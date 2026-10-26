@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::audit::{self, AuditEvent};
-use crate::auth::AuthUser;
+use crate::auth::WriteUser;
 use crate::error::{ApiError, ApiResult};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -29,7 +29,7 @@ struct OrgResponse {
 /// Any authenticated user can create an org and becomes its admin.
 async fn create_org(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     body: web::Json<CreateOrgRequest>,
 ) -> ApiResult<HttpResponse> {
     validate::slug("slug", &body.slug)?;

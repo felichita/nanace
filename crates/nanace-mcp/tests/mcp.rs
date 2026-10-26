@@ -40,6 +40,9 @@ async fn start_api() -> String {
             600,
         ),
         dev_login: true,
+        google: None,
+        frontend_url: "http://127.0.0.1/auth/complete".to_owned(),
+        secure_cookies: false,
     });
     let server = HttpServer::new(move || App::new().app_data(state.clone()).configure(api::configure))
         .workers(1)
@@ -229,6 +232,44 @@ async fn tools_respect_team_isolation() {
     let mut params = CallToolRequestParams::new("get_context");
     params = params.with_arguments(json!({ "context_id": "nope" }).as_object().unwrap().clone());
     assert!(alice.call_tool(params).await.is_err());
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn read_scoped_personal_access_token_works() {
+    let base = start_api().await;
+    let seed = seed(&base).await;
+    let http = reqwest::Client::new();
+    let session: Value = http
+        .post(format!("{base}/api/v1/auth/dev-login"))
+        .json(&json!({ "email": seed.alice }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pat: Value = http
+        .post(format!("{base}/api/v1/me/tokens"))
+        .bearer_auth(session["access_token"].as_str().unwrap())
+        .json(&json!({ "name": "mcp", "scope": "read" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = pat["token"].as_str().unwrap().to_owned();
+
+    let client = connect(&base, Credentials::Token(SecretString::from(token))).await;
+    let (is_error, text) = call(
+        &client,
+        "search_contexts",
+        json!({ "query": "authenticate users with JWT" }),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains(&seed.dev_context_id), "{text}");
 }
 
 #[actix_web::test]

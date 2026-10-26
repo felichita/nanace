@@ -24,8 +24,9 @@ Talks to the backend over REST (and WebSocket for live updates).
 
 Handles requests, validation, and database integration:
 
-- Authentication: Google OAuth 2.0 **[planned]** + JWT **[built]**. Until
-  OAuth lands, `POST /api/v1/auth/dev-login` issues tokens for any email when
+- Authentication **[built]**: Google sign-in (OpenID Connect) issuing
+  short-lived session JWTs, plus personal access tokens for MCP and scripts.
+  `POST /api/v1/auth/dev-login` issues sessions for any email when
   `NANACE_DEV_LOGIN=true` (development only).
 - Authorization: role-based access control (RBAC) **[built]**
 - Embedding generation for markdown **[built]**
@@ -42,7 +43,9 @@ Talks to PostgreSQL and Qdrant.
 | Table | Purpose |
 |---|---|
 | `organizations` | Companies (tenants) |
-| `users` | People; one row per normalized email |
+| `users` | People; one row per normalized email, linked to a Google subject |
+| `api_tokens` | Personal access tokens (hash only), scope, expiry, revocation |
+| `login_codes` | One-time codes handed to the browser after Google sign-in |
 | `org_members` | Org membership with `member` / `admin` role |
 | `teams` | dev, QA, devops, analytics, ... within an org |
 | `team_members` | Team role: `reader` / `writer` / `admin`; `source` = `manual` or `google_sync` |
@@ -156,7 +159,47 @@ mix. Inside an org, every query filters on `org_id` and on the caller's team
 ids from PostgreSQL. This follows Qdrant's recommended payload-based
 multitenancy and avoids a collection per team.
 
-### Google Workspace integration [planned]
+### Authentication [built]
+
+**Google sign-in** (authorization code flow with PKCE):
+
+```text
+Browser -> GET /api/v1/auth/google/login
+        <- 302 to Google + signed state cookie (state, nonce, PKCE verifier; 10 min)
+Google  -> GET /api/v1/auth/google/callback?code&state
+           backend checks cookie signature + state, exchanges the code with
+           the client secret + verifier, validates ID token claims
+           (iss, aud, exp, nonce, email_verified, Workspace domain)
+        <- 302 to NANACE_FRONTEND_URL?code=<one-time login code>  (or ?error=<reason>)
+Frontend -> POST /api/v1/auth/exchange {code}  -> session JWT (single use, 60 s)
+```
+
+- The ID token is not signature-checked: it comes straight from Google's
+  token endpoint over TLS, which OpenID Connect Core §3.1.3.7 allows.
+- Users are matched by Google subject, then by email for people invited
+  before their first sign-in. An email already linked to a different Google
+  account is rejected (`account_conflict`), never taken over.
+- `NANACE_GOOGLE_ALLOWED_DOMAINS` restricts sign-in to Workspace accounts of
+  those domains (the `hd` claim), not merely matching email suffixes.
+- Session token in the URL is avoided: only the one-time code is, and the
+  landing page strips it and sends `Referrer-Policy: no-referrer`.
+- Until the React app exists, the default frontend URL is a built-in page
+  (`/auth/complete`) for signing in and managing access tokens.
+
+**Personal access tokens** (`nnc_pat_…`):
+
+- 256-bit random secrets; only the SHA-256 hash and a short display prefix
+  are stored. Shown once at creation.
+- Scope `read` (GET requests and search) or `write` (everything the user's
+  roles allow). Mutating handlers take `WriteUser`, which rejects read tokens.
+- Expire after 1–365 days (default 90); revocation is immediate. At most 50
+  active tokens per user.
+- Creating and revoking tokens requires an interactive session, so a leaked
+  token cannot mint new ones.
+- Tokens carry the user's identity only; team permissions still come from
+  PostgreSQL on every request.
+
+### Google Workspace group sync [planned]
 
 ```text
 Automatic sync:
@@ -220,9 +263,9 @@ audit path as the HTTP API.
 - The org is the tool argument, then `NANACE_ORG_ID`, then the user's only org.
 - Context content is returned inside `<context_content>` delimiters, and the
   server instructions tell the model to treat it as data, not instructions.
-- Authentication: `NANACE_TOKEN`, or `NANACE_DEV_EMAIL` against a development
-  API (logs in again when the token expires). Long-lived personal access
-  tokens and remote MCP over streamable HTTP with OAuth are **[planned]**.
+- Authentication: `NANACE_TOKEN` with a personal access token (a `read`
+  token is enough), or `NANACE_DEV_EMAIL` against a development API. Remote
+  MCP over streamable HTTP with OAuth is **[planned]**.
 
 ## Component Diagram
 
@@ -278,6 +321,10 @@ Claude Desktop / Claude Code
 | Method | Path | Who |
 |---|---|---|
 | `POST` | `/api/v1/auth/dev-login` | Anyone, only when dev login is enabled |
+| `GET` | `/api/v1/auth/google/login`, `/callback` | Browser sign-in, when Google is configured |
+| `POST` | `/api/v1/auth/exchange` | One-time login code holder |
+| `GET/POST` | `/api/v1/me/tokens` | Authenticated / session only |
+| `DELETE` | `/api/v1/me/tokens/{id}` | Session only |
 | `GET` | `/api/v1/me` | Authenticated |
 | `POST` | `/api/v1/orgs` | Authenticated; caller becomes org admin |
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |

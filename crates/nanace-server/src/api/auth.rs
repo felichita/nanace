@@ -6,10 +6,12 @@ use uuid::Uuid;
 use crate::audit::{self, AuditEvent};
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
+use crate::secret::sha256_hex;
 use crate::{AppState, LOG_COMPONENT};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/auth/dev-login", web::post().to(dev_login))
+        .route("/auth/exchange", web::post().to(exchange))
         .route("/me", web::get().to(me));
 }
 
@@ -68,6 +70,31 @@ async fn dev_login(state: web::Data<AppState>, body: web::Json<DevLoginRequest>)
     tx.commit().await?;
 
     tracing::info!(event = "dev_login", component = LOG_COMPONENT, user_id = %user_id, "dev login");
+    Ok(HttpResponse::Ok().json(TokenResponse {
+        access_token: state.jwt.issue(user_id, &email)?,
+        token_type: "Bearer",
+        expires_in: state.jwt.ttl_secs(),
+        user_id,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeRequest {
+    code: String,
+}
+
+/// Trades a one-time login code from the Google callback for a session
+/// token. Each code works once and expires after a minute.
+async fn exchange(state: web::Data<AppState>, body: web::Json<ExchangeRequest>) -> ApiResult<HttpResponse> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "WITH used AS (DELETE FROM login_codes WHERE code_hash = $1 AND expires_at > now() RETURNING user_id) \
+         SELECT u.id, u.email FROM used JOIN users u ON u.id = used.user_id",
+    )
+    .bind(sha256_hex(&body.code))
+    .fetch_optional(&state.pool)
+    .await?;
+    let (user_id, email) = row.ok_or(ApiError::Unauthorized)?;
     Ok(HttpResponse::Ok().json(TokenResponse {
         access_token: state.jwt.issue(user_id, &email)?,
         token_type: "Bearer",

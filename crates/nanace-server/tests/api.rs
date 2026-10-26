@@ -37,6 +37,9 @@ async fn state(dev_login: bool) -> web::Data<AppState> {
             600,
         ),
         dev_login,
+        google: None,
+        frontend_url: "http://127.0.0.1/auth/complete".to_owned(),
+        secure_cookies: false,
     })
 }
 

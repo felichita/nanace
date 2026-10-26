@@ -1,9 +1,12 @@
 mod audit_logs;
 mod auth;
+mod complete_page;
 mod contexts;
+mod google;
 mod orgs;
 mod search;
 mod teams;
+mod tokens;
 
 use actix_web::{HttpResponse, web};
 
@@ -17,9 +20,12 @@ const JSON_LIMIT_BYTES: usize = 1024 * 1024;
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.app_data(web::JsonConfig::default().limit(JSON_LIMIT_BYTES))
         .route("/healthz", web::get().to(healthz))
+        .configure(complete_page::configure)
         .service(
             web::scope("/api/v1")
                 .configure(auth::configure)
+                .configure(google::configure)
+                .configure(tokens::configure)
                 .configure(orgs::configure)
                 .configure(teams::configure)
                 .configure(contexts::configure)

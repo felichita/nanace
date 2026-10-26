@@ -8,6 +8,8 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod oauth;
+pub mod secret;
 pub mod vectors;
 
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use nanace_embed::Embedder;
 use sqlx::PgPool;
 
 use crate::auth::JwtKeys;
+use crate::oauth::GoogleOAuth;
 use crate::vectors::VectorStore;
 
 pub const LOG_COMPONENT: &str = "nanace_server";
@@ -29,4 +32,10 @@ pub struct AppState {
     pub embedder: Arc<dyn Embedder>,
     pub jwt: JwtKeys,
     pub dev_login: bool,
+    /// `None` when Google sign-in is not configured.
+    pub google: Option<GoogleOAuth>,
+    /// Browser destination after sign-in.
+    pub frontend_url: String,
+    /// Set `Secure` on cookies; true when the public URL is HTTPS.
+    pub secure_cookies: bool,
 }

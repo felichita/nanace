@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::access;
 use crate::audit::{self, AuditEvent};
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -38,7 +38,7 @@ struct TeamRow {
 /// Org admins create teams and become the team's first admin.
 async fn create_team(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     path: web::Path<Uuid>,
     body: web::Json<CreateTeamRequest>,
 ) -> ApiResult<HttpResponse> {
@@ -151,7 +151,7 @@ struct PutMemberRequest {
 /// is linked on their first login; the user also joins the org as a member.
 async fn put_member(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     path: web::Path<(Uuid, Uuid)>,
     body: web::Json<PutMemberRequest>,
 ) -> ApiResult<HttpResponse> {
@@ -202,7 +202,7 @@ async fn put_member(
 
 async fn remove_member(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     path: web::Path<(Uuid, Uuid, Uuid)>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id, member_id) = path.into_inner();

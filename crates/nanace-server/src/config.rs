@@ -15,6 +15,16 @@ pub enum EmbedderKind {
     Hashing,
 }
 
+/// Google sign-in settings. Present only when `NANACE_GOOGLE_CLIENT_ID` is set.
+#[derive(Debug, Clone)]
+pub struct GoogleConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    /// Lowercased Workspace domains allowed to sign in; empty allows any
+    /// verified Google account.
+    pub allowed_domains: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -26,6 +36,11 @@ pub struct Config {
     pub fastembed_cache_dir: PathBuf,
     pub dev_login: bool,
     pub run_migrations: bool,
+    /// Externally reachable base URL of this API (OAuth redirect target).
+    pub public_url: String,
+    /// Where the browser lands after sign-in, with `?code=` or `?error=`.
+    pub frontend_url: String,
+    pub google: Option<GoogleConfig>,
 }
 
 impl Config {
@@ -64,6 +79,27 @@ impl Config {
                 .context("NANACE_JWT_TTL_SECS must be an integer between 60 and 86400")?,
         };
 
+        let public_url = get("NANACE_PUBLIC_URL").unwrap_or_else(|| "http://127.0.0.1:8080".to_owned());
+        let public_url = absolute_http_url("NANACE_PUBLIC_URL", &public_url)?;
+        let frontend_url = match get("NANACE_FRONTEND_URL") {
+            Some(url) => absolute_http_url("NANACE_FRONTEND_URL", &url)?,
+            None => format!("{public_url}/auth/complete"),
+        };
+
+        let google = match get("NANACE_GOOGLE_CLIENT_ID").filter(|id| !id.trim().is_empty()) {
+            None => None,
+            Some(client_id) => Some(GoogleConfig {
+                client_id: client_id.trim().to_owned(),
+                client_secret: SecretString::from(required("NANACE_GOOGLE_CLIENT_SECRET")?),
+                allowed_domains: get("NANACE_GOOGLE_ALLOWED_DOMAINS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|d| d.trim().to_ascii_lowercase())
+                    .filter(|d| !d.is_empty())
+                    .collect(),
+            }),
+        };
+
         Ok(Self {
             bind: get("NANACE_BIND")
                 .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
@@ -79,8 +115,25 @@ impl Config {
                 .into(),
             dev_login: flag("NANACE_DEV_LOGIN", false)?,
             run_migrations: flag("NANACE_RUN_MIGRATIONS", true)?,
+            public_url,
+            frontend_url,
+            google,
         })
     }
+}
+
+/// Returns `url` without a trailing slash after checking it is an absolute
+/// http(s) URL with a host.
+fn absolute_http_url(key: &str, url: &str) -> anyhow::Result<String> {
+    let url = url.trim().trim_end_matches('/');
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .with_context(|| format!("{key} must start with http:// or https://"))?;
+    if rest.is_empty() || rest.starts_with('/') || url.contains(['?', '#', ' ']) {
+        bail!("{key} must be an absolute URL without query or fragment");
+    }
+    Ok(url.to_owned())
 }
 
 #[cfg(test)]
@@ -124,8 +177,53 @@ mod tests {
     }
 
     #[test]
+    fn google_and_urls() {
+        let cfg = config(&[]).unwrap();
+        assert!(cfg.google.is_none());
+        assert_eq!(cfg.frontend_url, "http://127.0.0.1:8080/auth/complete");
+
+        assert!(
+            config(&[("NANACE_GOOGLE_CLIENT_ID", "id")]).is_err(),
+            "secret is required"
+        );
+        let cfg = config(&[
+            ("NANACE_GOOGLE_CLIENT_ID", "id"),
+            ("NANACE_GOOGLE_CLIENT_SECRET", "s3cret"),
+            ("NANACE_GOOGLE_ALLOWED_DOMAINS", " Example.com, ,example.org"),
+            ("NANACE_PUBLIC_URL", "https://kb.example.com/"),
+            ("NANACE_FRONTEND_URL", "https://app.example.com/login"),
+        ])
+        .unwrap();
+        let google = cfg.google.unwrap();
+        assert_eq!(google.allowed_domains, ["example.com", "example.org"]);
+        assert_eq!(cfg.public_url, "https://kb.example.com");
+        assert_eq!(cfg.frontend_url, "https://app.example.com/login");
+
+        for bad in [
+            "kb.example.com",
+            "ftp://x",
+            "https://",
+            "https://x?y=1",
+            "https:///path",
+        ] {
+            assert!(
+                config(&[("NANACE_PUBLIC_URL", bad)]).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn debug_output_redacts_secrets() {
-        let rendered = format!("{:?}", config(&[]).unwrap());
+        let rendered = format!(
+            "{:?}",
+            config(&[
+                ("NANACE_GOOGLE_CLIENT_ID", "id"),
+                ("NANACE_GOOGLE_CLIENT_SECRET", "google-s3cret")
+            ])
+            .unwrap()
+        );
+        assert!(!rendered.contains("google-s3cret"));
         assert!(!rendered.contains("0123456789abcdef"));
         assert!(!rendered.contains("postgres://"));
     }

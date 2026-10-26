@@ -13,7 +13,17 @@ make run                      # starts PostgreSQL + Qdrant, then the API on :808
 The first start downloads the `bge-small-en-v1.5` model (~130 MB) into
 `.fastembed_cache/`.
 
-With `NANACE_DEV_LOGIN=true`, get a token for any email:
+### Google sign-in
+
+1. In Google Cloud Console create an OAuth client of type **Web application**
+   with redirect URI `http://127.0.0.1:8080/api/v1/auth/google/callback`
+   (use your `NANACE_PUBLIC_URL`).
+2. Set `NANACE_GOOGLE_CLIENT_ID`, `NANACE_GOOGLE_CLIENT_SECRET`, and
+   optionally `NANACE_GOOGLE_ALLOWED_DOMAINS` in `.env`.
+3. Open <http://127.0.0.1:8080/auth/complete>, sign in, and create a
+   personal access token (`read` scope is enough for Claude).
+
+Without Google, `NANACE_DEV_LOGIN=true` gives a session for any email:
 
 ```bash
 curl -s -X POST localhost:8080/api/v1/auth/dev-login \
@@ -28,12 +38,12 @@ Build the MCP server once:
 cargo build --release -p nanace-mcp
 ```
 
-Claude Code:
+Claude Code, with a personal access token:
 
 ```bash
 claude mcp add nanace \
   --env NANACE_API_URL=http://127.0.0.1:8080 \
-  --env NANACE_DEV_EMAIL=you@example.com \
+  --env NANACE_TOKEN=nnc_pat_... \
   -- "$PWD/target/release/nanace-mcp"
 ```
 
@@ -46,15 +56,15 @@ Claude Desktop (`claude_desktop_config.json`):
       "command": "/absolute/path/to/target/release/nanace-mcp",
       "env": {
         "NANACE_API_URL": "http://127.0.0.1:8080",
-        "NANACE_DEV_EMAIL": "you@example.com"
+        "NANACE_TOKEN": "nnc_pat_..."
       }
     }
   }
 }
 ```
 
-Use `NANACE_TOKEN` instead of `NANACE_DEV_EMAIL` against an API without dev
-login, and `NANACE_ORG_ID` to pick a default organization.
+Against a development API you can use `NANACE_DEV_EMAIL=you@example.com`
+instead of a token. `NANACE_ORG_ID` picks a default organization.
 
 ## Development
 

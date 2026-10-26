@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-reqwest = { version = "0.13", features = ["json", "query"] }
+reqwest.workspace = true
 rmcp = { version = "3.8", features = ["server", "transport-io", "macros", "schemars"] }
 schemars = "1"
 secrecy.workspace = true

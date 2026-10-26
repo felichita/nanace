@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanace sign-in</title>
+<link rel="stylesheet" href="/auth/complete.css">
+</head>
+<body>
+<main>
+  <h1>nanace</h1>
+  <p id="status">Loading…</p>
+
+  <section id="signin" hidden>
+    <a class="button" href="/api/v1/auth/google/login">Sign in with Google</a>
+  </section>
+
+  <section id="tokens" hidden>
+    <h2>Personal access tokens</h2>
+    <p>Use a token with the MCP server (<code>NANACE_TOKEN</code>) or scripts. Read tokens can only read and search.</p>
+    <form id="create">
+      <label>Name <input name="name" required maxlength="100" value="Claude MCP"></label>
+      <label>Scope
+        <select name="scope">
+          <option value="read" selected>read</option>
+          <option value="write">write</option>
+        </select>
+      </label>
+      <label>Expires in days <input name="days" type="number" min="1" max="365" value="90"></label>
+      <button type="submit">Create token</button>
+    </form>
+    <div id="created" hidden>
+      <p><strong>Copy this token now. It will not be shown again.</strong></p>
+      <pre id="token"></pre>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Prefix</th><th>Scope</th><th>Expires</th><th>Last used</th><th></th></tr></thead>
+      <tbody id="list"></tbody>
+    </table>
+  </section>
+</main>
+<script src="/auth/complete.js"></script>
+</body>
+</html>

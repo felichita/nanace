@@ -143,8 +143,15 @@ only for changed code, new evidence, or an explicit re-review request.
   gets database or Qdrant credentials. Tools stay read-only unless writes are
   explicitly requested, and never take tenant scope from context content.
   stdout is the MCP channel: log to stderr only.
-- JWTs identify the user only. Never put roles or team ids in tokens;
-  permissions are read from PostgreSQL per request.
+- JWTs and personal access tokens identify the user only. Never put roles or
+  team ids in tokens; permissions are read from PostgreSQL per request.
+- Handlers that change state take `WriteUser` (rejects `read`-scoped
+  tokens); read-only handlers take `AuthUser`. Token management requires
+  `AuthUser::require_session`.
+- Store only hashes of tokens and login codes; never log or return a secret
+  after creation. Session tokens never go in URLs.
+- `GoogleOAuth::with_token_url` exists for tests: the ID token signature is
+  not checked, so production must use Google's HTTPS token endpoint.
 
 ## Logging
 

@@ -6,7 +6,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
 use crate::vectors::Chunk;
 use crate::{AppState, CHUNK_MAX_BYTES, LOG_COMPONENT, access, db};
@@ -104,7 +104,7 @@ fn vector_store_unavailable(err: anyhow::Error) -> ApiError {
 
 async fn create_context(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     path: web::Path<(Uuid, Uuid)>,
     body: web::Json<ContextInput>,
 ) -> ApiResult<HttpResponse> {
@@ -234,7 +234,7 @@ async fn get_context(
 
 async fn update_context(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     path: web::Path<(Uuid, Uuid)>,
     body: web::Json<ContextInput>,
 ) -> ApiResult<HttpResponse> {
@@ -309,7 +309,7 @@ async fn update_context(
 
 async fn delete_context(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: WriteUser,
     path: web::Path<(Uuid, Uuid)>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, context_id) = path.into_inner();

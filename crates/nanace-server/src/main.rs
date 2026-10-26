@@ -5,6 +5,7 @@ use anyhow::Context;
 use nanace_embed::{Embedder, FastEmbedder, HashingEmbedder};
 use nanace_server::auth::JwtKeys;
 use nanace_server::config::{Config, EmbedderKind};
+use nanace_server::oauth::GoogleOAuth;
 use nanace_server::vectors::VectorStore;
 use nanace_server::{AppState, LOG_COMPONENT, api, db};
 use secrecy::ExposeSecret;
@@ -66,12 +67,28 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let google = config
+        .google
+        .clone()
+        .map(|google| GoogleOAuth::new(google, &config.public_url, &config.jwt_secret))
+        .transpose()?;
+    if google.is_none() {
+        tracing::info!(
+            event = "google_login_disabled",
+            component = LOG_COMPONENT,
+            "Google sign-in not configured"
+        );
+    }
+
     let state = web::Data::new(AppState {
         pool,
         vectors,
         embedder,
         jwt: JwtKeys::new(&config.jwt_secret, config.jwt_ttl_secs),
         dev_login: config.dev_login,
+        google,
+        frontend_url: config.frontend_url.clone(),
+        secure_cookies: config.public_url.starts_with("https://"),
     });
 
     tracing::info!(event = "server_start", component = LOG_COMPONENT, bind = %config.bind, "listening");
