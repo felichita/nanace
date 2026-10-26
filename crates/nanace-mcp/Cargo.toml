@@ -1,0 +1,27 @@
+[package]
+name = "nanace-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.13", features = ["json", "query"] }
+rmcp = { version = "3.8", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+actix-web.workspace = true
+nanace-embed.workspace = true
+nanace-server = { path = "../nanace-server" }
+rmcp = { version = "3.8", features = ["client"] }
+sqlx.workspace = true

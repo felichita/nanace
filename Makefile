@@ -18,8 +18,8 @@ lint:
 test: ## Unit tests; no external services
 	cargo test --workspace
 
-test-integration: deps ## API + RLS tests against compose services
-	cargo test -p nanace-server -- --ignored
+test-integration: deps ## API, RLS and MCP tests against compose services
+	cargo test -p nanace-server -p nanace-mcp -- --ignored
 
 test-model: ## Real bge-small-en-v1.5 test; downloads the model on first run
 	cargo test -p nanace-embed -- --ignored

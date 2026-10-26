@@ -30,7 +30,7 @@ Handles requests, validation, and database integration:
 - Authorization: role-based access control (RBAC) **[built]**
 - Embedding generation for markdown **[built]**
 - API handlers: CRUD over contexts **[built]**
-- MCP server exposing tools to Claude **[planned]**
+- MCP server exposing tools to Claude **[built: stdio, read-only]**
 - Audit logging of every action **[built]**
 
 Talks to PostgreSQL and Qdrant.
@@ -94,14 +94,16 @@ harmless because every search result is re-checked in PostgreSQL.
 ```text
 1. A user asks Claude: "How do I authenticate users?"
 
-2. Claude, via MCP [planned; the HTTP search endpoint is built]:
-   a) The backend embeds the question
+2. Claude calls the `search_contexts` MCP tool; `nanace-mcp` forwards it to
+   the API as the user, and the backend:
+   a) Embeds the question
    b) Looks up the caller's readable teams in PostgreSQL
    c) Searches the org's Qdrant collection filtered to those teams
    d) Re-checks every hit against PostgreSQL under RLS
    e) Returns the markdown, e.g. "## API Authentication..."
 
-3. Claude answers grounded in your documentation.
+3. Claude reads the full document with `get_context` and answers grounded
+   in your documentation.
 ```
 
 ### Flow 3: Team isolation (QA cannot see DevOps)
@@ -198,6 +200,30 @@ operations. The bottleneck is embedding generation (CPU-bound, runs on the
 blocking thread pool); the fix is batching, a dedicated embedding worker, and
 caching.
 
+## MCP Server [built]
+
+`nanace-mcp` is a separate binary that Claude Desktop or Claude Code launches
+over stdio. It calls the REST API with the user's credentials and holds no
+database or Qdrant access, so every tool result passes the same RBAC, RLS and
+audit path as the HTTP API.
+
+| Tool | API call | Purpose |
+|---|---|---|
+| `list_teams` | `GET /me` | Orgs, teams and roles, with ids |
+| `search_contexts` | `POST /orgs/{org}/search` | Semantic search with snippets |
+| `get_context` | `GET /orgs/{org}/contexts/{id}` | Full markdown of one context |
+| `list_contexts` | `GET /orgs/{org}/teams/{team}/contexts` | Recent titles in a team |
+
+- All tools are annotated read-only. Write tools (create/update context) are
+  deliberately left out until there is a confirmation story for
+  model-initiated writes.
+- The org is the tool argument, then `NANACE_ORG_ID`, then the user's only org.
+- Context content is returned inside `<context_content>` delimiters, and the
+  server instructions tell the model to treat it as data, not instructions.
+- Authentication: `NANACE_TOKEN`, or `NANACE_DEV_EMAIL` against a development
+  API (logs in again when the token expires). Long-lived personal access
+  tokens and remote MCP over streamable HTTP with OAuth are **[planned]**.
+
 ## Component Diagram
 
 ```text
@@ -206,15 +232,12 @@ Frontend (React)
 Backend (Rust)
     |-> PostgreSQL  <- authorization, metadata, canonical content
     |-> Qdrant      <- embeddings, semantic search
-    |
+    ^
+    | REST, as the user
+nanace-mcp (stdio)
+    ^
     | MCP protocol
 Claude Desktop / Claude Code
-    | question
-MCP server (in the backend)
-    |-> embed the question
-    |-> search Qdrant + filter by PostgreSQL permissions
-
-Result: accurate answers from your knowledge base.
 ```
 
 ## Why This Architecture
@@ -246,6 +269,7 @@ Result: accurate answers from your knowledge base.
 | `crates/nanace-core` | Pure domain logic: roles, validation, markdown chunking, hashing |
 | `crates/nanace-embed` | `Embedder` trait, `FastEmbedder` (bge-small), `HashingEmbedder` |
 | `crates/nanace-server` | Actix-web API, auth, RBAC, RLS-scoped DB access, Qdrant, audit, migrations |
+| `crates/nanace-mcp` | stdio MCP server; read-only tools over the REST API |
 | `deploy/postgres` | Local database bootstrap (non-superuser app role) |
 | `docker-compose.yml` | PostgreSQL 18 and Qdrant for development |
 

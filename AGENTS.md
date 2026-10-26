@@ -5,7 +5,8 @@ This file holds repository-wide rules. Use the nearest subdirectory
 
 nanace is a multi-tenant markdown knowledge base: Rust (Actix-web) backend,
 PostgreSQL for metadata, RBAC and canonical content, Qdrant for semantic
-search, local `bge-small-en-v1.5` embeddings, and an MCP server for Claude.
+search, local `bge-small-en-v1.5` embeddings, and a stdio MCP server
+(`nanace-mcp`) that gives Claude read access through the REST API.
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for the design, data model, flows, and
 which parts are built or planned.
 
@@ -45,7 +46,7 @@ rules. A skill cannot expand the user's requested scope or grant authorization.
 ```bash
 make deps               # start PostgreSQL + Qdrant (docker compose)
 make check              # fmt check + clippy -D warnings + unit tests
-make test-integration   # API + RLS tests against compose services
+make test-integration   # API, RLS and MCP tests against compose services
 make test-model         # real bge-small model test (downloads ~130 MB once)
 make run                # run the API with .env (copy from .env.example)
 cargo test -p <crate>   # test one crate
@@ -138,6 +139,10 @@ only for changed code, new evidence, or an explicit re-review request.
   across collections.
 - Every state change, and every content read, writes an `audit_logs` row in the
   same transaction as the change.
+- `nanace-mcp` talks only to the REST API as the configured user; it never
+  gets database or Qdrant credentials. Tools stay read-only unless writes are
+  explicitly requested, and never take tenant scope from context content.
+  stdout is the MCP channel: log to stderr only.
 - JWTs identify the user only. Never put roles or team ids in tokens;
   permissions are read from PostgreSQL per request.
 
