@@ -1,0 +1,27 @@
+[package]
+name = "nanace-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nanace-core.workspace = true
+nanace-embed.workspace = true
+actix-web.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+jsonwebtoken.workspace = true
+qdrant-client.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+actix-http = "3"

@@ -1,0 +1,32 @@
+# Local development dependencies. Ports bind to loopback only.
+name: nanace
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      # Bootstrap superuser; the app uses the `nanace` role from init.sql.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:${NANACE_PG_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nanace -d nanace"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    ports:
+      - "127.0.0.1:${NANACE_QDRANT_HTTP_PORT:-6333}:6333"
+      - "127.0.0.1:${NANACE_QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  postgres-data:
+  qdrant-data:

@@ -1,0 +1,17 @@
+[package]
+name = "nanace-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["fastembed"]
+fastembed = ["dep:fastembed"]
+
+[dependencies]
+async-trait.workspace = true
+fastembed = { workspace = true, optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

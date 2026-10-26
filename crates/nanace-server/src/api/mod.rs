@@ -1,0 +1,39 @@
+mod audit_logs;
+mod auth;
+mod contexts;
+mod orgs;
+mod search;
+mod teams;
+
+use actix_web::{HttpResponse, web};
+
+use crate::AppState;
+use crate::error::ApiResult;
+
+/// Request bodies above this are rejected before deserialization. Leaves room
+/// for the 256 KiB content limit plus JSON escaping.
+const JSON_LIMIT_BYTES: usize = 1024 * 1024;
+
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.app_data(web::JsonConfig::default().limit(JSON_LIMIT_BYTES))
+        .route("/healthz", web::get().to(healthz))
+        .service(
+            web::scope("/api/v1")
+                .configure(auth::configure)
+                .configure(orgs::configure)
+                .configure(teams::configure)
+                .configure(contexts::configure)
+                .configure(search::configure)
+                .configure(audit_logs::configure),
+        );
+}
+
+async fn healthz(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    sqlx::query("SELECT 1").execute(&state.pool).await?;
+    state
+        .vectors
+        .health()
+        .await
+        .map_err(|_| crate::error::ApiError::Unavailable("vector store"))?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "status": "ok" })))
+}
