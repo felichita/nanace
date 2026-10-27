@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/nanace-core", "crates/nanace-embed", "crates/nanace-mcp", "crates/nanace-server"]
+# Built with its own lockfile and target dir by the Tauri CLI (apps/desktop).
+exclude = ["apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

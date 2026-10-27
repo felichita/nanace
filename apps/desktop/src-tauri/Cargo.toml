@@ -1,0 +1,23 @@
+[package]
+name = "nanace-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.90"
+description = "nanace desktop app"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+base64 = "0.23"
+getrandom = "0.4"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tauri = { version = "2.12", features = [] }
+tauri-plugin-opener = "2.7"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+url = "2.5"

@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+/* Neutral palette. Components use the semantic tokens below. */
+:root {
+  --bg: #ffffff;
+  --sidebar: #f8f8f7;
+  --text: rgb(55, 53, 47);
+  --text-2: rgba(55, 53, 47, 0.65);
+  --text-3: rgba(55, 53, 47, 0.45);
+  --hover: rgba(55, 53, 47, 0.06);
+  --active: rgba(55, 53, 47, 0.1);
+  --border: rgba(55, 53, 47, 0.09);
+  --popover: #ffffff;
+  --shadow: 0 0 0 1px rgba(15, 15, 15, 0.05), 0 3px 6px rgba(15, 15, 15, 0.1), 0 9px 24px rgba(15, 15, 15, 0.2);
+  --accent: #2383e2;
+  --danger: #eb5757;
+  --chip: rgba(227, 226, 224, 0.5);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #191919;
+    --sidebar: #202020;
+    --text: rgba(255, 255, 255, 0.81);
+    --text-2: rgba(255, 255, 255, 0.46);
+    --text-3: rgba(255, 255, 255, 0.28);
+    --hover: rgba(255, 255, 255, 0.055);
+    --active: rgba(255, 255, 255, 0.09);
+    --border: rgba(255, 255, 255, 0.094);
+    --popover: #252525;
+    --shadow: 0 0 0 1px rgba(255, 255, 255, 0.094), 0 3px 6px rgba(0, 0, 0, 0.2), 0 9px 24px rgba(0, 0, 0, 0.4);
+    --chip: rgba(255, 255, 255, 0.094);
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-surface: var(--bg);
+  --color-sidebar: var(--sidebar);
+  --color-ink: var(--text);
+  --color-ink-2: var(--text-2);
+  --color-ink-3: var(--text-3);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-line: var(--border);
+  --color-popover: var(--popover);
+  --color-accent: var(--accent);
+  --color-danger: var(--danger);
+  --color-chip: var(--chip);
+  --font-sans: var(--font);
+  --shadow-pop: var(--shadow);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  overflow: hidden;
+}
+
+input,
+textarea,
+[contenteditable="true"],
+.selectable {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+button {
+  cursor: default;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--active);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+/* BlockNote: blend into the page. */
+.bn-container {
+  --bn-colors-editor-background: transparent;
+  --bn-colors-editor-text: var(--text);
+  --bn-font-family: var(--font);
+}
+.bn-container .bn-editor {
+  background: transparent;
+  padding-inline: 54px;
+  font-size: 16px;
+  line-height: 1.5;
+}
+.bn-default-styles {
+  font-family: var(--font);
+}
+
+.page-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  border-radius: 3px;
+  padding: 0 2px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--text-3);
+  text-underline-offset: 3px;
+  font-weight: 500;
+}
+.page-link:hover {
+  background: var(--hover);
+}
+.page-link.missing {
+  color: var(--text-2);
+  text-decoration-style: dashed;
+}
+.page-link svg {
+  align-self: center;
+  opacity: 0.6;
+}
