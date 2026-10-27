@@ -9,7 +9,7 @@
 | Windows x64 | `nanace_<version>_x64-setup.exe` or `.msi` |
 | Linux x64 / arm64 | `.AppImage`, `.deb` or `.rpm` |
 
-**Server + MCP** (`nanace-server`, `nanace-mcp`): `nanace-<version>-<target>.tar.gz` (`.zip` on Windows). Each archive has a `.sha256` checksum.
+**Server + MCP** (`nanace-server`, `nanace-mcp`): `nanace-<version>-<target>.tar.gz` (`.zip` on Windows). Each archive has a `.sha256` checksum. Linux server builds need glibc 2.38+ (Ubuntu 24.04, Debian 13, Fedora 39 or newer).
 
 The builds are not code-signed yet:
 
