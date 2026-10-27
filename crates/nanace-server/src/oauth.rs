@@ -49,6 +49,33 @@ pub struct LoginState {
     pub nonce: String,
     pub verifier: String,
     pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<DesktopLogin>,
+}
+
+/// A sign-in started by the desktop app (RFC 8252 loopback flow): the login
+/// code goes to `http://127.0.0.1:<port>/callback` and can only be exchanged
+/// with the PKCE verifier matching `code_challenge`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesktopLogin {
+    pub port: u16,
+    pub code_challenge: String,
+}
+
+impl DesktopLogin {
+    /// Validates client-supplied parameters. Ports below 1024 are refused;
+    /// the challenge must be an S256 PKCE challenge (43 base64url chars).
+    pub fn new(port: u16, code_challenge: String) -> Option<Self> {
+        let valid_challenge = code_challenge.len() == 43
+            && code_challenge
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        (port >= 1024 && valid_challenge).then_some(Self { port, code_challenge })
+    }
+
+    pub fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{}/callback", self.port)
+    }
 }
 
 /// Identity extracted from a validated Google ID token.
@@ -122,12 +149,13 @@ impl GoogleOAuth {
 
     /// Starts a sign-in: returns Google's authorization URL and the signed
     /// cookie value that must accompany the callback.
-    pub fn begin(&self) -> anyhow::Result<(String, String)> {
+    pub fn begin(&self, desktop: Option<DesktopLogin>) -> anyhow::Result<(String, String)> {
         let login = LoginState {
             state: random_token(32)?,
             nonce: random_token(32)?,
             verifier: random_token(48)?,
             expires_at: now_secs() + STATE_TTL.as_secs(),
+            desktop,
         };
         let mut url = reqwest::Url::parse(AUTH_URL).context("invalid Google auth URL")?;
         url.query_pairs_mut()
@@ -317,7 +345,7 @@ mod tests {
     #[test]
     fn begin_builds_url_and_verifiable_cookie() {
         let oauth = oauth(&["example.com"]);
-        let (url, cookie) = oauth.begin().unwrap();
+        let (url, cookie) = oauth.begin(None).unwrap();
         let url = reqwest::Url::parse(&url).unwrap();
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(q["client_id"], "client-123");
@@ -333,7 +361,7 @@ mod tests {
     #[test]
     fn state_rejects_tampering_mismatch_expiry_and_foreign_keys() {
         let oauth = oauth(&[]);
-        let (url, cookie) = oauth.begin().unwrap();
+        let (url, cookie) = oauth.begin(None).unwrap();
         let state = reqwest::Url::parse(&url)
             .unwrap()
             .query_pairs()
@@ -366,11 +394,33 @@ mod tests {
             nonce: "n".to_owned(),
             verifier: "v".to_owned(),
             expires_at: now_secs() - 1,
+            desktop: None,
         };
         assert_eq!(
             oauth.verify_state(&oauth.sign_state(&expired).unwrap(), "s"),
             Err(LoginError::InvalidState)
         );
+    }
+
+    #[test]
+    fn desktop_login_is_validated_and_signed_into_state() {
+        let challenge = pkce_challenge("verifier");
+        assert!(DesktopLogin::new(80, challenge.clone()).is_none());
+        assert!(DesktopLogin::new(5000, "short".to_owned()).is_none());
+        assert!(DesktopLogin::new(5000, format!("{}=", &challenge[..42])).is_none());
+        let desktop = DesktopLogin::new(5000, challenge).unwrap();
+        assert_eq!(desktop.redirect_uri(), "http://127.0.0.1:5000/callback");
+
+        let oauth = oauth(&[]);
+        let (url, cookie) = oauth.begin(Some(desktop.clone())).unwrap();
+        let state = reqwest::Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(oauth.verify_state(&cookie, &state).unwrap().desktop, Some(desktop));
     }
 
     #[test]

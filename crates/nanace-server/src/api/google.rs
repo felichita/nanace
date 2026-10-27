@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
 use crate::error::{ApiError, ApiResult};
-use crate::oauth::{GoogleIdentity, GoogleOAuth, LoginError, STATE_COOKIE, STATE_TTL};
+use crate::oauth::{DesktopLogin, GoogleIdentity, GoogleOAuth, LoginError, LoginState, STATE_COOKIE, STATE_TTL};
 use crate::secret::{random_token, sha256_hex};
 use crate::{AppState, LOG_COMPONENT};
 
@@ -35,8 +35,30 @@ fn state_cookie(value: String, secure: bool, max_age: CookieDuration) -> Cookie<
         .finish()
 }
 
-async fn login(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
-    let (url, cookie) = google(&state)?.begin()?;
+/// Set by the desktop app to receive the login code on its loopback
+/// listener; browsers omit both.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginQuery {
+    redirect_port: Option<u16>,
+    code_challenge: Option<String>,
+}
+
+async fn login(state: web::Data<AppState>, query: web::Query<LoginQuery>) -> ApiResult<HttpResponse> {
+    let google = google(&state)?;
+    let query = query.into_inner();
+    let desktop = match (query.redirect_port, query.code_challenge) {
+        (None, None) => None,
+        (Some(port), Some(challenge)) => Some(DesktopLogin::new(port, challenge).ok_or_else(|| {
+            ApiError::BadRequest("redirect_port must be >= 1024 and code_challenge an S256 challenge".to_owned())
+        })?),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "redirect_port and code_challenge go together".to_owned(),
+            ));
+        }
+    };
+    let (url, cookie) = google.begin(desktop)?;
     let max_age = CookieDuration::seconds(i64::try_from(STATE_TTL.as_secs()).map_err(anyhow::Error::from)?);
     Ok(HttpResponse::Found()
         .insert_header((LOCATION, url))
@@ -77,19 +99,37 @@ impl From<anyhow::Error> for CallbackError {
     }
 }
 
-/// Completes sign-in and redirects the browser to the frontend with either
-/// `?code=<one-time login code>` or `?error=<reason>`.
+/// Completes sign-in and redirects the browser to the frontend (or the
+/// desktop app's loopback listener) with either `?code=<one-time login code>`
+/// or `?error=<reason>`.
 async fn callback(
     req: HttpRequest,
     state: web::Data<AppState>,
     query: web::Query<CallbackQuery>,
 ) -> ApiResult<HttpResponse> {
     let google = google(&state)?;
-    let target = match complete(&req, &state, google, &query).await {
-        Ok(code) => format!("{}?code={code}", state.frontend_url),
+    // Verified first so that errors also reach the client that started the
+    // sign-in; an unverifiable state goes to the web frontend.
+    let login = match (req.cookie(STATE_COOKIE), &query.state) {
+        (Some(cookie), Some(state_param)) => google.verify_state(cookie.value(), state_param),
+        _ => Err(LoginError::InvalidState),
+    };
+    let base = match &login {
+        Ok(LoginState {
+            desktop: Some(desktop), ..
+        }) => desktop.redirect_uri(),
+        _ => state.frontend_url.clone(),
+    };
+    let result = match login {
+        _ if query.error.is_some() => Err(LoginError::AccessDenied.into()),
+        Ok(login) => complete(&state, google, &query, &login).await,
+        Err(err) => Err(err.into()),
+    };
+    let target = match result {
+        Ok(code) => format!("{base}?code={code}"),
         Err(CallbackError::Login(err)) => {
             tracing::warn!(event = "google_login_rejected", component = LOG_COMPONENT, reason = %err, "sign-in rejected");
-            format!("{}?error={err}", state.frontend_url)
+            format!("{base}?error={err}")
         }
         Err(CallbackError::Internal(err)) => {
             tracing::error!(
@@ -98,7 +138,7 @@ async fn callback(
                 error = %format!("{err:#}"),
                 "sign-in failed"
             );
-            format!("{}?error=server_error", state.frontend_url)
+            format!("{base}?error=server_error")
         }
     };
     Ok(HttpResponse::Found()
@@ -109,20 +149,15 @@ async fn callback(
 }
 
 async fn complete(
-    req: &HttpRequest,
     state: &AppState,
     google: &GoogleOAuth,
     query: &CallbackQuery,
+    login: &LoginState,
 ) -> Result<String, CallbackError> {
-    if query.error.is_some() {
-        return Err(LoginError::AccessDenied.into());
-    }
-    let (Some(code), Some(state_param)) = (&query.code, &query.state) else {
+    let Some(code) = &query.code else {
         return Err(LoginError::InvalidState.into());
     };
-    let cookie = req.cookie(STATE_COOKIE).ok_or(LoginError::InvalidState)?;
-    let login = google.verify_state(cookie.value(), state_param)?;
-    let identity = google.complete(code, &login).await?;
+    let identity = google.complete(code, login).await?;
 
     let mut tx = state.pool.begin().await?;
     let user_id = link_user(&mut tx, &identity).await?;
@@ -131,12 +166,13 @@ async fn complete(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "INSERT INTO login_codes (code_hash, user_id, expires_at) \
-         VALUES ($1, $2, now() + make_interval(secs => $3))",
+        "INSERT INTO login_codes (code_hash, user_id, expires_at, code_challenge) \
+         VALUES ($1, $2, now() + make_interval(secs => $3), $4)",
     )
     .bind(sha256_hex(&login_code))
     .bind(user_id)
     .bind(LOGIN_CODE_TTL_SECS)
+    .bind(login.desktop.as_ref().map(|d| &d.code_challenge))
     .execute(&mut *tx)
     .await?;
     audit::record(

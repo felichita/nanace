@@ -6,13 +6,15 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::audit::{self, AuditEvent};
-use crate::auth::{AuthUser, PAT_PREFIX, TokenScope};
+use crate::auth::{AuthMethod, AuthUser, PAT_PREFIX, TokenScope};
 use crate::error::{ApiError, ApiResult};
 use crate::secret::{random_token, sha256_hex};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/me/tokens", web::post().to(create_token))
         .route("/me/tokens", web::get().to(list_tokens))
+        // Before `{token_id}`, which would otherwise match "current".
+        .route("/me/tokens/current", web::delete().to(revoke_current_token))
         .route("/me/tokens/{token_id}", web::delete().to(revoke_token));
 }
 
@@ -123,7 +125,21 @@ async fn list_tokens(state: web::Data<AppState>, user: AuthUser) -> ApiResult<Ht
 
 async fn revoke_token(state: web::Data<AppState>, user: AuthUser, path: web::Path<Uuid>) -> ApiResult<HttpResponse> {
     user.require_session()?;
-    let token_id = path.into_inner();
+    revoke(&state, &user, path.into_inner()).await
+}
+
+/// Revokes the token that authenticates this request (sign-out for clients
+/// such as the desktop app). Any scope may revoke itself.
+async fn revoke_current_token(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+    let AuthMethod::Token { id, .. } = user.method else {
+        return Err(ApiError::BadRequest(
+            "request is not authenticated with a token".to_owned(),
+        ));
+    };
+    revoke(&state, &user, id).await
+}
+
+async fn revoke(state: &AppState, user: &AuthUser, token_id: Uuid) -> ApiResult<HttpResponse> {
     let mut tx = state.pool.begin().await?;
     let revoked =
         sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL")

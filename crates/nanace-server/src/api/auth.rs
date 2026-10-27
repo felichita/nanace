@@ -1,11 +1,13 @@
 use actix_web::{HttpResponse, web};
 use nanace_core::validate;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
+use crate::oauth::pkce_challenge;
 use crate::secret::sha256_hex;
 use crate::{AppState, LOG_COMPONENT};
 
@@ -82,19 +84,30 @@ async fn dev_login(state: web::Data<AppState>, body: web::Json<DevLoginRequest>)
 #[serde(deny_unknown_fields)]
 struct ExchangeRequest {
     code: String,
+    /// PKCE verifier; required for codes issued to the desktop app.
+    code_verifier: Option<String>,
 }
 
 /// Trades a one-time login code from the Google callback for a session
-/// token. Each code works once and expires after a minute.
+/// token. Each code works once and expires after a minute; a wrong verifier
+/// still consumes the code.
 async fn exchange(state: web::Data<AppState>, body: web::Json<ExchangeRequest>) -> ApiResult<HttpResponse> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "WITH used AS (DELETE FROM login_codes WHERE code_hash = $1 AND expires_at > now() RETURNING user_id) \
-         SELECT u.id, u.email FROM used JOIN users u ON u.id = used.user_id",
+    let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "WITH used AS (DELETE FROM login_codes WHERE code_hash = $1 AND expires_at > now() \
+                       RETURNING user_id, code_challenge) \
+         SELECT u.id, u.email, used.code_challenge FROM used JOIN users u ON u.id = used.user_id",
     )
     .bind(sha256_hex(&body.code))
     .fetch_optional(&state.pool)
     .await?;
-    let (user_id, email) = row.ok_or(ApiError::Unauthorized)?;
+    let (user_id, email, challenge) = row.ok_or(ApiError::Unauthorized)?;
+    if let Some(challenge) = challenge {
+        let verifier = body.code_verifier.as_deref().ok_or(ApiError::Unauthorized)?;
+        let matches: bool = pkce_challenge(verifier).as_bytes().ct_eq(challenge.as_bytes()).into();
+        if !matches {
+            return Err(ApiError::Unauthorized);
+        }
+    }
     Ok(HttpResponse::Ok().json(TokenResponse {
         access_token: state.jwt.issue(user_id, &email)?,
         token_type: "Bearer",

@@ -130,6 +130,7 @@ fn google_claims(sub: &str, email: &str, nonce: &str) -> Value {
 /// Runs login -> Google -> callback and returns the callback redirect target.
 async fn google_round_trip<S>(
     app: &S,
+    login_query: &str,
     mock: &Arc<Mutex<MockGoogle>>,
     claims: impl FnOnce(&str) -> Value,
     tamper_state: bool,
@@ -137,7 +138,11 @@ async fn google_round_trip<S>(
 where
     S: Service<actix_http::Request, Response = ServiceResponse, Error = actix_web::Error>,
 {
-    let (status, _, resp) = send(app, test::TestRequest::get().uri("/api/v1/auth/google/login")).await;
+    let (status, _, resp) = send(
+        app,
+        test::TestRequest::get().uri(&format!("/api/v1/auth/google/login{login_query}")),
+    )
+    .await;
     assert_eq!(status, StatusCode::FOUND);
     let auth = query(&location(&resp));
     let cookie = resp.get(SET_COOKIE).unwrap().to_str().unwrap();
@@ -175,9 +180,7 @@ where
     location(&resp)
 }
 
-#[actix_web::test]
-#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
-async fn google_sign_in_flow() {
+async fn mock_google() -> (Arc<Mutex<MockGoogle>>, GoogleOAuth) {
     let mock = Arc::new(Mutex::new(MockGoogle::default()));
     let token_url = start_mock_google(mock.clone()).await;
     let google = GoogleOAuth::with_token_url(
@@ -191,6 +194,13 @@ async fn google_sign_in_flow() {
         token_url,
     )
     .unwrap();
+    (mock, google)
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn google_sign_in_flow() {
+    let (mock, google) = mock_google().await;
     let app = test::init_service(App::new().app_data(state(Some(google)).await).configure(api::configure)).await;
 
     // An admin invites Bob by email before his first sign-in.
@@ -237,6 +247,7 @@ async fn google_sign_in_flow() {
     let sub = format!("google-{id}");
     let target = google_round_trip(
         &app,
+        "",
         &mock,
         |n| google_claims(&sub, &bob_email.to_uppercase(), n),
         false,
@@ -275,15 +286,16 @@ async fn google_sign_in_flow() {
     assert_eq!(me["memberships"][0]["team_role"], "reader");
 
     // Signing in again by subject keeps the same user.
-    let target = google_round_trip(&app, &mock, |n| google_claims(&sub, &bob_email, n), false).await;
+    let target = google_round_trip(&app, "", &mock, |n| google_claims(&sub, &bob_email, n), false).await;
     assert!(target.contains("?code="), "{target}");
 
     // Rejections land on the frontend with an error code.
-    let target = google_round_trip(&app, &mock, |n| google_claims(&sub, &bob_email, n), true).await;
+    let target = google_round_trip(&app, "", &mock, |n| google_claims(&sub, &bob_email, n), true).await;
     assert_eq!(target, format!("{FRONTEND}?error=invalid_state"));
     let other = format!("other-{id}");
     let target = google_round_trip(
         &app,
+        "",
         &mock,
         |n| {
             let mut c = google_claims(&other, &format!("eve.{id}@evil.test"), n);
@@ -294,7 +306,7 @@ async fn google_sign_in_flow() {
     )
     .await;
     assert_eq!(target, format!("{FRONTEND}?error=domain_not_allowed"));
-    let target = google_round_trip(&app, &mock, |n| google_claims(&other, &bob_email, n), false).await;
+    let target = google_round_trip(&app, "", &mock, |n| google_claims(&other, &bob_email, n), false).await;
     assert_eq!(
         target,
         format!("{FRONTEND}?error=account_conflict"),
@@ -302,6 +314,7 @@ async fn google_sign_in_flow() {
     );
     let target = google_round_trip(
         &app,
+        "",
         &mock,
         |n| {
             let mut c = google_claims(&other, &format!("x.{id}@example.test"), n);
@@ -474,4 +487,102 @@ async fn personal_access_tokens() {
     .await
     .unwrap();
     assert_eq!(actions, ["token.create", "token.create", "token.revoke"]);
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn desktop_loopback_sign_in() {
+    let (mock, google) = mock_google().await;
+    let app = test::init_service(App::new().app_data(state(Some(google)).await).configure(api::configure)).await;
+    let verifier = format!("desktop-verifier-{}-{}", unique(), unique());
+    let challenge = pkce_challenge(&verifier);
+    let desktop = format!("?redirect_port=47123&code_challenge={challenge}");
+    const LOOPBACK: &str = "http://127.0.0.1:47123/callback";
+
+    for bad in [
+        format!("?redirect_port=80&code_challenge={challenge}"),
+        "?redirect_port=47123&code_challenge=short".to_owned(),
+        "?redirect_port=47123".to_owned(),
+        format!("?code_challenge={challenge}"),
+        "?redirect_uri=https://evil.test".to_owned(),
+    ] {
+        let (status, _, _) = send(
+            &app,
+            test::TestRequest::get().uri(&format!("/api/v1/auth/google/login{bad}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    let id = unique();
+    let email = format!("desk.{id}@example.test");
+    let sub = format!("desk-{id}");
+    let sign_in = || google_round_trip(&app, &desktop, &mock, |n| google_claims(&sub, &email, n), false);
+    let exchange = |code: &str, verifier: Option<&str>| {
+        test::TestRequest::post()
+            .uri("/api/v1/auth/exchange")
+            .set_json(json!({ "code": code, "code_verifier": verifier }))
+    };
+
+    // The code goes to the loopback listener, never to the web frontend.
+    let target = sign_in().await;
+    assert!(target.starts_with(&format!("{LOOPBACK}?code=")), "{target}");
+    let code = query(&target)["code"].clone();
+    // Without the verifier the code is refused, and it is spent.
+    let (status, _, _) = send(&app, exchange(&code, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = send(&app, exchange(&code, Some(&verifier))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "codes work once");
+
+    let code = query(&sign_in().await)["code"].clone();
+    let (status, _, _) = send(&app, exchange(&code, Some("wrong-verifier"))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let code = query(&sign_in().await)["code"].clone();
+    let (status, session, _) = send(&app, exchange(&code, Some(&verifier))).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let session = session["access_token"].as_str().unwrap().to_owned();
+
+    // Errors after a verified state also reach the desktop app.
+    let target = google_round_trip(
+        &app,
+        &desktop,
+        &mock,
+        |n| {
+            let mut c = google_claims(&sub, &email, n);
+            c["email_verified"] = json!(false);
+            c
+        },
+        false,
+    )
+    .await;
+    assert_eq!(target, format!("{LOOPBACK}?error=email_not_verified"));
+    let target = google_round_trip(&app, &desktop, &mock, |n| google_claims(&sub, &email, n), true).await;
+    assert_eq!(target, format!("{FRONTEND}?error=invalid_state"), "unverifiable state");
+
+    // The desktop app keeps a personal access token and signs out by
+    // revoking it.
+    let auth = |req: test::TestRequest, token: &str| req.insert_header(("Authorization", format!("Bearer {token}")));
+    let (status, pat, _) = send(
+        &app,
+        auth(test::TestRequest::post().uri("/api/v1/me/tokens"), &session)
+            .set_json(json!({ "name": "nanace desktop", "scope": "write" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let pat = pat["token"].as_str().unwrap().to_owned();
+    let (status, _, _) = send(
+        &app,
+        auth(test::TestRequest::delete().uri("/api/v1/me/tokens/current"), &session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a session is not a token");
+    let (status, _, _) = send(
+        &app,
+        auth(test::TestRequest::delete().uri("/api/v1/me/tokens/current"), &pat),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(&app, auth(test::TestRequest::get().uri("/api/v1/me"), &pat)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
