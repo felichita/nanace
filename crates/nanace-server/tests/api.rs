@@ -495,3 +495,484 @@ async fn auth_is_required_and_dev_login_is_opt_in() {
     let (status, body) = c.call("GET", "/healthz", None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+fn edge_set(graph: &Value, kind: &str) -> Vec<(String, String)> {
+    let mut edges: Vec<(String, String)> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .map(|e| {
+            (
+                e["source"].as_str().unwrap().to_owned(),
+                e["target"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    edges.sort();
+    edges
+}
+
+fn titles(list: &Value) -> Vec<String> {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["title"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn wiki_links_and_graph_respect_team_access() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let bob_email = email("bob");
+    let alice = c.login(&email("alice")).await;
+    let bob = c.login(&bob_email).await;
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("graph"), "name": "Graph" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let base = format!("/api/v1/orgs/{}", org["id"].as_str().unwrap());
+    let mut team_ids = Vec::new();
+    for slug in ["docs", "secret"] {
+        let team = c
+            .ok(
+                "POST",
+                &format!("{base}/teams"),
+                &alice,
+                Some(json!({ "slug": slug, "name": slug })),
+                StatusCode::CREATED,
+            )
+            .await;
+        team_ids.push(team["id"].as_str().unwrap().to_owned());
+    }
+    let (docs, secret) = (team_ids[0].clone(), team_ids[1].clone());
+    c.ok(
+        "PUT",
+        &format!("{base}/teams/{docs}/members"),
+        &alice,
+        Some(json!({ "email": bob_email, "role": "reader" })),
+        StatusCode::OK,
+    )
+    .await;
+
+    let create = |team: String, title: &'static str, content: String| {
+        let uri = format!("{base}/teams/{team}/contexts");
+        let alice = alice.clone();
+        let c = &c;
+        async move {
+            let body = c
+                .ok(
+                    "POST",
+                    &uri,
+                    &alice,
+                    Some(json!({ "title": title, "content": content })),
+                    StatusCode::CREATED,
+                )
+                .await;
+            body["id"].as_str().unwrap().to_owned()
+        }
+    };
+    let auth = create(
+        docs.clone(),
+        "Auth Guide",
+        "See [[Deploy Guide]] and [[Secret Plan|the plan]]. `[[Not A Link]]` [[Future Page]]".to_owned(),
+    )
+    .await;
+    let deploy = create(
+        docs.clone(),
+        "Deploy Guide",
+        "Deploying. Back to [[ auth guide ]].".to_owned(),
+    )
+    .await;
+    let plan = create(
+        secret.clone(),
+        "Secret Plan",
+        "Classified, see [[Auth Guide]].".to_owned(),
+    )
+    .await;
+    let twin_body = "kubernetes rollout canary traffic split health probes rollback window ".repeat(20);
+    let twin_a = create(docs.clone(), "Rollout A", twin_body.clone()).await;
+    let twin_b = create(docs.clone(), "Rollout B", twin_body).await;
+
+    let graph_uri = |extra: &str| format!("{base}/graph?min_score=0.9{extra}");
+    let pairs = |pairs: &[(&String, &String)]| {
+        let mut v: Vec<(String, String)> = pairs.iter().map(|(a, b)| ((*a).clone(), (*b).clone())).collect();
+        v.sort();
+        v
+    };
+
+    // Alice reads both teams: every link resolves, case-insensitively.
+    let graph = c.ok("GET", &graph_uri(""), &alice, None, StatusCode::OK).await;
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        edge_set(&graph, "link"),
+        pairs(&[(&auth, &deploy), (&deploy, &auth), (&auth, &plan), (&plan, &auth)])
+    );
+    let semantic = edge_set(&graph, "semantic");
+    assert_eq!(semantic.len(), 1, "{graph}");
+    assert!(semantic[0] == (twin_a.clone(), twin_b.clone()) || semantic[0] == (twin_b.clone(), twin_a.clone()));
+
+    // Bob reads only docs: the secret context and its links never appear.
+    let graph = c.ok("GET", &graph_uri(""), &bob, None, StatusCode::OK).await;
+    let rendered = graph.to_string();
+    assert!(
+        !rendered.contains(&plan) && !rendered.contains("Secret Plan"),
+        "{rendered}"
+    );
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 4);
+    assert_eq!(edge_set(&graph, "link"), pairs(&[(&auth, &deploy), (&deploy, &auth)]));
+    c.ok(
+        "GET",
+        &graph_uri(&format!("&team_id={secret}")),
+        &bob,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let only_docs = c
+        .ok(
+            "GET",
+            &graph_uri(&format!("&team_id={docs}&semantic=false")),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(only_docs["nodes"].as_array().unwrap().len(), 4);
+    assert!(edge_set(&only_docs, "semantic").is_empty());
+    for bad in ["&neighbors=0", "&neighbors=11", "&min_score=2", "&unknown=1"] {
+        c.ok("GET", &graph_uri(bad), &alice, None, StatusCode::BAD_REQUEST)
+            .await;
+    }
+
+    let links = c
+        .ok(
+            "GET",
+            &format!("{base}/contexts/{auth}/links"),
+            &bob,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(titles(&links["outgoing"]), ["Deploy Guide"]);
+    assert_eq!(titles(&links["backlinks"]), ["Deploy Guide"]);
+    let links = c
+        .ok(
+            "GET",
+            &format!("{base}/contexts/{auth}/links"),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(titles(&links["outgoing"]), ["Deploy Guide", "Secret Plan"]);
+    assert_eq!(titles(&links["backlinks"]), ["Deploy Guide", "Secret Plan"]);
+    let links = c
+        .ok(
+            "GET",
+            &format!("{base}/contexts/{twin_a}/links"),
+            &bob,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(titles(&links["related"])[0], "Rollout B");
+    c.ok(
+        "GET",
+        &format!("{base}/contexts/{plan}/links"),
+        &bob,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // RLS on context_links holds below the application: a reader sees no
+    // links from unreadable contexts and cannot write links.
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let bob_id: Uuid = c.ok("GET", "/api/v1/me", &bob, None, StatusCode::OK).await["user_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM context_links WHERE source_id = ANY($1)")
+        .bind([plan.parse::<Uuid>().unwrap(), auth.parse::<Uuid>().unwrap()])
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(visible, 3, "auth's three links only, none of the plan's");
+    let insert = sqlx::query("INSERT INTO context_links (org_id, source_id, target_key) VALUES ($1, $2, 'x')")
+        .bind(org_id)
+        .bind(auth.parse::<Uuid>().unwrap())
+        .execute(&mut *tx)
+        .await;
+    assert!(insert.is_err(), "readers cannot insert links");
+    drop(tx);
+
+    // A link to a page that does not exist yet resolves once it is created.
+    let future = create(docs.clone(), "Future Page", String::new()).await; // blank pages are allowed
+    let graph = c
+        .ok("GET", &graph_uri("&semantic=false"), &bob, None, StatusCode::OK)
+        .await;
+    assert!(edge_set(&graph, "link").contains(&(auth.clone(), future.clone())));
+
+    // Edits based on a stale version are rejected.
+    let current = c
+        .ok(
+            "GET",
+            &format!("{base}/contexts/{deploy}"),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    let edit = |base_updated_at: &Value| {
+        Some(json!({
+            "title": "Deploy Guide",
+            "content": "Deploying, no links now.",
+            "base_updated_at": base_updated_at,
+        }))
+    };
+    let updated = c
+        .ok(
+            "PUT",
+            &format!("{base}/contexts/{deploy}"),
+            &alice,
+            edit(&current["updated_at"]),
+            StatusCode::OK,
+        )
+        .await;
+    assert_ne!(updated["updated_at"], current["updated_at"]);
+    c.ok(
+        "PUT",
+        &format!("{base}/contexts/{deploy}"),
+        &alice,
+        edit(&current["updated_at"]),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let graph = c
+        .ok("GET", &graph_uri("&semantic=false"), &alice, None, StatusCode::OK)
+        .await;
+    assert!(
+        !edge_set(&graph, "link").contains(&(deploy.clone(), auth.clone())),
+        "edit replaces links"
+    );
+
+    // Deleting a context removes its outgoing links with it.
+    c.ok(
+        "DELETE",
+        &format!("{base}/contexts/{auth}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let graph = c
+        .ok("GET", &graph_uri("&semantic=false"), &alice, None, StatusCode::OK)
+        .await;
+    assert_eq!(edge_set(&graph, "link"), pairs(&[]));
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn trash_restore_and_purge() {
+    let c = Client {
+        app: test::init_service(App::new().app_data(state(true).await).configure(api::configure)).await,
+    };
+    let (bob_email, carol_email) = (email("bob"), email("carol"));
+    let alice = c.login(&email("alice")).await;
+    let bob = c.login(&bob_email).await;
+    let carol = c.login(&carol_email).await;
+    let alice_id = c.ok("GET", "/api/v1/me", &alice, None, StatusCode::OK).await["user_id"].clone();
+    let carol_id = c.ok("GET", "/api/v1/me", &carol, None, StatusCode::OK).await["user_id"].clone();
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("trash"), "name": "Trash" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let base = format!("/api/v1/orgs/{}", org["id"].as_str().unwrap());
+    let team = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "docs", "name": "Docs" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let team = team["id"].as_str().unwrap();
+    for (who, role) in [(&bob_email, "reader"), (&carol_email, "writer")] {
+        c.ok(
+            "PUT",
+            &format!("{base}/teams/{team}/members"),
+            &alice,
+            Some(json!({ "email": who, "role": role })),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let create = |title: &str, content: &str| Some(json!({ "title": title, "content": content, "tags": ["kept"] }));
+    let alpha = c
+        .ok(
+            "POST",
+            &format!("{base}/teams/{team}/contexts"),
+            &alice,
+            create("Alpha", "zebra migration notes, see [[Beta]]"),
+            StatusCode::CREATED,
+        )
+        .await;
+    let alpha = alpha["id"].as_str().unwrap().to_owned();
+    c.ok(
+        "POST",
+        &format!("{base}/teams/{team}/contexts"),
+        &alice,
+        create("Beta", "other"),
+        StatusCode::CREATED,
+    )
+    .await;
+    let search = |token: String| {
+        let uri = format!("{base}/search");
+        let c = &c;
+        async move {
+            ids(&c
+                .ok(
+                    "POST",
+                    &uri,
+                    &token,
+                    Some(json!({ "query": "zebra migration" })),
+                    StatusCode::OK,
+                )
+                .await)
+        }
+    };
+    let links = |token: String| {
+        let uri = format!("{base}/graph?semantic=false");
+        let c = &c;
+        async move { edge_set(&c.ok("GET", &uri, &token, None, StatusCode::OK).await, "link") }
+    };
+
+    // Readers cannot delete; a writer moves the page to the trash.
+    let (status, _) = c
+        .call("DELETE", &format!("{base}/contexts/{alpha}"), Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    c.ok(
+        "DELETE",
+        &format!("{base}/contexts/{alpha}"),
+        &carol,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok(
+        "GET",
+        &format!("{base}/contexts/{alpha}"),
+        &alice,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(!search(alice.clone()).await.contains(&alpha));
+    assert!(links(alice.clone()).await.is_empty());
+
+    // Only writers see the trash.
+    let trash = c.ok("GET", &format!("{base}/trash"), &bob, None, StatusCode::OK).await;
+    assert_eq!(trash, json!([]));
+    let trash = c
+        .ok("GET", &format!("{base}/trash"), &alice, None, StatusCode::OK)
+        .await;
+    assert_eq!(trash.as_array().unwrap().len(), 1);
+    assert_eq!(trash[0]["title"], "Alpha");
+    assert_eq!(trash[0]["deleted_by_email"], carol_email);
+    assert!(trash.to_string().find("zebra").is_none(), "trash lists titles only");
+    let outsider = c.login(&email("eve")).await;
+    c.ok("GET", &format!("{base}/trash"), &outsider, None, StatusCode::NOT_FOUND)
+        .await;
+
+    // Restore keeps the id, author, tags, links and search.
+    c.ok(
+        "POST",
+        &format!("{base}/trash/{alpha}/restore"),
+        &bob,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let restored = c
+        .ok(
+            "POST",
+            &format!("{base}/trash/{alpha}/restore"),
+            &carol,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(restored["id"], alpha);
+    assert_eq!(restored["created_by"], alice_id);
+    assert_eq!(restored["updated_by"], carol_id);
+    assert_eq!(restored["tags"], json!(["kept"]));
+    assert!(search(bob.clone()).await.contains(&alpha));
+    assert_eq!(links(bob.clone()).await.len(), 1);
+    c.ok(
+        "POST",
+        &format!("{base}/trash/{alpha}/restore"),
+        &carol,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Purge is permanent.
+    c.ok(
+        "DELETE",
+        &format!("{base}/contexts/{alpha}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok(
+        "DELETE",
+        &format!("{base}/trash/{alpha}"),
+        &bob,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    c.ok(
+        "DELETE",
+        &format!("{base}/trash/{alpha}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok(
+        "POST",
+        &format!("{base}/trash/{alpha}/restore"),
+        &alice,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(
+        c.ok("GET", &format!("{base}/trash"), &alice, None, StatusCode::OK)
+            .await,
+        json!([])
+    );
+}

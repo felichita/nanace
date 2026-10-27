@@ -3,10 +3,12 @@ mod auth;
 mod complete_page;
 mod contexts;
 mod google;
+mod graph;
 mod orgs;
 mod search;
 mod teams;
 mod tokens;
+mod trash;
 
 use actix_web::{HttpResponse, web};
 
@@ -29,7 +31,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 .configure(orgs::configure)
                 .configure(teams::configure)
                 .configure(contexts::configure)
+                .configure(trash::configure)
                 .configure(search::configure)
+                .configure(graph::configure)
                 .configure(audit_logs::configure),
         );
 }

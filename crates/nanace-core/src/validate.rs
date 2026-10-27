@@ -86,10 +86,9 @@ pub fn title(value: &str) -> Result<String, ValidationError> {
     Ok(trimmed.to_owned())
 }
 
+/// Content may be empty: a new page starts blank and is still findable by
+/// its title.
 pub fn content(value: &str) -> Result<(), ValidationError> {
-    if value.trim().is_empty() {
-        return Err(invalid("content", "must not be empty"));
-    }
     if value.len() > MAX_CONTENT_BYTES {
         return Err(invalid("content", "exceeds 256 KiB"));
     }
@@ -163,7 +162,7 @@ mod tests {
         assert!(title(&"x".repeat(MAX_TITLE_CHARS)).is_ok());
         assert!(title(&"x".repeat(MAX_TITLE_CHARS + 1)).is_err());
         assert!(title("a\nb").is_err());
-        assert!(content(" \n ").is_err());
+        assert!(content("").is_ok());
         assert!(content(&"x".repeat(MAX_CONTENT_BYTES)).is_ok());
         assert!(content(&"x".repeat(MAX_CONTENT_BYTES + 1)).is_err());
     }

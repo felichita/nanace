@@ -1,10 +1,12 @@
 //! Domain types and pure logic shared by the nanace backend crates.
 
 pub mod chunk;
+pub mod links;
 pub mod role;
 pub mod validate;
 
 pub use chunk::chunk_markdown;
+pub use links::wiki_links;
 pub use role::{OrgRole, TeamRole};
 
 use sha2::{Digest, Sha256};

@@ -9,10 +9,13 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
+use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::value::Kind;
+use qdrant_client::qdrant::vector_output::Vector;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FieldType,
-    Filter, PointStruct, QueryPointsBuilder, Range, UpsertPointsBuilder, VectorParamsBuilder,
+    Filter, GetPointsBuilder, PayloadIncludeSelector, PointId, PointStruct, QueryBatchPointsBuilder,
+    QueryPointsBuilder, Range, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
 use uuid::Uuid;
@@ -32,6 +35,19 @@ pub struct ChunkHit {
     pub text: String,
 }
 
+/// A semantically similar context, found from `source`'s first chunk.
+pub struct Neighbor {
+    pub source: Uuid,
+    pub target: Uuid,
+    pub score: f32,
+}
+
+/// Contexts per Qdrant request when computing neighbors.
+const NEIGHBOR_BATCH: usize = 128;
+/// Chunk hits fetched per requested neighbor; several chunks of one context
+/// can be the closest.
+const NEIGHBOR_OVERFETCH: u64 = 4;
+
 pub struct VectorStore {
     client: Qdrant,
     dimensions: u64,
@@ -39,6 +55,21 @@ pub struct VectorStore {
 
 pub fn collection_name(org_id: Uuid) -> String {
     format!("contexts_{}", org_id.simple())
+}
+
+fn team_filter(org_id: Uuid, team_ids: &[Uuid]) -> Vec<Condition> {
+    let teams: Vec<String> = team_ids.iter().map(Uuid::to_string).collect();
+    vec![
+        Condition::matches("org_id", org_id.to_string()),
+        Condition::matches("team_id", teams),
+    ]
+}
+
+fn payload_string(payload: &HashMap<String, qdrant_client::qdrant::Value>, key: &str) -> Option<String> {
+    match payload.get(key).and_then(|v| v.kind.as_ref()) {
+        Some(Kind::StringValue(s)) => Some(s.clone()),
+        _ => None,
+    }
 }
 
 fn point_id(context_id: Uuid, chunk_index: usize) -> String {
@@ -178,16 +209,12 @@ impl VectorStore {
         if !self.client.collection_exists(&name).await? {
             return Ok(Vec::new());
         }
-        let teams: Vec<String> = team_ids.iter().map(Uuid::to_string).collect();
         let response = self
             .client
             .query(
                 QueryPointsBuilder::new(&name)
                     .query(vector)
-                    .filter(Filter::must([
-                        Condition::matches("org_id", org_id.to_string()),
-                        Condition::matches("team_id", teams),
-                    ]))
+                    .filter(Filter::must(team_filter(org_id, team_ids)))
                     .limit(limit)
                     .with_payload(true),
             )
@@ -198,18 +225,98 @@ impl VectorStore {
             .result
             .into_iter()
             .filter_map(|point| {
-                let payload: HashMap<_, _> = point.payload;
-                let text_of = |key: &str| match payload.get(key).and_then(|v| v.kind.as_ref()) {
-                    Some(Kind::StringValue(s)) => Some(s.clone()),
-                    _ => None,
-                };
                 Some(ChunkHit {
-                    context_id: text_of("context_id")?.parse().ok()?,
+                    context_id: payload_string(&point.payload, "context_id")?.parse().ok()?,
                     score: point.score,
-                    text: text_of("text")?,
+                    text: payload_string(&point.payload, "text")?,
                 })
             })
             .collect())
+    }
+
+    /// Up to `per_context` most similar other contexts for each of
+    /// `context_ids`, restricted to `team_ids` and scoring at least
+    /// `min_score`. Each context is represented by its first chunk; contexts
+    /// without stored vectors are skipped. `team_ids` must be non-empty.
+    pub async fn neighbors(
+        &self,
+        org_id: Uuid,
+        team_ids: &[Uuid],
+        context_ids: &[Uuid],
+        per_context: u64,
+        min_score: f32,
+    ) -> anyhow::Result<Vec<Neighbor>> {
+        anyhow::ensure!(!team_ids.is_empty(), "neighbor search requires at least one team");
+        let name = collection_name(org_id);
+        if context_ids.is_empty() || !self.client.collection_exists(&name).await? {
+            return Ok(Vec::new());
+        }
+        let mut neighbors = Vec::new();
+        for batch in context_ids.chunks(NEIGHBOR_BATCH) {
+            let by_point: HashMap<String, Uuid> = batch.iter().map(|&id| (point_id(id, 0), id)).collect();
+            let ids: Vec<PointId> = by_point.keys().map(|p| PointId::from(p.clone())).collect();
+            // Fetch vectors first: querying by a point id that was deleted
+            // concurrently would fail the whole batch.
+            let points = self
+                .client
+                .get_points(GetPointsBuilder::new(&name, ids).with_vectors(true).with_payload(false))
+                .await
+                .context("failed to fetch context vectors")?;
+            let mut sources = Vec::new();
+            let mut queries = Vec::new();
+            for point in points.result {
+                let Some(PointIdOptions::Uuid(pid)) = point.id.and_then(|id| id.point_id_options) else {
+                    continue;
+                };
+                let Some(&source) = by_point.get(&pid) else { continue };
+                let Some(Vector::Dense(dense)) = point.vectors.and_then(|v| v.get_vector()) else {
+                    continue;
+                };
+                sources.push(source);
+                queries.push(
+                    QueryPointsBuilder::new(&name)
+                        .query(dense.data)
+                        .filter(Filter {
+                            must: team_filter(org_id, team_ids),
+                            must_not: vec![Condition::matches("context_id", source.to_string())],
+                            ..Default::default()
+                        })
+                        .limit(per_context * NEIGHBOR_OVERFETCH)
+                        .score_threshold(min_score)
+                        .with_payload(PayloadIncludeSelector::new(vec!["context_id".to_owned()]))
+                        .build(),
+                );
+            }
+            if queries.is_empty() {
+                continue;
+            }
+            let response = self
+                .client
+                .query_batch(QueryBatchPointsBuilder::new(&name, queries))
+                .await
+                .context("Qdrant batch query failed")?;
+            for (source, result) in sources.into_iter().zip(response.result) {
+                let mut seen: Vec<Uuid> = Vec::new();
+                for point in result.result {
+                    let Some(target) = payload_string(&point.payload, "context_id").and_then(|s| s.parse().ok()) else {
+                        continue;
+                    };
+                    if seen.contains(&target) {
+                        continue;
+                    }
+                    seen.push(target);
+                    neighbors.push(Neighbor {
+                        source,
+                        target,
+                        score: point.score,
+                    });
+                    if seen.len() as u64 == per_context {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(neighbors)
     }
 }
 
