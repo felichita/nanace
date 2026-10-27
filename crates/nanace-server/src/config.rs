@@ -170,7 +170,7 @@ mod tests {
     fn rejects_weak_or_malformed_settings() {
         assert!(config(&[("NANACE_JWT_SECRET", "short")]).is_err());
         assert!(config(&[("NANACE_DEV_LOGIN", "yes")]).is_err());
-        assert!(config(&[("NANACE_EMBEDDER", "openai")]).is_err());
+        assert!(config(&[("NANACE_EMBEDDER", "unknown-model")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "59")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "86401")]).is_err());
         assert!(config(&[("NANACE_BIND", "localhost")]).is_err());

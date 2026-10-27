@@ -163,7 +163,7 @@ async fn graph(
             *score = score.max(n.score);
         }
         let mut similar: Vec<_> = best.into_iter().collect();
-        similar.sort_by(|a, b| a.0.cmp(&b.0));
+        similar.sort_by_key(|(pair, _)| *pair);
         edges.extend(similar.into_iter().map(|((source, target), score)| Edge {
             source,
             target,

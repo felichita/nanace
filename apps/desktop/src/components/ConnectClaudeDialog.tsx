@@ -185,7 +185,7 @@ export function ConnectClaudeDialog({ serverUrl, onClose }: { serverUrl: string;
       {done && (
         <div className="mt-3 rounded-md bg-[#0f7b6c]/10 px-3 py-2 text-sm">
           Connected. {TARGETS.filter((t) => done.includes(t.id)).map((t) => t.after).join(" ")}
-          <div className="mt-1 text-ink-2">Try asking Claude: “Search nanace for what is still open on Envoy.”</div>
+          <div className="mt-1 text-ink-2">Try asking Claude: “Search nanace for our deployment checklist.”</div>
         </div>
       )}
 
