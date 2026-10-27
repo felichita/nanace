@@ -9,7 +9,7 @@
     "check": "tsc --noEmit && vitest run",
     "tauri": "tauri",
     "test": "vitest run",
-    "mcp": "./scripts/build-mcp.sh"
+    "mcp": "node scripts/build-mcp.mjs"
   },
   "dependencies": {
     "@blocknote/core": "0.56.0",

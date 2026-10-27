@@ -83,6 +83,24 @@ email. **Import Claude memory**, in the sidebar or ⌘K, turns Claude Code's
 memory files (`~/.claude/projects/*/memory`) into linked pages. The app stores a personal access token named "nanace desktop" in the
 macOS Keychain (or the OS keyring).
 
+## Releases
+
+Prebuilt downloads are on the GitHub Releases page:
+
+- **Desktop app:** macOS (Apple silicon and Intel), Windows x64, and Linux
+  x64/arm64 (AppImage, deb, rpm).
+- **Server and MCP archives:** Linux x64/arm64, macOS arm64, Windows x64.
+
+To publish a release, push a version tag:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The `Release` workflow builds everything on native runners, uploads it to a
+draft release, and publishes it when every build succeeds. Builds are not
+code-signed yet.
+
 ## Development
 
 ```bash

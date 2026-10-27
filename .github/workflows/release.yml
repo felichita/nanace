@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-24.04
+    outputs:
+      id: ${{ steps.release.outputs.id }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "nanace $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  server:
+    name: Server ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 builds run on older glibc, so they work on more distros.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p nanace-server -p nanace-mcp
+      - name: Package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="nanace-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/nanace-server$ext" "target/${{ matrix.target }}/release/nanace-mcp$ext" \
+            README.md .env.example "$name/"
+          if [[ -n "$ext" ]]; then
+            archive="$name.zip"; 7z a -bso0 "$archive" "$name"
+          else
+            archive="$name.tar.gz"; tar czf "$archive" "$name"
+          fi
+          if command -v sha256sum >/dev/null; then sha256sum "$archive" > "$archive.sha256"; else shasum -a 256 "$archive" > "$archive.sha256"; fi
+          gh release upload "$GITHUB_REF_NAME" "$archive" "$archive.sha256" --clobber
+
+  desktop:
+    name: Desktop ${{ matrix.name }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS arm64, os: macos-latest, target: aarch64-apple-darwin, args: "--target aarch64-apple-darwin" }
+          - { name: macOS x64, os: macos-latest, target: x86_64-apple-darwin, args: "--target x86_64-apple-darwin" }
+          - { name: Linux x64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, args: "" }
+          - { name: Linux arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, args: "" }
+          - { name: Windows x64, os: windows-latest, target: x86_64-pc-windows-msvc, args: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Tauri system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+        working-directory: apps/desktop
+      # beforeBuildCommand builds the nanace-mcp sidecar for the target.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: npm run tauri
+          releaseId: ${{ needs.create-release.outputs.id }}
+          args: ${{ matrix.args }}
+
+  publish:
+    name: Publish release
+    needs: [create-release, server, desktop]
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
