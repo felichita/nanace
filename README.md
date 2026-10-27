@@ -32,7 +32,10 @@ curl -s -X POST localhost:8080/api/v1/auth/dev-login \
 
 ## Connect Claude (MCP)
 
-Build the MCP server once:
+In the desktop app, choose **Connect to Claude** in the sidebar. It
+registers the bundled MCP server with Claude Code (all projects) and/or
+Claude Desktop, each with its own read-only token. To set it up by hand
+instead, build the MCP server once:
 
 ```bash
 cargo build --release -p nanace-mcp
@@ -66,10 +69,25 @@ Claude Desktop (`claude_desktop_config.json`):
 Against a development API you can use `NANACE_DEV_EMAIL=you@example.com`
 instead of a token. `NANACE_ORG_ID` picks a default organization.
 
+## Desktop app
+
+Requires Node 20+ and the Rust toolchain. With the API running:
+
+```bash
+make desktop-dev        # npm install + tauri dev
+make desktop-build      # release bundle in apps/desktop/src-tauri/target/release/bundle
+```
+
+Sign in with Google (opens your browser) or, against a dev server, with any
+email. **Import Claude memory**, in the sidebar or ⌘K, turns Claude Code's
+memory files (`~/.claude/projects/*/memory`) into linked pages. The app stores a personal access token named "nanace desktop" in the
+macOS Keychain (or the OS keyring).
+
 ## Development
 
 ```bash
 make check              # fmt, clippy -D warnings, unit tests
 make test-integration   # API, RLS and MCP tests against docker compose
 make test-model         # real embedding model test
+make desktop-check      # desktop: tsc, vitest, clippy, Rust tests
 ```

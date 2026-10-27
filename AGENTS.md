@@ -49,6 +49,7 @@ make check              # fmt check + clippy -D warnings + unit tests
 make test-integration   # API, RLS and MCP tests against compose services
 make test-model         # real bge-small model test (downloads ~130 MB once)
 make run                # run the API with .env (copy from .env.example)
+make desktop-check      # desktop app: tsc, vitest, Tauri clippy + tests
 cargo test -p <crate>   # test one crate
 ```
 
@@ -87,6 +88,7 @@ Select checks from the final task-owned diff.
 - **Embedding or chunking changes:** also run `make test-model` when the
   real model's behavior matters.
 - **Broad cross-crate changes:** `make check` plus the integration tests.
+- **Desktop app (`apps/desktop`):** `make desktop-check`.
 
 Never weaken a gate to get green: do not suppress lints, ignore tests, or relax
 assertions unless changing that policy is itself the task. Integration tests
@@ -150,6 +152,14 @@ only for changed code, new evidence, or an explicit re-review request.
   `AuthUser::require_session`.
 - Store only hashes of tokens and login codes; never log or return a secret
   after creation. Session tokens never go in URLs.
+- The desktop webview never sees tokens: API calls go through the Tauri
+  `api` command, which only reaches `<server>/api/v1/`. Do not add Tauri
+  permissions or commands that expose HTTP, the filesystem, or the shell to
+  the webview. The one file read is `scan_claude_memory`: fixed to
+  `~/.claude/projects/*/memory/*.md`, no symlinks, size-capped. The one
+  config write is "Connect to Claude": `claude mcp add/remove --scope user`
+  (the CLI, never editing `~/.claude.json` directly) and a merge of the
+  `nanace` entry in Claude Desktop's config. Both use read-scoped tokens.
 - `GoogleOAuth::with_token_url` exists for tests: the ID token signature is
   not checked, so production must use Google's HTTPS token endpoint.
 

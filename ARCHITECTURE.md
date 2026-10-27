@@ -9,16 +9,49 @@ agreed design that is not implemented yet.
 
 ## Three Layers
 
-### 1. Frontend (React) [planned]
+### 1. Desktop app (Tauri + React) [built]
 
-User interface:
+`apps/desktop`: a desktop app with a page tree, a block editor and a graph view.
 
-- Markdown editor for creating contexts
-- Team management
-- Permission controls
-- Search and browsing of contexts
+- **Shell:** Tauri 2 (Rust). The webview never holds credentials: it calls
+  one `api` command, which attaches a personal access token kept in the OS
+  keychain and only reaches `<server>/api/v1/...`. External links open in the
+  system browser; the webview cannot navigate away from the app.
+- **UI:** React, TypeScript, Vite, Tailwind, TanStack Query.
+  - Sidebar with workspaces (orgs), teamspaces and pages.
+  - BlockNote block editor with markdown round-trip. Readers get a read-only
+    view.
+  - Page mentions: type `@` to link a page. Mentions are stored as
+    `[[Title]]`.
+  - ⌘K search: title matches plus semantic results.
+  - Backlinks, links and related pages under each page.
+  - Force-directed graph view (react-force-graph).
+- **Editing:**
+  - Autosave sends `base_updated_at`. When the page changed in the meantime,
+    the server answers `409`, and the app offers a reload instead of
+    overwriting.
+- **Claude memory import:**
+  - **Reading:** the button reads Claude Code memory files
+    (`~/.claude/projects/*/memory/*.md`) through one read-only Tauri command.
+  - **Conversion:** each memory becomes a page. Its title comes from the
+    project's `MEMORY.md`, `[[name]]` links are rewritten to `[[Title]]`,
+    and the page gets the tags `claude-memory`, the project and the memory
+    type.
+  - **Re-import:** a `Source:` footer identifies the file, so importing again
+    skips it, or updates it only when the user asks.
+- **Connect to Claude:**
+  - **Bundling:** `nanace-mcp` ships as a Tauri sidecar.
+  - **Registration:** the button registers it with Claude Code
+    (`claude mcp add --scope user`) and/or Claude Desktop (merges the
+    `nanace` entry into `claude_desktop_config.json`).
+  - **Tokens:** each app gets its own read-scoped token. Minting one needs a
+    fresh interactive sign-in. Reconnecting revokes the previous token, and
+    disconnecting revokes it with itself.
+- **Sign-in:** Google in the system browser with a loopback redirect and PKCE
+  (RFC 8252), or dev email login. Both end with a write-scoped personal
+  access token. Signing out revokes that token.
 
-Talks to the backend over REST (and WebSocket for live updates).
+Live collaboration (WebSocket, CRDT) is **[planned]**.
 
 ### 2. Backend (Rust + Actix-web)
 
@@ -174,6 +207,15 @@ Google  -> GET /api/v1/auth/google/callback?code&state
 Frontend -> POST /api/v1/auth/exchange {code}  -> session JWT (single use, 60 s)
 ```
 
+The desktop app adds two parameters to the login request:
+`redirect_port` (1024 or above) and an S256 `code_challenge`.
+
+- Both are signed into the state cookie.
+- The callback then redirects to `http://127.0.0.1:<port>/callback`.
+- The issued login code can only be exchanged with the matching
+  `code_verifier`.
+- A wrong or missing verifier still consumes the code.
+
 - The ID token is not signature-checked: it comes straight from Google's
   token endpoint over TLS, which OpenID Connect Core §3.1.3.7 allows.
 - Users are matched by Google subject, then by email for people invited
@@ -183,8 +225,8 @@ Frontend -> POST /api/v1/auth/exchange {code}  -> session JWT (single use, 60 s)
   those domains (the `hd` claim), not merely matching email suffixes.
 - Session token in the URL is avoided: only the one-time code is, and the
   landing page strips it and sends `Referrer-Policy: no-referrer`.
-- Until the React app exists, the default frontend URL is a built-in page
-  (`/auth/complete`) for signing in and managing access tokens.
+- Browsers land on a built-in page (`/auth/complete`) by default. It lets
+  you sign in and manage access tokens.
 
 **Personal access tokens** (`nnc_pat_…`):
 
@@ -198,6 +240,34 @@ Frontend -> POST /api/v1/auth/exchange {code}  -> session JWT (single use, 60 s)
   token cannot mint new ones.
 - Tokens carry the user's identity only; team permissions still come from
   PostgreSQL on every request.
+
+### Links and graph [built]
+
+- **Link syntax:** a context links to another with `[[Title]]` or
+  `[[Title|label]]`. Text in code is ignored.
+- **Storage:** on every create or update, the links are stored in
+  `context_links` as `lower(title)` keys.
+- **Resolution:** keys are resolved at read time by joining `contexts` on
+  `lower(title)`. Both tables are under RLS, so links only resolve to
+  contexts the reader can see, and a link starts resolving once its target
+  page is created.
+- **Similarity edges:** Qdrant nearest-neighbour queries from each context's
+  first-chunk vector, filtered by org and readable teams. Only edges between
+  nodes read from PostgreSQL are returned.
+- **Not audited:** the graph and links endpoints return titles only, like
+  listing, so they are not audited as content reads.
+
+### Trash [built]
+
+- **Deleting:** deleting a context moves it to `context_trash` and removes its
+  vectors and links. Trashed pages are outside `contexts`, so search, the
+  graph and MCP never see them.
+- **Who has access:** RLS limits the trash to team writers and admins.
+- **Restoring:** a restore puts the row back with its id and original author,
+  and re-embeds the content. The `contexts` INSERT policy accepts another
+  user's `created_by` only for a row coming back from the trash.
+- **Purging** deletes the trashed row permanently.
+- Automatic purge after N days is **[planned]**.
 
 ### Google Workspace group sync [planned]
 
@@ -313,6 +383,7 @@ Claude Desktop / Claude Code
 | `crates/nanace-embed` | `Embedder` trait, `FastEmbedder` (bge-small), `HashingEmbedder` |
 | `crates/nanace-server` | Actix-web API, auth, RBAC, RLS-scoped DB access, Qdrant, audit, migrations |
 | `crates/nanace-mcp` | stdio MCP server; read-only tools over the REST API |
+| `apps/desktop` | Tauri desktop app (React UI in `src`, Rust shell in `src-tauri`) |
 | `deploy/postgres` | Local database bootstrap (non-superuser app role) |
 | `docker-compose.yml` | PostgreSQL 18 and Qdrant for development |
 
@@ -325,6 +396,7 @@ Claude Desktop / Claude Code
 | `POST` | `/api/v1/auth/exchange` | One-time login code holder |
 | `GET/POST` | `/api/v1/me/tokens` | Authenticated / session only |
 | `DELETE` | `/api/v1/me/tokens/{id}` | Session only |
+| `DELETE` | `/api/v1/me/tokens/current` | The token itself (sign-out) |
 | `GET` | `/api/v1/me` | Authenticated |
 | `POST` | `/api/v1/orgs` | Authenticated; caller becomes org admin |
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |
@@ -332,6 +404,11 @@ Claude Desktop / Claude Code
 | `DELETE` | `/api/v1/orgs/{org}/teams/{team}/members/{user}` | Team admin or org admin |
 | `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader / team writer |
 | `GET/PUT/DELETE` | `/api/v1/orgs/{org}/contexts/{id}` | Team reader / team writer / team writer |
+| `GET` | `/api/v1/orgs/{org}/contexts/{id}/links` | Team reader; outgoing, backlinks, related |
+| `GET` | `/api/v1/orgs/{org}/graph` | Org member; readable contexts, link and similarity edges |
+| `GET` | `/api/v1/orgs/{org}/trash` | Team writer; trashed pages of writable teams |
+| `POST` | `/api/v1/orgs/{org}/trash/{id}/restore` | Team writer |
+| `DELETE` | `/api/v1/orgs/{org}/trash/{id}` | Team writer; permanent |
 | `POST` | `/api/v1/orgs/{org}/search` | Org member; results limited to readable teams |
 | `GET` | `/api/v1/orgs/{org}/audit-logs` | Org admin |
 | `GET` | `/healthz` | Anyone |
