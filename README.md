@@ -72,6 +72,17 @@ instead of a token. `NANACE_ORG_ID` picks a default organization.
 `NANACE_ALLOW_WRITES=true` (with a write-scoped token) adds the
 `create_context` and `update_context` tools.
 
+### Work-log skill for Claude Code
+
+`integrations/claude-code/skills/nanace` is a Claude Code skill: `/nanace
+PROJECT-2345` records what was done in the current session on the task's page
+(appending a dated section, or creating the page). It needs the write tools
+(**Allow Claude to create and edit pages**). Install it for all projects:
+
+```bash
+mkdir -p ~/.claude/skills && cp -r integrations/claude-code/skills/nanace ~/.claude/skills/
+```
+
 ## Desktop app
 
 Requires Node 20+ and the Rust toolchain. With the API running:
