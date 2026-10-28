@@ -24,6 +24,8 @@ struct AuditQuery {
 struct AuditRow {
     id: i64,
     actor_user_id: Option<Uuid>,
+    /// Null for system actions.
+    actor_email: Option<String>,
     action: String,
     resource_type: String,
     resource_id: Option<Uuid>,
@@ -44,9 +46,11 @@ async fn list_audit_logs(
         return Err(ApiError::BadRequest("limit must be 1-500".to_owned()));
     }
     let rows: Vec<AuditRow> = sqlx::query_as(
-        "SELECT id, actor_user_id, action, resource_type, resource_id, details, created_at \
-         FROM audit_logs WHERE org_id = $1 AND ($2::bigint IS NULL OR id < $2) \
-         ORDER BY id DESC LIMIT $3",
+        "SELECT a.id, a.actor_user_id, u.email AS actor_email, a.action, a.resource_type, a.resource_id, \
+                a.details, a.created_at \
+         FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id \
+         WHERE a.org_id = $1 AND ($2::bigint IS NULL OR a.id < $2) \
+         ORDER BY a.id DESC LIMIT $3",
     )
     .bind(org_id)
     .bind(query.before_id)

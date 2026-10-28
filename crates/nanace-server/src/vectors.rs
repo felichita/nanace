@@ -201,6 +201,18 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Deletes the org's collection, if any.
+    pub async fn delete_collection(&self, org_id: Uuid) -> anyhow::Result<()> {
+        let name = collection_name(org_id);
+        if self.client.collection_exists(&name).await? {
+            self.client
+                .delete_collection(&name)
+                .await
+                .context("failed to delete Qdrant collection")?;
+        }
+        Ok(())
+    }
+
     /// Deletes the org's collection (if any) and creates it again empty, with
     /// the current embedding dimensions.
     pub async fn recreate_collection(&self, org_id: Uuid) -> anyhow::Result<()> {

@@ -291,6 +291,28 @@ The desktop app adds two parameters to the login request:
   server task does this under RLS as a writer of each team and audits it as
   `system.trash_purge`. The trash list shows each page's `purge_at`.
 
+### Account and organization deletion [built]
+
+**`DELETE /me`** (session only) erases the caller's account:
+
+- **What goes:** memberships, tokens and login codes are deleted.
+- **What stays:** the user row is kept because pages and audit entries
+  reference it, but it is anonymized and marked `deleted_at`. Sessions and
+  tokens stop working on the next request.
+- **Organizations:** those where the caller is the only member are deleted.
+  Pages in shared teams stay with the team.
+- **Last admin:** refused while the caller is the last admin of an
+  organization that still has members.
+- **Signing in again** with the same email starts a new, empty account.
+
+**`DELETE /orgs/{org}`** (org admin, confirmed with the slug) deletes the
+organization:
+
+- **What goes:** teams, pages, links, trash, the org's audit history and its
+  Qdrant collection. Pages are removed by the foreign-key cascade, which
+  PostgreSQL runs without row security.
+- **What stays:** an `org.delete` entry with no org.
+
 ### Google Workspace group sync [planned]
 
 ```text
@@ -468,6 +490,9 @@ Claude Desktop / Claude Code
 | `POST` | `/api/v1/me/tokens/current/rotate` | The token itself; same name, scope and lifetime |
 | `GET` | `/api/v1/me` | Authenticated |
 | `POST` | `/api/v1/orgs` | Authenticated; caller becomes org admin |
+| `PATCH` | `/api/v1/orgs/{org}` | Org admin; rename |
+| `DELETE` | `/api/v1/orgs/{org}` | Org admin; body `{"confirm": "<slug>"}`; deletes everything in it |
+| `DELETE` | `/api/v1/me` | Session only; erases the caller's account (GDPR) |
 | `GET` | `/api/v1/orgs/{org}/members` | Org admin; members with their teams |
 | `PUT` | `/api/v1/orgs/{org}/members/{user}` | Org admin; role `admin` or `member` (not the last admin) |
 | `DELETE` | `/api/v1/orgs/{org}/members/{user}` | Org admin; removes from the org and all its teams (not the last admin) |

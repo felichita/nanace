@@ -3,13 +3,16 @@ use nanace_core::{OrgRole, validate};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::account;
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
-use crate::{AppState, access};
+use crate::{AppState, LOG_COMPONENT, access};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/orgs", web::post().to(create_org))
+        .route("/orgs/{org_id}", web::patch().to(rename_org))
+        .route("/orgs/{org_id}", web::delete().to(delete_org))
         .route("/orgs/{org_id}/members", web::get().to(list_org_members))
         .route("/orgs/{org_id}/members/{user_id}", web::put().to(set_org_role))
         .route("/orgs/{org_id}/members/{user_id}", web::delete().to(remove_org_member));
@@ -228,5 +231,99 @@ async fn remove_org_member(
     )
     .await?;
     tx.commit().await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameOrgRequest {
+    name: String,
+}
+
+async fn rename_org(
+    state: web::Data<AppState>,
+    user: WriteUser,
+    path: web::Path<Uuid>,
+    body: web::Json<RenameOrgRequest>,
+) -> ApiResult<HttpResponse> {
+    let org_id = path.into_inner();
+    access::require_org_admin(&state.pool, org_id, user.user_id).await?;
+    let name = validate::display_name("name", &body.name)?;
+    let mut tx = state.pool.begin().await?;
+    let renamed: Option<(String, String)> = sqlx::query_as(
+        "UPDATE organizations o SET name = $2 FROM (SELECT name FROM organizations WHERE id = $1 FOR UPDATE) old \
+         WHERE o.id = $1 RETURNING o.slug, old.name",
+    )
+    .bind(org_id)
+    .bind(&name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (slug, previous) = renamed.ok_or(ApiError::NotFound)?;
+    audit::record(
+        &mut *tx,
+        AuditEvent {
+            org_id: Some(org_id),
+            actor: user.user_id,
+            action: "org.rename",
+            resource_type: "organization",
+            resource_id: Some(org_id),
+            details: serde_json::json!({ "from": previous, "to": name }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(HttpResponse::Ok().json(OrgResponse { id: org_id, slug, name }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteOrgRequest {
+    /// The organization's slug, typed by the user to confirm.
+    confirm: String,
+}
+
+/// Deletes an organization with all its teams, pages and history. Org admins
+/// only, confirmed with the slug.
+async fn delete_org(
+    state: web::Data<AppState>,
+    user: WriteUser,
+    path: web::Path<Uuid>,
+    body: web::Json<DeleteOrgRequest>,
+) -> ApiResult<HttpResponse> {
+    let org_id = path.into_inner();
+    access::require_org_admin(&state.pool, org_id, user.user_id).await?;
+    let mut tx = state.pool.begin().await?;
+    let org: Option<(String, String)> = sqlx::query_as("SELECT slug, name FROM organizations WHERE id = $1 FOR UPDATE")
+        .bind(org_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let (slug, name) = org.ok_or(ApiError::NotFound)?;
+    if body.confirm.trim() != slug {
+        return Err(ApiError::BadRequest("confirm must be the workspace slug".to_owned()));
+    }
+    account::delete_org(&mut tx, org_id).await?;
+    // Kept with no org so the deletion itself stays on record.
+    audit::record(
+        &mut *tx,
+        AuditEvent {
+            org_id: None,
+            actor: user.user_id,
+            action: "org.delete",
+            resource_type: "organization",
+            resource_id: Some(org_id),
+            details: serde_json::json!({ "slug": slug, "name": name }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    if let Err(err) = state.vectors.delete_collection(org_id).await {
+        tracing::warn!(
+            event = "vector_collection_delete_failed",
+            component = LOG_COMPONENT,
+            org_id = %org_id,
+            error = %format!("{err:#}"),
+            "collection of a deleted organization was left behind"
+        );
+    }
     Ok(HttpResponse::NoContent().finish())
 }

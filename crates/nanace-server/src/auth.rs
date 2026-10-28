@@ -150,7 +150,7 @@ fn bearer(req: &HttpRequest) -> Option<String> {
 async fn authenticate_pat(state: &AppState, token: &str) -> ApiResult<AuthUser> {
     let row: Option<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "SELECT t.id, t.user_id, u.email, t.scope FROM api_tokens t JOIN users u ON u.id = t.user_id \
-         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND t.expires_at > now()",
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND t.expires_at > now() AND u.deleted_at IS NULL",
     )
     .bind(sha256_hex(token))
     .fetch_optional(&state.pool)
@@ -190,7 +190,17 @@ impl FromRequest for AuthUser {
             if token.starts_with(PAT_PREFIX) {
                 authenticate_pat(&state, &token).await
             } else {
-                state.jwt.verify(&token).ok_or(ApiError::Unauthorized)
+                let user = state.jwt.verify(&token).ok_or(ApiError::Unauthorized)?;
+                // Sessions are stateless; a deleted account must still stop
+                // working before its session expires.
+                let active: Option<bool> = sqlx::query_scalar("SELECT deleted_at IS NULL FROM users WHERE id = $1")
+                    .bind(user.user_id)
+                    .fetch_optional(&state.pool)
+                    .await?;
+                if active != Some(true) {
+                    return Err(ApiError::Unauthorized);
+                }
+                Ok(user)
             }
         })
     }

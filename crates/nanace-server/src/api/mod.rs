@@ -1,3 +1,4 @@
+mod account;
 mod audit_logs;
 mod auth;
 mod complete_page;
@@ -31,6 +32,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(
             web::scope("/api/v1")
                 .configure(auth::configure)
+                .configure(account::configure)
                 .configure(google::configure)
                 .configure(tokens::configure)
                 .configure(orgs::configure)

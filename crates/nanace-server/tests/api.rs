@@ -59,6 +59,7 @@ where
             "POST" => test::TestRequest::post(),
             "PUT" => test::TestRequest::put(),
             "DELETE" => test::TestRequest::delete(),
+            "PATCH" => test::TestRequest::patch(),
             other => panic!("unsupported method {other}"),
         }
         .uri(uri);
@@ -1602,4 +1603,236 @@ async fn expired_trash_is_purged() {
             .await
             .unwrap();
     assert_eq!(audited, 1);
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn orgs_are_renamed_and_deleted_and_accounts_erased() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let (bob_email, carol_email, erin_email) = (email("bob"), email("carol"), email("erin"));
+    let alice = c.login(&email("alice")).await;
+    let bob = c.login(&bob_email).await;
+    let new_org = |token: String, name: &'static str| {
+        let c = &c;
+        async move {
+            let org = c
+                .ok(
+                    "POST",
+                    "/api/v1/orgs",
+                    &token,
+                    Some(json!({ "slug": unique("del"), "name": name })),
+                    StatusCode::CREATED,
+                )
+                .await;
+            (
+                org["id"].as_str().unwrap().to_owned(),
+                org["slug"].as_str().unwrap().to_owned(),
+            )
+        }
+    };
+    let new_team = |token: String, org: String| {
+        let c = &c;
+        async move {
+            c.ok(
+                "POST",
+                &format!("/api/v1/orgs/{org}/teams"),
+                &token,
+                Some(json!({ "slug": "docs", "name": "Docs" })),
+                StatusCode::CREATED,
+            )
+            .await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let invite = |token: String, org: String, team: String, who: String| {
+        let c = &c;
+        async move {
+            c.ok(
+                "PUT",
+                &format!("/api/v1/orgs/{org}/teams/{team}/members"),
+                &token,
+                Some(json!({ "email": who, "role": "writer" })),
+                StatusCode::OK,
+            )
+            .await;
+        }
+    };
+    let page = |token: String, org: String, team: String| {
+        let c = &c;
+        async move {
+            c.ok(
+                "POST",
+                &format!("/api/v1/orgs/{org}/teams/{team}/contexts"),
+                &token,
+                Some(json!({ "title": "Notes", "content": "kept" })),
+                StatusCode::CREATED,
+            )
+            .await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+
+    // Rename and delete an organization.
+    let (org, slug) = new_org(alice.clone(), "Before").await;
+    let team = new_team(alice.clone(), org.clone()).await;
+    invite(alice.clone(), org.clone(), team.clone(), bob_email.clone()).await;
+    let page_id = page(alice.clone(), org.clone(), team.clone()).await;
+    let base = format!("/api/v1/orgs/{org}");
+    c.ok(
+        "PATCH",
+        &base,
+        &bob,
+        Some(json!({ "name": "Nope" })),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let renamed = c
+        .ok("PATCH", &base, &alice, Some(json!({ "name": "After" })), StatusCode::OK)
+        .await;
+    assert_eq!(renamed["name"], "After");
+    let me = c.ok("GET", "/api/v1/me", &bob, None, StatusCode::OK).await;
+    assert!(me.to_string().contains("\"org_name\":\"After\""), "{me}");
+    c.ok(
+        "DELETE",
+        &base,
+        &alice,
+        Some(json!({ "confirm": "wrong" })),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    c.ok(
+        "DELETE",
+        &base,
+        &bob,
+        Some(json!({ "confirm": slug })),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    c.ok(
+        "DELETE",
+        &base,
+        &alice,
+        Some(json!({ "confirm": slug })),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok(
+        "GET",
+        &format!("{base}/contexts/{page_id}"),
+        &alice,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    c.ok("GET", &format!("{base}/teams"), &bob, None, StatusCode::NOT_FOUND)
+        .await;
+    let org_uuid: Uuid = org.parse().unwrap();
+    let (history, deletion): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM audit_logs WHERE org_id = $1), \
+                (SELECT count(*) FROM audit_logs WHERE action = 'org.delete' AND resource_id = $1)",
+    )
+    .bind(org_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((history, deletion), (0, 1));
+
+    // Account deletion.
+    let carol = c.login(&carol_email).await;
+    let erin = c.login(&erin_email).await;
+    let carol_id = c.ok("GET", "/api/v1/me", &carol, None, StatusCode::OK).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let erin_id = c.ok("GET", "/api/v1/me", &erin, None, StatusCode::OK).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Carol alone in one org, a writer in Bob's org, sole admin of a shared org.
+    let (solo, _) = new_org(carol.clone(), "Solo").await;
+    new_team(carol.clone(), solo.clone()).await;
+    let (shared, _) = new_org(bob.clone(), "Shared").await;
+    let shared_team = new_team(bob.clone(), shared.clone()).await;
+    invite(bob.clone(), shared.clone(), shared_team.clone(), carol_email.clone()).await;
+    let carol_page = page(carol.clone(), shared.clone(), shared_team.clone()).await;
+    let (owned, _) = new_org(carol.clone(), "Owned").await;
+    let owned_team = new_team(carol.clone(), owned.clone()).await;
+    invite(carol.clone(), owned.clone(), owned_team, erin_email.clone()).await;
+    let carol_pat = c
+        .ok(
+            "POST",
+            "/api/v1/me/tokens",
+            &carol,
+            Some(json!({ "name": "cli", "scope": "write" })),
+            StatusCode::CREATED,
+        )
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    c.ok("DELETE", "/api/v1/me", &carol_pat, None, StatusCode::FORBIDDEN)
+        .await;
+    let (status, body) = c.call("DELETE", "/api/v1/me", Some(&carol), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.to_string().contains("Owned"), "{body}");
+    c.ok(
+        "PUT",
+        &format!("/api/v1/orgs/{owned}/members/{erin_id}"),
+        &carol,
+        Some(json!({ "role": "admin" })),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok("DELETE", "/api/v1/me", &carol, None, StatusCode::NO_CONTENT).await;
+
+    for token in [&carol, &carol_pat] {
+        c.ok("GET", "/api/v1/me", token, None, StatusCode::UNAUTHORIZED).await;
+    }
+    let solo_left: i64 = sqlx::query_scalar("SELECT count(*) FROM organizations WHERE id = $1")
+        .bind(solo.parse::<Uuid>().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(solo_left, 0, "an org with no other members is deleted");
+    let kept = c
+        .ok(
+            "GET",
+            &format!("/api/v1/orgs/{shared}/contexts/{carol_page}"),
+            &bob,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(kept["created_by"], carol_id, "pages stay with their team");
+    let erased: (String, Option<String>) = sqlx::query_as("SELECT email, google_sub FROM users WHERE id = $1")
+        .bind(carol_id.parse::<Uuid>().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(erased.0.starts_with("deleted-") && erased.1.is_none(), "{erased:?}");
+    let members = c
+        .ok(
+            "GET",
+            &format!("/api/v1/orgs/{owned}/members"),
+            &erin,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(!members.to_string().contains(&carol_email));
+
+    // Signing in again with the same email starts a fresh, empty account.
+    let again = c.login(&carol_email).await;
+    let fresh = c.ok("GET", "/api/v1/me", &again, None, StatusCode::OK).await;
+    assert_ne!(fresh["user_id"], carol_id);
+    assert_eq!(fresh["memberships"], json!([]));
 }
