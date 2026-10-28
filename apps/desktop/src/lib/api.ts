@@ -118,6 +118,14 @@ export interface Member {
   source: string;
 }
 
+export interface OrgMember {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+  role: OrgRole;
+  teams: string[];
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -170,6 +178,8 @@ export const api = {
     call<unknown>("PUT", `/orgs/${org}/teams/${team}/members`, { email, role }),
   removeMember: (org: string, team: string, user: string) =>
     call<unknown>("DELETE", `/orgs/${org}/teams/${team}/members/${user}`),
+  orgMembers: (org: string) => call<OrgMember[]>("GET", `/orgs/${org}/members`),
+  removeOrgMember: (org: string, user: string) => call<null>("DELETE", `/orgs/${org}/members/${user}`),
 
   /** Every context of a team, following pagination. */
   async contexts(org: string, team: string): Promise<ContextSummary[]> {

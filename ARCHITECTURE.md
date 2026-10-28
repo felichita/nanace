@@ -420,6 +420,8 @@ across teams or orgs.
 
 **In one sentence:** PostgreSQL + Qdrant give a multi-tenant knowledge base
 with team-level RBAC, Google Groups auto-sync, and Claude semantic search.
+| `GET` | `/api/v1/orgs/{org}/members` | Org admin; members with their teams |
+| `DELETE` | `/api/v1/orgs/{org}/members/{user}` | Org admin; removes from the org and all its teams (not the last admin) |
 
 **For managers:**
 

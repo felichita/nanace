@@ -977,3 +977,144 @@ async fn trash_restore_and_purge() {
         json!([])
     );
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn org_admins_remove_members_from_the_org() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let (bob_email, carol_email) = (email("bob"), email("carol"));
+    let alice = c.login(&email("alice")).await;
+    let bob = c.login(&bob_email).await;
+    let carol = c.login(&carol_email).await;
+    let eve = c.login(&email("eve")).await;
+    let me = |token: String| {
+        let c = &c;
+        async move {
+            c.ok("GET", "/api/v1/me", &token, None, StatusCode::OK).await["user_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let (alice_id, bob_id) = (me(alice.clone()).await, me(bob.clone()).await);
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("members"), "name": "Members" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let base = format!("/api/v1/orgs/{}", org["id"].as_str().unwrap());
+    let team = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "docs", "name": "Docs" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let team = team["id"].as_str().unwrap();
+    for (who, role) in [(&bob_email, "reader"), (&carol_email, "writer")] {
+        c.ok(
+            "PUT",
+            &format!("{base}/teams/{team}/members"),
+            &alice,
+            Some(json!({ "email": who, "role": role })),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let page = c
+        .ok(
+            "POST",
+            &format!("{base}/teams/{team}/contexts"),
+            &alice,
+            Some(json!({ "title": "Plan", "content": "secret plan" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let page_uri = format!("{base}/contexts/{}", page["id"].as_str().unwrap());
+    c.ok("GET", &page_uri, &bob, None, StatusCode::OK).await;
+
+    // Only org admins list and remove members; outsiders cannot probe the org.
+    c.ok("GET", &format!("{base}/members"), &carol, None, StatusCode::FORBIDDEN)
+        .await;
+    c.ok(
+        "DELETE",
+        &format!("{base}/members/{bob_id}"),
+        &carol,
+        None,
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    c.ok("GET", &format!("{base}/members"), &eve, None, StatusCode::NOT_FOUND)
+        .await;
+    let members = c
+        .ok("GET", &format!("{base}/members"), &alice, None, StatusCode::OK)
+        .await;
+    let bob_row = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["user_id"] == bob_id.as_str())
+        .unwrap();
+    assert_eq!(bob_row["role"], "member");
+    assert_eq!(bob_row["teams"], json!(["Docs"]));
+    assert_eq!(members.as_array().unwrap().len(), 3);
+
+    // Removal ends access at once, including team membership.
+    c.ok(
+        "DELETE",
+        &format!("{base}/members/{bob_id}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok("GET", &page_uri, &bob, None, StatusCode::NOT_FOUND).await;
+    c.ok("GET", &format!("{base}/teams"), &bob, None, StatusCode::NOT_FOUND)
+        .await;
+    let team_members = c
+        .ok(
+            "GET",
+            &format!("{base}/teams/{team}/members"),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(!team_members.to_string().contains(&bob_email));
+    c.ok(
+        "DELETE",
+        &format!("{base}/members/{bob_id}"),
+        &alice,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // The last admin stays.
+    c.ok(
+        "DELETE",
+        &format!("{base}/members/{alice_id}"),
+        &alice,
+        None,
+        StatusCode::CONFLICT,
+    )
+    .await;
+
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'org.member.remove' AND resource_id = $1")
+            .bind(bob_id.parse::<Uuid>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 1);
+}
