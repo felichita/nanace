@@ -49,6 +49,10 @@ agreed design that is not implemented yet.
     `NANACE_ALLOW_WRITES=true`.
     - **Issuing:** needs a fresh interactive sign-in, and revokes every
       earlier token of that kind.
+    - **Storage:** the token never appears in a config file or on a command
+      line. It lives in a file only the user can read
+      (`<app config>/claude/*.token`, mode 0600), and the configs carry
+      `NANACE_TOKEN_FILE`, which `nanace-mcp` re-reads on every request.
     - **Rotation:** while the app runs it rotates tokens older than 7 days
       (`POST /me/tokens/current/rotate`) and rewrites the configs. It notifies
       the user when a token can no longer be renewed. Reconnecting revokes the previous token, and

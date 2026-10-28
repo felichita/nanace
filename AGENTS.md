@@ -162,7 +162,8 @@ only for changed code, new evidence, or an explicit re-review request.
   `~/.claude/projects/*/memory/*.md`, no symlinks, size-capped. The one
   config write is "Connect to Claude": `claude mcp add/remove --scope user`
   (the CLI, never editing `~/.claude.json` directly) and a merge of the
-  `nanace` entry in Claude Desktop's config. Both use read-scoped tokens.
+  `nanace` entry in Claude Desktop's config, pointing at a 0600 token file
+  (`NANACE_TOKEN_FILE`); never put a token in a config or on a command line.
 - `GoogleOAuth::with_token_url` exists for tests: the ID token signature is
   not checked, so production must use Google's HTTPS token endpoint.
 

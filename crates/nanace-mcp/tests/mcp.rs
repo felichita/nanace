@@ -468,3 +468,52 @@ async fn write_tools_need_opt_in_and_write_access() {
     .await;
     assert!(!is_error && text.contains("team `qa`"), "{text}");
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn token_file_is_reread_after_rotation() {
+    let base = start_api().await;
+    let seed = seed(&base).await;
+    let first = pat(&base, &seed.alice, "read").await;
+    let dir = std::env::temp_dir().join(format!("nanace-mcp-token-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("token");
+    std::fs::write(&file, format!("{first}\n")).unwrap();
+
+    let client = connect(&base, Credentials::TokenFile(file.clone())).await;
+    let (is_error, text) = call(&client, "list_teams", json!({})).await;
+    assert!(!is_error, "{text}");
+
+    // Rotate: the old token dies, the file gets the new one, and the running
+    // server keeps working without a restart.
+    let http = reqwest::Client::new();
+    let rotated: Value = http
+        .post(format!("{base}/api/v1/me/tokens/current/rotate"))
+        .bearer_auth(&first)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = http
+        .delete(format!("{base}/api/v1/me/tokens/current"))
+        .bearer_auth(&first)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let (is_error, _) = call(&client, "list_teams", json!({})).await;
+    assert!(is_error, "the revoked token no longer works");
+    // Revoking the old token revoked its chain, so mint a fresh one.
+    let fresh = pat(&base, &seed.alice, "read").await;
+    assert_ne!(rotated["token"], json!(fresh));
+    std::fs::write(&file, &fresh).unwrap();
+    let (is_error, text) = call(&client, "list_teams", json!({})).await;
+    assert!(!is_error, "{text}");
+
+    std::fs::remove_file(&file).unwrap();
+    let (is_error, text) = call(&client, "list_teams", json!({})).await;
+    assert!(is_error && text.contains("not authenticated"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

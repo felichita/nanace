@@ -6,6 +6,11 @@
 //! its `claude_desktop_config.json` is merged in place, keeping every other
 //! setting. Each app gets its own token: read-scoped, or write-scoped with
 //! `NANACE_ALLOW_WRITES=true` when the user lets Claude create and edit pages.
+//!
+//! The token itself never appears in a config file or on a command line: it
+//! lives in a file only the user can read (`<app config>/claude/*.token`), and
+//! the configs carry `NANACE_TOKEN_FILE`. `nanace-mcp` re-reads that file on
+//! every request, so rotating a token only rewrites the file.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,9 +63,18 @@ pub struct Paths {
     pub home: PathBuf,
     /// Directory holding `Claude/claude_desktop_config.json`.
     pub config_dir: PathBuf,
+    /// This app's directory for the token files.
+    pub token_dir: PathBuf,
 }
 
 impl Paths {
+    pub fn token_file(&self, target: Target) -> PathBuf {
+        self.token_dir.join(match target {
+            Target::Code => "claude-code.token",
+            Target::Desktop => "claude-desktop.token",
+        })
+    }
+
     fn code_config(&self) -> PathBuf {
         self.home.join(".claude.json")
     }
@@ -150,10 +164,37 @@ pub fn status(paths: &Paths, rotation: &RotationState) -> ClaudeStatus {
     status
 }
 
-/// Token in the current entry for `target`, so it can be revoked when the
-/// entry is replaced or removed.
+/// Token of the current entry for `target`, so it can be revoked when the
+/// entry is replaced or removed: from its token file, or inline in entries
+/// written before token files existed.
 pub fn existing_token(paths: &Paths, target: Target) -> Option<String> {
-    current_entry(paths, target).and_then(|(_, env)| env.get("NANACE_TOKEN").cloned())
+    let (_, env) = current_entry(paths, target)?;
+    if let Some(token) = env.get("NANACE_TOKEN") {
+        return Some(token.clone());
+    }
+    let token = fs::read_to_string(env.get("NANACE_TOKEN_FILE")?).ok()?;
+    Some(token.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// Stores `token` in `target`'s token file (mode 0600, directory 0700) and
+/// returns its path.
+pub fn write_token(paths: &Paths, target: Target, token: &str) -> Result<PathBuf, String> {
+    fs::create_dir_all(&paths.token_dir)
+        .map_err(|err| format!("cannot create {}: {err}", paths.token_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&paths.token_dir, fs::Permissions::from_mode(0o700));
+    }
+    let path = paths.token_file(target);
+    let tmp = path.with_extension("token.tmp");
+    write_private(&tmp, token.as_bytes()).map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+pub fn remove_token(paths: &Paths, target: Target) {
+    let _ = fs::remove_file(paths.token_file(target));
 }
 
 /// Command and environment of the current nanace entry for `target`.
@@ -174,10 +215,18 @@ pub fn current_entry(paths: &Paths, target: Target) -> Option<(PathBuf, Env)> {
     Some((command, env))
 }
 
-/// Swaps the token in an existing entry, keeping its command and settings.
+/// Swaps the token of an existing entry. Usually only the token file changes;
+/// an entry that still carries the token inline (or points elsewhere) is
+/// rewritten once to use this app's token file, keeping its other settings.
 pub fn replace_token(paths: &Paths, target: Target, token: &str) -> Result<(), String> {
     let (command, mut env) = current_entry(paths, target).ok_or_else(|| "not connected".to_owned())?;
-    env.insert("NANACE_TOKEN".to_owned(), token.to_owned());
+    let file = write_token(paths, target, token)?;
+    let file_value = file.display().to_string();
+    if env.get("NANACE_TOKEN_FILE") == Some(&file_value) && !env.contains_key("NANACE_TOKEN") {
+        return Ok(());
+    }
+    env.remove("NANACE_TOKEN");
+    env.insert("NANACE_TOKEN_FILE".to_owned(), file_value);
     match target {
         Target::Code => connect_code(paths, &command, &env),
         Target::Desktop => connect_desktop(paths, &command, &env),
@@ -230,10 +279,10 @@ pub fn now_secs() -> u64 {
 
 pub type Env = BTreeMap<String, String>;
 
-pub fn server_env(api_url: &str, token: &str, org_id: &str, allow_writes: bool) -> Env {
+pub fn server_env(api_url: &str, token_file: &Path, org_id: &str, allow_writes: bool) -> Env {
     let mut env = Env::from([
         ("NANACE_API_URL".to_owned(), api_url.to_owned()),
-        ("NANACE_TOKEN".to_owned(), token.to_owned()),
+        ("NANACE_TOKEN_FILE".to_owned(), token_file.display().to_string()),
         ("NANACE_ORG_ID".to_owned(), org_id.to_owned()),
     ]);
     if allow_writes {
@@ -250,7 +299,7 @@ fn run_cli(cli: &Path, args: &[String]) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        // The CLI echoes the command on errors, which includes the token.
+        // Its output may echo the command line; keep it out of messages.
         Err(format!("`claude mcp` failed with {}", out.status))
     }
 }
@@ -275,7 +324,9 @@ pub fn disconnect_code(paths: &Paths) -> Result<(), String> {
     let cli = paths
         .claude_cli()
         .ok_or_else(|| "Claude Code CLI (`claude`) not found".to_owned())?;
-    run_cli(&cli, &["mcp", "remove", SERVER_NAME, "-s", "user"].map(String::from))
+    run_cli(&cli, &["mcp", "remove", SERVER_NAME, "-s", "user"].map(String::from))?;
+    remove_token(paths, Target::Code);
+    Ok(())
 }
 
 /// Sets (or with `None`, removes) the nanace entry in a Claude Desktop config,
@@ -331,7 +382,9 @@ pub fn connect_desktop(paths: &Paths, binary: &Path, env: &Env) -> Result<(), St
 }
 
 pub fn disconnect_desktop(paths: &Paths) -> Result<(), String> {
-    update_desktop_config(&paths.desktop_config(), None)
+    update_desktop_config(&paths.desktop_config(), None)?;
+    remove_token(paths, Target::Desktop);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -344,6 +397,7 @@ mod tests {
         fs::create_dir_all(&home).expect("mkdir");
         Paths {
             config_dir: home.join("config"),
+            token_dir: home.join("app/claude"),
             home,
         }
     }
@@ -355,8 +409,13 @@ mod tests {
         fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         fs::write(&file, r#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#).expect("write");
 
-        let env = server_env("http://127.0.0.1:8080", "nnc_pat_secret", "org-1", true);
+        let token_file = write_token(&paths, Target::Desktop, "nnc_pat_secret").expect("token");
+        let env = server_env("http://127.0.0.1:8080", &token_file, "org-1", true);
         connect_desktop(&paths, Path::new("/opt/nanace-mcp"), &env).expect("connect");
+        assert!(
+            !fs::read_to_string(&file).expect("read").contains("nnc_pat"),
+            "no token in the config"
+        );
         let config = read_json(&file).expect("read").expect("exists");
         assert_eq!(config["theme"], "dark");
         assert_eq!(config["mcpServers"]["other"]["command"], "x");
@@ -372,11 +431,14 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&file).expect("meta").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            let mode = |p: &Path| fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode(&file), 0o600);
+            assert_eq!(mode(&token_file), 0o600);
+            assert_eq!(mode(&paths.token_dir), 0o700);
         }
 
         disconnect_desktop(&paths).expect("disconnect");
+        assert!(!token_file.exists(), "disconnect removes the token file");
         let config = read_json(&file).expect("read").expect("exists");
         assert!(config["mcpServers"].get("nanace").is_none());
         assert_eq!(config["mcpServers"]["other"]["command"], "x");
@@ -386,14 +448,34 @@ mod tests {
     #[test]
     fn tokens_are_replaced_in_place_and_rotation_state_round_trips() {
         let paths = temp_paths("rotate");
-        let env = server_env("http://127.0.0.1:8080", "nnc_pat_old", "org-1", true);
-        connect_desktop(&paths, Path::new("/opt/nanace-mcp"), &env).expect("connect");
+        // An entry from before token files, with the token inline.
+        let mut legacy = server_env("http://127.0.0.1:8080", Path::new("/unused"), "org-1", true);
+        legacy.remove("NANACE_TOKEN_FILE");
+        legacy.insert("NANACE_TOKEN".to_owned(), "nnc_pat_old".to_owned());
+        connect_desktop(&paths, Path::new("/opt/nanace-mcp"), &legacy).expect("connect");
+        assert_eq!(existing_token(&paths, Target::Desktop).as_deref(), Some("nnc_pat_old"));
+
+        // Rotation moves it to a token file, keeping the other settings.
         replace_token(&paths, Target::Desktop, "nnc_pat_new").expect("replace");
         let (command, env) = current_entry(&paths, Target::Desktop).expect("entry");
         assert_eq!(command, PathBuf::from("/opt/nanace-mcp"));
-        assert_eq!(env["NANACE_TOKEN"], "nnc_pat_new");
+        assert!(!env.contains_key("NANACE_TOKEN"));
+        assert_eq!(
+            env["NANACE_TOKEN_FILE"],
+            paths.token_file(Target::Desktop).display().to_string()
+        );
         assert_eq!(env["NANACE_ALLOW_WRITES"], "true");
         assert_eq!(env["NANACE_ORG_ID"], "org-1");
+        assert_eq!(existing_token(&paths, Target::Desktop).as_deref(), Some("nnc_pat_new"));
+
+        // Later rotations only rewrite the file.
+        let config_before = fs::read(paths.desktop_config()).expect("read");
+        replace_token(&paths, Target::Desktop, "nnc_pat_newer").expect("replace");
+        assert_eq!(fs::read(paths.desktop_config()).expect("read"), config_before);
+        assert_eq!(
+            existing_token(&paths, Target::Desktop).as_deref(),
+            Some("nnc_pat_newer")
+        );
 
         let file = paths.home.join("state/claude-rotation.json");
         let mut state = RotationState::default();
@@ -411,7 +493,7 @@ mod tests {
         let file = paths.desktop_config();
         fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         fs::write(&file, "{ not json").expect("write");
-        let env = server_env("http://x", "t", "o", false);
+        let env = server_env("http://x", Path::new("/t"), "o", false);
         assert!(connect_desktop(&paths, Path::new("/bin/x"), &env).is_err());
         assert_eq!(fs::read_to_string(&file).expect("read"), "{ not json");
         let _ = fs::remove_dir_all(&paths.home);

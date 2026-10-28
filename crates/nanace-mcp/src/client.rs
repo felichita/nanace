@@ -10,6 +10,10 @@ use uuid::Uuid;
 pub enum Credentials {
     /// A bearer token issued by the API.
     Token(SecretString),
+    /// A file holding the token, read on every request: the token stays out of
+    /// process arguments and config files, and a rotated token is picked up
+    /// without restarting.
+    TokenFile(std::path::PathBuf),
     /// Logs in through the development-only endpoint and logs in again when
     /// the token expires. Works only when the API has dev login enabled.
     DevEmail(String),
@@ -106,7 +110,7 @@ impl ApiClient {
             .build()?;
         let token = match &credentials {
             Credentials::Token(token) => Some(token.clone()),
-            Credentials::DevEmail(_) => None,
+            Credentials::TokenFile(_) | Credentials::DevEmail(_) => None,
         };
         Ok(Self {
             http,
@@ -259,6 +263,17 @@ impl ApiClient {
     }
 
     async fn current_token(&self) -> Result<SecretString, ApiError> {
+        if let Credentials::TokenFile(path) = &self.credentials {
+            let token = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|_| ApiError::Unauthorized)?
+                .trim()
+                .to_owned();
+            if token.is_empty() {
+                return Err(ApiError::Unauthorized);
+            }
+            return Ok(SecretString::from(token));
+        }
         if let Some(token) = self.token.read().await.as_ref() {
             return Ok(token.clone());
         }

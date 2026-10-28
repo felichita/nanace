@@ -112,6 +112,11 @@ fn claude_paths(app: &AppHandle) -> Result<claude::Paths, String> {
     Ok(claude::Paths {
         home: app.path().home_dir().map_err(|err| err.to_string())?,
         config_dir: app.path().config_dir().map_err(|err| err.to_string())?,
+        token_dir: app
+            .path()
+            .app_config_dir()
+            .map_err(|err| err.to_string())?
+            .join("claude"),
     })
 }
 
@@ -145,7 +150,8 @@ async fn rotate_claude_tokens(app: &AppHandle) -> Result<Vec<claude::Target>, St
         let Some((_, env)) = claude::current_entry(&paths, target) else {
             continue;
         };
-        let (Some(token), Some(api_url)) = (env.get("NANACE_TOKEN"), env.get("NANACE_API_URL")) else {
+        // From the token file (or inline, for entries from before token files).
+        let (Some(token), Some(api_url)) = (claude::existing_token(&paths, target), env.get("NANACE_API_URL")) else {
             continue;
         };
         // Entries pointing at another server were set up elsewhere.
@@ -158,7 +164,7 @@ async fn rotate_claude_tokens(app: &AppHandle) -> Result<Vec<claude::Target>, St
         if !due {
             continue;
         }
-        match session.rotate_token(api_url, token).await {
+        match session.rotate_token(api_url, &token).await {
             Ok(Some(new_token)) => {
                 if claude::replace_token(&paths, target, &new_token).is_ok() {
                     rotation.set(target, Some(now));
@@ -225,7 +231,14 @@ async fn connect_claude(
                 CLAUDE_TOKEN_DAYS,
             )
             .await?;
-        let env = claude::server_env(&server_url, &token, &org_id, allow_writes);
+        let token_file = match claude::write_token(&paths, target, &token) {
+            Ok(file) => file,
+            Err(err) => {
+                session.revoke_token(&server_url, &token).await;
+                return Err(err);
+            }
+        };
+        let env = claude::server_env(&server_url, &token_file, &org_id, allow_writes);
         let written = match target {
             claude::Target::Code => claude::connect_code(&paths, &binary, &env),
             claude::Target::Desktop => claude::connect_desktop(&paths, &binary, &env),

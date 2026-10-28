@@ -3,6 +3,7 @@
 //! Environment:
 //! - `NANACE_API_URL`: API base URL (default `http://127.0.0.1:8080`).
 //! - `NANACE_TOKEN`: bearer token for the API, or
+//! - `NANACE_TOKEN_FILE`: a file holding it (re-read on every request), or
 //! - `NANACE_DEV_EMAIL`: log in through the API's dev-only login instead.
 //! - `NANACE_ORG_ID`: default organization (optional).
 //! - `NANACE_ALLOW_WRITES`: `true` adds the `create_context` / `update_context`
@@ -24,13 +25,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let base_url = std::env::var("NANACE_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
-    let credentials = match (
-        std::env::var("NANACE_TOKEN").ok(),
-        std::env::var("NANACE_DEV_EMAIL").ok(),
-    ) {
-        (Some(token), _) if !token.trim().is_empty() => Credentials::Token(SecretString::from(token.trim().to_owned())),
-        (_, Some(email)) if !email.trim().is_empty() => Credentials::DevEmail(email.trim().to_owned()),
-        _ => bail!("set NANACE_TOKEN (or NANACE_DEV_EMAIL for a development API)"),
+    let var = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let credentials = if let Some(token) = var("NANACE_TOKEN") {
+        Credentials::Token(SecretString::from(token.trim().to_owned()))
+    } else if let Some(path) = var("NANACE_TOKEN_FILE") {
+        Credentials::TokenFile(path.trim().into())
+    } else if let Some(email) = var("NANACE_DEV_EMAIL") {
+        Credentials::DevEmail(email.trim().to_owned())
+    } else {
+        bail!("set NANACE_TOKEN or NANACE_TOKEN_FILE (or NANACE_DEV_EMAIL for a development API)")
     };
     let default_org = std::env::var("NANACE_ORG_ID")
         .ok()
