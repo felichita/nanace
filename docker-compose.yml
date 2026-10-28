@@ -54,8 +54,12 @@ services:
       NANACE_EMBEDDER: fastembed
       # Unverified email login stays off unless explicitly enabled here.
       NANACE_DEV_LOGIN: ${NANACE_COMPOSE_DEV_LOGIN:-false}
+      NANACE_LOG_FORMAT: ${NANACE_LOG_FORMAT:-text}
+      NANACE_METRICS_BIND: 0.0.0.0:9090
     ports:
       - "${NANACE_HOST_BIND:-127.0.0.1}:${NANACE_PORT:-8080}:8080"
+      # Prometheus metrics, loopback only.
+      - "127.0.0.1:${NANACE_METRICS_PORT:-9090}:9090"
 
   # Integration tests only: in-memory storage, emptied on every restart.
   qdrant-test:

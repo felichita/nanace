@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use actix_web::middleware::from_fn;
 use actix_web::{App, HttpServer, middleware, web};
 use anyhow::{Context, bail};
 use nanace_embed::{Embedder, FastEmbedder, HashingEmbedder};
@@ -8,7 +9,7 @@ use nanace_server::config::{Config, EmbedderKind};
 use nanace_server::oauth::GoogleOAuth;
 use nanace_server::upgrades::{self, Status};
 use nanace_server::vectors::VectorStore;
-use nanace_server::{AppState, LOG_COMPONENT, api, db};
+use nanace_server::{AppState, LOG_COMPONENT, api, db, metrics};
 use secrecy::ExposeSecret;
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
@@ -16,9 +17,13 @@ use uuid::Uuid;
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // NANACE_LOG_FORMAT=json emits one JSON object per line (Loki, ELK, ...).
+    match std::env::var("NANACE_LOG_FORMAT").as_deref() {
+        Ok("json") => tracing_subscriber::fmt().json().with_env_filter(filter).init(),
+        Ok("text") | Err(_) => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        Ok(other) => bail!("NANACE_LOG_FORMAT must be text or json, got `{other}`"),
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -110,9 +115,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tracing::info!(event = "server_start", component = LOG_COMPONENT, bind = %config.bind, "listening");
-    HttpServer::new(move || {
+    let api = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .wrap(from_fn(metrics::track))
             // Path only: query strings carry one-time login codes and OAuth state.
             .wrap(
                 middleware::Logger::new("%a \"%{request}xi\" %s %b %T")
@@ -121,13 +127,23 @@ async fn main() -> anyhow::Result<()> {
             .configure(api::configure)
     })
     .bind(config.bind)?
-    .run()
-    .await?;
+    .run();
+    match config.metrics_bind {
+        Some(bind) => {
+            tracing::info!(event = "metrics_start", component = LOG_COMPONENT, bind = %bind, "serving metrics");
+            let metrics = HttpServer::new(|| App::new().route("/metrics", web::get().to(metrics::metrics_handler)))
+                .workers(1)
+                .bind(bind)?
+                .run();
+            tokio::try_join!(api, metrics)?;
+        }
+        None => api.await?,
+    }
     Ok(())
 }
 
 async fn load_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    Ok(match config.embedder {
+    let embedder: Arc<dyn Embedder> = match config.embedder {
         EmbedderKind::FastEmbed => {
             let cache_dir = config.fastembed_cache_dir.clone();
             Arc::new(
@@ -145,7 +161,8 @@ async fn load_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
             );
             Arc::new(HashingEmbedder::new(384))
         }
-    })
+    };
+    Ok(Arc::new(metrics::TimedEmbedder(embedder)))
 }
 
 /// `nanace-server reindex [--org <id>]`: rebuilds Qdrant from PostgreSQL with

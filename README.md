@@ -128,6 +128,18 @@ make down    # stop it (data volumes are kept)
 The server listens on `127.0.0.1:8080`; set `NANACE_HOST_BIND=0.0.0.0` to
 share it on your network.
 
+### Logs and metrics
+
+- **Logs:** `NANACE_LOG_FORMAT=json` writes one JSON object per line, for
+  Loki or ELK (the default is `text`). Request logs carry the path only,
+  never query strings.
+- **Metrics:** `NANACE_METRICS_BIND=0.0.0.0:9090` serves Prometheus metrics
+  on `/metrics` on that separate listener, so the public ingress never
+  exposes them. Docker Compose serves them on `127.0.0.1:9090`.
+  - `nanace_http_requests_total` and `nanace_http_request_duration_seconds`,
+    by method, route pattern and status;
+  - `nanace_embedding_duration_seconds`, by `passage` or `query`.
+
 ### Upgrades
 
 By default the server upgrades the database when it starts:

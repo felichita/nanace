@@ -43,6 +43,8 @@ pub struct GoogleConfig {
 #[derive(Debug)]
 pub struct Config {
     pub bind: SocketAddr,
+    /// Separate listener for Prometheus `/metrics`; disabled when unset.
+    pub metrics_bind: Option<SocketAddr>,
     pub database_url: SecretString,
     pub qdrant_url: String,
     pub jwt_secret: SecretString,
@@ -125,6 +127,11 @@ impl Config {
                 .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
                 .parse()
                 .context("NANACE_BIND must be a socket address")?,
+            metrics_bind: get("NANACE_METRICS_BIND")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.parse())
+                .transpose()
+                .context("NANACE_METRICS_BIND must be a socket address")?,
             database_url: SecretString::from(required("DATABASE_URL")?),
             qdrant_url: get("QDRANT_URL").unwrap_or_else(|| "http://127.0.0.1:6334".to_owned()),
             jwt_secret,
@@ -192,6 +199,7 @@ mod tests {
         assert!(config(&[("NANACE_DEV_LOGIN", "yes")]).is_err());
         assert!(config(&[("NANACE_EMBEDDER", "unknown-model")]).is_err());
         assert!(config(&[("NANACE_JWT_SECRET", "change-me-to-at-least-32-random-bytes")]).is_err());
+        assert!(config(&[("NANACE_METRICS_BIND", "not-an-address")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "59")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "86401")]).is_err());
         assert!(config(&[("NANACE_BIND", "localhost")]).is_err());

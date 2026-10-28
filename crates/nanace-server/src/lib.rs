@@ -8,6 +8,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod metrics;
 pub mod oauth;
 pub mod reindex;
 pub mod secret;
