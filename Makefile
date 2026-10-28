@@ -1,4 +1,4 @@
-.PHONY: deps deps-down fmt fmt-check lint test test-integration test-model check run desktop-deps desktop-dev desktop-build desktop-check
+.PHONY: deps deps-down up down logs fmt fmt-check lint test test-integration test-model check run desktop-deps desktop-dev desktop-build desktop-check
 
 DESKTOP := apps/desktop
 
@@ -6,7 +6,16 @@ deps: ## Start PostgreSQL and Qdrant
 	docker compose up -d --wait
 
 deps-down: ## Stop dependencies (keeps volumes)
-	docker compose down
+	docker compose --profile app --profile test down
+
+up: ## Build and run the API server in Docker with PostgreSQL and Qdrant
+	docker compose --profile app up -d --build --wait
+
+down: ## Stop the Docker stack (keeps volumes)
+	docker compose --profile app down
+
+logs: ## Follow the API server logs
+	docker compose logs -f server
 
 fmt:
 	cargo fmt --all
@@ -23,9 +32,9 @@ test: ## Unit tests; no external services
 test-integration: deps ## API, RLS and MCP tests against compose services
 	# qdrant-test keeps data in memory: start it empty and stop it afterwards
 	# (even when tests fail) so test collections do not hold RAM.
-	docker compose restart qdrant-test
+	docker compose --profile test up -d --force-recreate qdrant-test
 	until curl -sf http://127.0.0.1:6335/readyz >/dev/null; do sleep 0.5; done
-	cargo test -p nanace-server -p nanace-mcp -- --ignored; status=$$?; docker compose stop qdrant-test; exit $$status
+	cargo test -p nanace-server -p nanace-mcp -- --ignored; status=$$?; docker compose --profile test stop qdrant-test; exit $$status
 
 test-model: ## Real bge-small-en-v1.5 test; downloads the model on first run
 	cargo test -p nanace-embed -- --ignored

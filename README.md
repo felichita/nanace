@@ -97,6 +97,66 @@ email. **Import Claude memory**, in the sidebar or ⌘K, turns Claude Code's
 memory files (`~/.claude/projects/*/memory`) into linked pages. The app stores a personal access token named "nanace desktop" in the
 macOS Keychain (or the OS keyring).
 
+## Docker
+
+The `Docker` workflow publishes the backend image for `linux/amd64` and
+`linux/arm64` for every `v*` tag (pull requests only build it):
+
+```bash
+docker pull ghcr.io/felichita/nanace-server:latest   # or :0.1.2, :0.1
+```
+
+The image runs `nanace-server` as a non-root user on port 8080 and has the
+embedding model baked in, so it starts without internet access. It does not
+contain `nanace-mcp`: Claude runs that on each user's machine (it ships with
+the desktop app and the release archives) and points it at the server. Configure it with the same environment variables as
+`.env.example` (`DATABASE_URL`, `QDRANT_URL`, `NANACE_JWT_SECRET`,
+`NANACE_PUBLIC_URL`, ...); PostgreSQL must give it a non-superuser role (see
+`deploy/postgres/init.sql`). `GET /healthz` checks PostgreSQL and Qdrant.
+
+Build it locally with `docker build -t nanace-server .`, or run the whole
+stack (API server, PostgreSQL, Qdrant) with Docker Compose:
+
+```bash
+make up      # docker compose --profile app up -d --build; settings from .env
+make logs    # follow the server logs
+make down    # stop it (data volumes are kept)
+```
+
+The server listens on `127.0.0.1:8080`; set `NANACE_HOST_BIND=0.0.0.0` to
+share it on your network.
+
+### Upgrades
+
+By default the server upgrades the database when it starts:
+
+- it applies the SQL migrations;
+- it runs the application upgrades written in Rust (for example backfilling
+  derived data);
+- if `NANACE_EMBEDDER` now selects a different model, it reindexes.
+
+On Kubernetes, run that as a separate step instead (an init container, a
+Job, or a Helm pre-upgrade hook) and start the pods with
+`NANACE_RUN_MIGRATIONS=false`. They then refuse to start on a database that
+is behind or ahead of them:
+
+```bash
+nanace-server migrate --check   # report only; exit status 1 when something is pending
+nanace-server migrate           # apply, then exit
+```
+
+To rebuild the vectors from PostgreSQL, for example after moving to a new or
+empty Qdrant or changing the embedding model, run the `reindex` command. It
+recreates each organization's collection; search for that organization is
+incomplete until it finishes:
+
+```bash
+docker compose --profile app run --rm server reindex            # all organizations
+docker compose --profile app run --rm server reindex --org <id>  # one organization
+cargo run -p nanace-server -- reindex                            # from source, with .env
+``` Unverified email login stays off in Compose unless
+`NANACE_COMPOSE_DEV_LOGIN=true`.
+
 ## Releases
 
 Prebuilt downloads are on the GitHub Releases page:

@@ -1,0 +1,13 @@
+# Only Cargo.toml, Cargo.lock, rustfmt.toml and crates/ are needed.
+target
+apps
+.git
+.github
+.agents
+.claude
+.fastembed_cache
+.env
+*.md
+!crates/**/*.md
+deploy
+integrations
