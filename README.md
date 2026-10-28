@@ -80,11 +80,77 @@ instead of a token. `NANACE_ORG_ID` picks a default organization.
 
 `integrations/claude-code/skills/nanace` is a Claude Code skill: `/nanace
 PROJECT-2345` records what was done in the current session on the task's page
-(appending a dated section, or creating the page). It needs the write tools
-(**Allow Claude to create and edit pages**). Install it for all projects:
+(appending a dated section, or creating the page). It treats each team as a
+wiki: before writing it reads the team's `Wiki: Schema` page (page types, title
+prefixes, templates, tags), and afterwards it updates the related `Topic:` page,
+`Wiki: Index` and `Wiki: Log`. A team without a schema is initialized from
+`schema-template.md`, and the new schema is marked as the default for review.
+It needs the write tools (**Allow Claude to create and edit pages**).
+
+Install or update the MCP server binary and the skill, and connect Claude Code
+to your server, with one command (run it again later to update). Point it at
+your server with `NANACE_API_URL`; the default is `http://127.0.0.1:8080`:
+
+macOS / Linux:
 
 ```bash
-mkdir -p ~/.claude/skills && cp -r integrations/claude-code/skills/nanace ~/.claude/skills/
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.sh)"
+
+# with your server:
+NANACE_API_URL=https://nanace.example.com \
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.sh)"
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.ps1 | iex"
+
+# with your server, in a PowerShell window:
+$env:NANACE_API_URL = 'https://nanace.example.com'
+irm https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.ps1 | iex
+```
+
+What the installer does:
+
+- **`nanace-mcp`**: downloads it from the latest GitHub release
+  (`NANACE_VERSION=v0.1.3` pins one), checks the `.sha256`, and installs it to
+  `~/.local/bin` (Windows: `%LOCALAPPDATA%\nanace\bin`; override with
+  `NANACE_BIN_DIR`). A `.nanace-mcp.version` file next to it records the release
+  and checksum, so a re-run downloads nothing when the binary is current,
+  updates it when a newer release exists, and repairs it when the file was
+  changed. The replacement is atomic, so a running server is not affected.
+  Published builds: macOS arm64, Linux x64/arm64 (glibc), Windows x64; on other
+  platforms (for example Intel macOS) the binary is skipped — use the desktop
+  app, which bundles it, or `cargo build --release -p nanace-mcp`.
+  `NANACE_SKIP_BINARY=1` installs only the skill.
+- **Skill**: copies it to `~/.claude/skills/nanace` (or
+  `$CLAUDE_CONFIG_DIR/skills/nanace`) from `NANACE_REF` (default `main`). An
+  older version is moved to `~/.claude/skill-backups/` first.
+- **Claude Code connection** (interactive, asks before changing anything):
+  connects Claude Code to the server at `NANACE_API_URL` (default
+  `http://127.0.0.1:8080`, for example
+  `NANACE_API_URL=https://nanace.example.com`). It opens
+  `<server>/auth/complete`, where you sign in and create a token with scope
+  `write`, reads the token with hidden input, checks it against the API, and
+  saves it to `~/.config/nanace/claude-code.token` (Windows:
+  `%LOCALAPPDATA%\nanace\claude-code.token`; override with
+  `NANACE_TOKEN_FILE`), readable only by you. If you belong to several
+  organizations it asks which one to use (or set `NANACE_ORG_ID`). Then it
+  runs `claude mcp add nanace --scope user` with `NANACE_TOKEN_FILE`, so the
+  token is never in a config file or a command line. A re-run reuses the saved
+  token, and does nothing when Claude Code already uses this `nanace-mcp`
+  (`NANACE_RECONNECT=1` connects again, e.g. after changing the server).
+  If Claude Code runs another copy (such as the desktop app's, which
+  **Connect to Claude** registers and the app updates), it asks before
+  switching. Without a terminal, or with `NANACE_CONNECT=0`, it only prints the
+  manual steps. New users need an account on the server and, to save pages, a
+  team role of `writer` from an admin; the installer warns when that is missing.
+
+To install the skill from a local clone instead of GitHub:
+
+```bash
+NANACE_BASE_URL="file://$PWD/integrations/claude-code/skills/nanace" integrations/claude-code/install.sh
 ```
 
 ## Desktop app
