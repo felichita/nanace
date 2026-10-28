@@ -404,6 +404,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn csp_blocks_remote_content() {
+        // Remote images in a page would tell its author who opened it, and
+        // when (a tracking pixel); scripts and fetches stay local too.
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid config");
+        let csp = config["app"]["security"]["csp"].as_str().expect("csp set");
+        // Tauri's own IPC endpoint is the only network source allowed.
+        for source in csp.split(';').flat_map(|d| d.split_whitespace().skip(1)) {
+            let remote = source.starts_with("http") || source == "https:" || source.contains('*');
+            assert!(!remote || source == "http://ipc.localhost", "{source}");
+        }
+        assert!(csp.contains("img-src 'self' data: blob:"), "{csp}");
+    }
+
+    #[test]
     fn only_web_links_leave_the_app() {
         let url = |s: &str| url::Url::parse(s).expect("url");
         assert!(is_app_url(&url("tauri://localhost/index.html")));
