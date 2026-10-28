@@ -191,6 +191,11 @@ export function PageView({ id }: { id: string }) {
     if (!page || loaded.current === `${page.id}:${editorKey}`) return;
     loaded.current = `${page.id}:${editorKey}`;
     saved.current = { title: page.title, content: page.content, tags: page.tags, updatedAt: page.updated_at };
+    // Update the refs now, not on the next render: a flush before then (StrictMode
+    // runs the unmount flush right after this effect) would save the empty
+    // initial title and tags.
+    titleRef.current = page.title;
+    tagsRef.current = page.tags;
     blocked.current = false;
     setTitle(page.title);
     setTags(page.tags);
