@@ -20,6 +20,10 @@ export function TrashDialog({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
 
   const items = (trash.data ?? []).filter((t) => t.title.toLowerCase().includes(filter.trim().toLowerCase()));
+  const sample = trash.data?.find((t) => t.purge_at);
+  const retentionDays = sample?.purge_at
+    ? Math.round((Date.parse(sample.purge_at) - Date.parse(sample.deleted_at)) / 86_400_000)
+    : null;
 
   async function act(item: TrashItem, kind: "restore" | "purge") {
     setBusy(item.id);
@@ -79,6 +83,7 @@ export function TrashDialog({ onClose }: { onClose: () => void }) {
                 <div className="truncate text-sm">{item.title}</div>
                 <div className="truncate text-xs text-ink-3">
                   {team?.name} · deleted {relativeTime(item.deleted_at)} by {item.deleted_by_email}
+                  {item.purge_at && ` · gone for good ${untilText(item.purge_at)}`}
                 </div>
               </div>
               {busy === item.id ? (
@@ -99,6 +104,7 @@ export function TrashDialog({ onClose }: { onClose: () => void }) {
       </div>
       <p className="mt-3 text-xs text-ink-3">
         Pages in Trash are hidden from search, the graph and Claude. Restoring brings back the page with its links.
+        {retentionDays !== null && ` Pages are deleted for good ${retentionDays} days after they are moved to Trash.`}
       </p>
 
       {confirm && (
@@ -116,6 +122,13 @@ export function TrashDialog({ onClose }: { onClose: () => void }) {
       )}
     </Dialog>
   );
+}
+
+function untilText(iso: string): string {
+  const hours = Math.max(0, (Date.parse(iso) - Date.now()) / 3_600_000);
+  if (hours < 1) return "within the hour";
+  if (hours < 24) return `in ${Math.round(hours)}h`;
+  return `in ${Math.round(hours / 24)} days`;
 }
 
 export function Toast({

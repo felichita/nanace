@@ -286,7 +286,10 @@ The desktop app adds two parameters to the login request:
   and re-embeds the content. The `contexts` INSERT policy accepts another
   user's `created_by` only for a row coming back from the trash.
 - **Purging** deletes the trashed row permanently.
-- Automatic purge after N days is **[planned]**.
+- **Retention:** trashed contexts are purged for good after
+  `NANACE_TRASH_RETENTION_DAYS` days (default 7; 0 keeps them). An hourly
+  server task does this under RLS as a writer of each team and audits it as
+  `system.trash_purge`. The trash list shows each page's `purge_at`.
 
 ### Google Workspace group sync [planned]
 

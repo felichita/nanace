@@ -45,6 +45,8 @@ pub struct Config {
     pub bind: SocketAddr,
     /// Separate listener for Prometheus `/metrics`; disabled when unset.
     pub metrics_bind: Option<SocketAddr>,
+    /// Days a context stays in the trash before it is purged; 0 keeps it.
+    pub trash_retention_days: u32,
     pub database_url: SecretString,
     pub qdrant_url: String,
     pub jwt_secret: SecretString,
@@ -127,6 +129,10 @@ impl Config {
                 .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
                 .parse()
                 .context("NANACE_BIND must be a socket address")?,
+            trash_retention_days: get("NANACE_TRASH_RETENTION_DAYS")
+                .map(|v| v.trim().parse::<u32>().ok().filter(|d| *d <= 3650))
+                .unwrap_or(Some(7))
+                .context("NANACE_TRASH_RETENTION_DAYS must be 0-3650 (0 keeps trash forever)")?,
             metrics_bind: get("NANACE_METRICS_BIND")
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| v.parse())
@@ -200,6 +206,15 @@ mod tests {
         assert!(config(&[("NANACE_EMBEDDER", "unknown-model")]).is_err());
         assert!(config(&[("NANACE_JWT_SECRET", "change-me-to-at-least-32-random-bytes")]).is_err());
         assert!(config(&[("NANACE_METRICS_BIND", "not-an-address")]).is_err());
+        assert!(config(&[("NANACE_TRASH_RETENTION_DAYS", "-1")]).is_err());
+        assert!(config(&[("NANACE_TRASH_RETENTION_DAYS", "9999")]).is_err());
+        assert_eq!(
+            config(&[("NANACE_TRASH_RETENTION_DAYS", "0")])
+                .unwrap()
+                .trash_retention_days,
+            0
+        );
+        assert_eq!(config(&[]).unwrap().trash_retention_days, 7);
         assert!(config(&[("NANACE_JWT_TTL_SECS", "59")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "86401")]).is_err());
         assert!(config(&[("NANACE_BIND", "localhost")]).is_err());

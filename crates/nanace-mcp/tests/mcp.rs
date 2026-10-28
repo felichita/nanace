@@ -43,6 +43,7 @@ async fn start_api() -> String {
         google: None,
         frontend_url: "http://127.0.0.1/auth/complete".to_owned(),
         secure_cookies: false,
+        trash_retention_days: 7,
     });
     let server = HttpServer::new(move || App::new().app_data(state.clone()).configure(api::configure))
         .workers(1)

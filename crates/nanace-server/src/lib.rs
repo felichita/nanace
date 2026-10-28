@@ -11,6 +11,7 @@ pub mod error;
 pub mod metrics;
 pub mod oauth;
 pub mod reindex;
+pub mod retention;
 pub mod secret;
 pub mod upgrades;
 pub mod vectors;
@@ -41,4 +42,6 @@ pub struct AppState {
     pub frontend_url: String,
     /// Set `Secure` on cookies; true when the public URL is HTTPS.
     pub secure_cookies: bool,
+    /// Days a context stays in the trash before it is purged; 0 keeps it.
+    pub trash_retention_days: u32,
 }

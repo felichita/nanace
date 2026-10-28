@@ -41,6 +41,7 @@ async fn state(dev_login: bool) -> web::Data<AppState> {
         google: None,
         frontend_url: "http://127.0.0.1/auth/complete".to_owned(),
         secure_cookies: false,
+        trash_retention_days: 7,
     })
 }
 
@@ -1510,4 +1511,95 @@ async fn rls_pins_context_identity_and_trash_rows() {
         )
         .await;
     assert_eq!(restored["created_by"], alice_id.to_string());
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn expired_trash_is_purged() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let alice = c.login(&email("alice")).await;
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("purge"), "name": "Purge" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let base = format!("/api/v1/orgs/{org_id}");
+    let team = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "docs", "name": "Docs" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let page = c
+        .ok(
+            "POST",
+            &format!("{base}/teams/{}/contexts", team["id"].as_str().unwrap()),
+            &alice,
+            Some(json!({ "title": "Old", "content": "gone soon" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let page_id = page["id"].as_str().unwrap();
+    c.ok(
+        "DELETE",
+        &format!("{base}/contexts/{page_id}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    // The trash shows when each page goes for good.
+    let trash = c
+        .ok("GET", &format!("{base}/trash"), &alice, None, StatusCode::OK)
+        .await;
+    let deleted_at: chrono::DateTime<chrono::Utc> = trash[0]["deleted_at"].as_str().unwrap().parse().unwrap();
+    let purge_at: chrono::DateTime<chrono::Utc> = trash[0]["purge_at"].as_str().unwrap().parse().unwrap();
+    assert_eq!(purge_at - deleted_at, chrono::Duration::days(7));
+
+    // Within the retention period nothing is purged; past it, the page is.
+    assert_eq!(
+        nanace_server::retention::purge_expired(&pool, 7, Some(org_id))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        nanace_server::retention::purge_expired(&pool, 0, Some(org_id))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.ok("GET", &format!("{base}/trash"), &alice, None, StatusCode::OK)
+            .await,
+        json!([])
+    );
+    c.ok(
+        "POST",
+        &format!("{base}/trash/{page_id}/restore"),
+        &alice,
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'system.trash_purge' AND org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 1);
 }

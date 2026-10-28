@@ -108,6 +108,8 @@ export interface TrashItem {
   deleted_at: string;
   deleted_by: string;
   deleted_by_email: string;
+  /** When the page is deleted for good; null when trash is kept. */
+  purge_at: string | null;
 }
 
 export interface Member {

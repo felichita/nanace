@@ -112,7 +112,35 @@ async fn main() -> anyhow::Result<()> {
         google,
         frontend_url: config.frontend_url.clone(),
         secure_cookies: config.public_url.starts_with("https://"),
+        trash_retention_days: config.trash_retention_days,
     });
+
+    if config.trash_retention_days > 0 {
+        let pool = state.pool.clone();
+        let days = config.trash_retention_days;
+        actix_web::rt::spawn(async move {
+            loop {
+                match nanace_server::retention::purge_expired(&pool, days, None).await {
+                    Ok(0) => {}
+                    Ok(purged) => {
+                        tracing::info!(
+                            event = "trash_purged",
+                            component = LOG_COMPONENT,
+                            purged,
+                            "expired trash purged"
+                        )
+                    }
+                    Err(err) => tracing::warn!(
+                        event = "trash_purge_failed",
+                        component = LOG_COMPONENT,
+                        error = %format!("{err:#}"),
+                        "trash purge failed; retrying later"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     tracing::info!(event = "server_start", component = LOG_COMPONENT, bind = %config.bind, "listening");
     let api = HttpServer::new(move || {

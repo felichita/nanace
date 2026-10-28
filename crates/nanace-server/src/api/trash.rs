@@ -27,6 +27,8 @@ struct TrashItem {
     deleted_at: DateTime<Utc>,
     deleted_by: Uuid,
     deleted_by_email: String,
+    /// When the context will be deleted for good; null when trash is kept.
+    purge_at: Option<DateTime<Utc>>,
 }
 
 /// Trashed contexts of the teams where the caller can write (RLS), newest
@@ -36,11 +38,13 @@ async fn list_trash(state: web::Data<AppState>, user: AuthUser, path: web::Path<
     access::require_org_member(&state.pool, org_id, user.user_id).await?;
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     let items: Vec<TrashItem> = sqlx::query_as(
-        "SELECT t.id, t.team_id, t.title, t.tags, t.deleted_at, t.deleted_by, u.email AS deleted_by_email \
+        "SELECT t.id, t.team_id, t.title, t.tags, t.deleted_at, t.deleted_by, u.email AS deleted_by_email, \
+                CASE WHEN $2 > 0 THEN t.deleted_at + make_interval(days => $2) END AS purge_at \
          FROM context_trash t JOIN users u ON u.id = t.deleted_by \
          ORDER BY t.deleted_at DESC, t.id LIMIT $1",
     )
     .bind(MAX_LISTED)
+    .bind(i32::try_from(state.trash_retention_days).map_err(anyhow::Error::from)?)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

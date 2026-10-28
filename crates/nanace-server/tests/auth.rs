@@ -82,6 +82,7 @@ async fn state(google: Option<GoogleOAuth>) -> web::Data<AppState> {
         google,
         frontend_url: FRONTEND.to_owned(),
         secure_cookies: false,
+        trash_retention_days: 7,
     })
 }
 
