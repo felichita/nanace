@@ -88,14 +88,24 @@ function linkify(content: Inline[]): Inline[] {
   return out;
 }
 
-function linkifyBlocks(blocks: Block[]): Block[] {
+/** Turns pageLink nodes back into `[[...]]` text. */
+function unlinkify(content: Inline[]): Inline[] {
+  return content.map((item) => {
+    if (item.type !== "pageLink") return item;
+    const { title, label } = item.props as { title: string; label: string };
+    return { type: "text", text: label && label !== title ? `[[${title}|${label}]]` : `[[${title}]]`, styles: {} };
+  });
+}
+
+/** Applies `fn` to the inline content of every block, table cells included. */
+function mapInline(blocks: Block[], fn: (content: Inline[]) => Inline[]): Block[] {
   return blocks.map((block) => {
     const b = block as unknown as { type: string; content: unknown; children: Block[] };
     let content = b.content;
     if (b.type === "codeBlock") {
       // Code is literal text; `[[...]]` there is not a link.
     } else if (Array.isArray(content)) {
-      content = linkify(content as Inline[]);
+      content = fn(content as Inline[]);
     } else if (content && typeof content === "object" && (content as { type?: string }).type === "tableContent") {
       const table = content as { rows: { cells: unknown[] }[] };
       content = {
@@ -103,20 +113,20 @@ function linkifyBlocks(blocks: Block[]): Block[] {
         rows: table.rows.map((row) => ({
           ...row,
           cells: row.cells.map((cell) => {
-            if (Array.isArray(cell)) return linkify(cell as Inline[]);
+            if (Array.isArray(cell)) return fn(cell as Inline[]);
             const c = cell as { content?: Inline[] };
-            return c && Array.isArray(c.content) ? { ...c, content: linkify(c.content) } : cell;
+            return c && Array.isArray(c.content) ? { ...c, content: fn(c.content) } : cell;
           }),
         })),
       };
     }
-    return { ...block, content, children: linkifyBlocks(b.children ?? []) } as Block;
+    return { ...block, content, children: mapInline(b.children ?? [], fn) } as Block;
   });
 }
 
 export function markdownToBlocks(editor: Editor, markdown: string): Block[] {
   if (!markdown.trim()) return [];
-  return linkifyBlocks(editor.tryParseMarkdownToBlocks(markdown));
+  return mapInline(editor.tryParseMarkdownToBlocks(markdown), linkify);
 }
 
 /** Undoes markdown escaping inside `[[...]]`, which serializers apply to brackets. */
@@ -133,5 +143,7 @@ export function blocksToMarkdown(editor: Editor): string {
   const empty =
     blocks.length === 1 && Array.isArray(blocks[0].content) && blocks[0].content.length === 0 && !blocks[0].children.length;
   if (empty) return "";
-  return unescapeWikiLinks(editor.blocksToMarkdownLossy(blocks)).trimEnd() + "\n";
+  // pageLinks become text first: their React toExternalHTML renders nothing once
+  // the editor is mounted in a view, which would drop every link from the page.
+  return unescapeWikiLinks(editor.blocksToMarkdownLossy(mapInline(blocks, unlinkify))).trimEnd() + "\n";
 }
