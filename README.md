@@ -123,3 +123,7 @@ make test-integration   # API, RLS and MCP tests (nanace_test DB + qdrant-test)
 make test-model         # real embedding model test
 make desktop-check      # desktop: tsc, vitest, clippy, Rust tests
 ```
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 Fedor Nikolaev.

@@ -29,6 +29,8 @@
     ],
     "externalBin": [
       "binaries/nanace-mcp"
-    ]
+    ],
+    "license": "Apache-2.0",
+    "copyright": "Copyright 2026 Fedor Nikolaev"
   }
 }
