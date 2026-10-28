@@ -9,6 +9,7 @@ export interface Layout {
   trashPage(id: string): Promise<void>;
   openTrash(): void;
   connectClaude(): void;
+  deleteAccount(): void;
   toast(message: string, action?: { label: string; run: () => void }): void;
 }
 
@@ -20,6 +21,7 @@ export const LayoutContext = createContext<Layout>({
   trashPage: async () => {},
   openTrash: () => {},
   connectClaude: () => {},
+  deleteAccount: () => {},
   toast: () => {},
 });
 

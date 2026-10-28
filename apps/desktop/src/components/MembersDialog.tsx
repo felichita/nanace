@@ -1,10 +1,11 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, Users } from "lucide-react";
+import { History, Plus, Settings2, Trash2, Users } from "lucide-react";
 import { useState } from "react";
 
 import { api, slugify, type OrgMember, type OrgRole, type Team, type TeamRole } from "../lib/api";
 import { useWorkspace } from "../lib/workspace";
 import { Button, Dialog, IconButton, Input, Spinner, TeamIcon } from "./ui";
+import { AuditLog, GeneralSettings } from "./WorkspaceSettings";
 
 const ROLES: { value: TeamRole; label: string }[] = [
   { value: "reader", label: "Can view" },
@@ -207,32 +208,43 @@ export function MembersDialog({ team, onClose }: { team: Team; onClose: () => vo
 export function TeamsDialog({ onClose }: { onClose: () => void }) {
   const ws = useWorkspace();
   const client = useQueryClient();
-  const [selected, setSelected] = useState<Team | "workspace" | null>(
-    ws.org.role === "admin" ? "workspace" : (ws.myTeams[0] ?? ws.teams[0] ?? null),
+  type Section = Team | "general" | "workspace" | "audit" | null;
+  const [selected, setSelected] = useState<Section>(
+    ws.org.role === "admin" ? "general" : (ws.myTeams[0] ?? ws.teams[0] ?? null),
   );
+  const isTeam = (s: Section, id: string) => typeof s === "object" && s?.id === id;
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const isAdmin = ws.org.role === "admin";
   const teams = isAdmin ? ws.teams : ws.myTeams;
 
   return (
-    <Dialog title="Teamspaces & members" onClose={onClose} width={760}>
+    <Dialog title="Workspace settings" onClose={onClose} width={760}>
       <div className="flex gap-4">
         <div className="w-[220px] shrink-0 space-y-px">
-          {isAdmin && (
-            <div
-              onClick={() => setSelected("workspace")}
-              className={`mb-2 flex h-8 items-center gap-2 rounded-md px-2 text-sm ${selected === "workspace" ? "bg-active" : "hover:bg-hover"}`}
-            >
-              <Users size={16} className="text-ink-2" />
-              Workspace members
-            </div>
-          )}
+          {isAdmin &&
+            (
+              [
+                ["general", "General", <Settings2 key="g" size={16} className="text-ink-2" />],
+                ["workspace", "Workspace members", <Users key="w" size={16} className="text-ink-2" />],
+                ["audit", "Audit log", <History key="a" size={16} className="text-ink-2" />],
+              ] as const
+            ).map(([id, label, icon]) => (
+              <div
+                key={id}
+                onClick={() => setSelected(id)}
+                className={`flex h-8 items-center gap-2 rounded-md px-2 text-sm ${selected === id ? "bg-active" : "hover:bg-hover"}`}
+              >
+                {icon}
+                {label}
+              </div>
+            ))}
+          {isAdmin && <div className="my-2 h-px bg-line" />}
           {teams.map((t) => (
             <div
               key={t.id}
               onClick={() => setSelected(t)}
-              className={`flex h-8 items-center gap-2 rounded-md px-2 text-sm ${selected !== "workspace" && selected?.id === t.id ? "bg-active" : "hover:bg-hover"}`}
+              className={`flex h-8 items-center gap-2 rounded-md px-2 text-sm ${isTeam(selected, t.id) ? "bg-active" : "hover:bg-hover"}`}
             >
               <TeamIcon id={t.id} name={t.name} size={18} />
               <span className="truncate">{t.name}</span>
@@ -265,8 +277,12 @@ export function TeamsDialog({ onClose }: { onClose: () => void }) {
           )}
         </div>
         <div className="min-w-0 flex-1">
-          {selected === "workspace" ? (
+          {selected === "general" ? (
+            <GeneralSettings onDeleted={onClose} />
+          ) : selected === "workspace" ? (
             <WorkspaceMembers />
+          ) : selected === "audit" ? (
+            <AuditLog />
           ) : (
             selected && <TeamMembers key={selected.id} team={selected} />
           )}

@@ -128,6 +128,17 @@ export interface OrgMember {
   teams: string[];
 }
 
+export interface AuditEntry {
+  id: number;
+  actor_user_id: string | null;
+  actor_email: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+  details: unknown;
+  created_at: string;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -182,6 +193,10 @@ export const api = {
     call<unknown>("DELETE", `/orgs/${org}/teams/${team}/members/${user}`),
   orgMembers: (org: string) => call<OrgMember[]>("GET", `/orgs/${org}/members`),
   removeOrgMember: (org: string, user: string) => call<null>("DELETE", `/orgs/${org}/members/${user}`),
+  renameOrg: (org: string, name: string) => call<Org>("PATCH", `/orgs/${org}`, { name }),
+  deleteOrg: (org: string, confirm: string) => call<null>("DELETE", `/orgs/${org}`, { confirm }),
+  auditLogs: (org: string, limit: number, beforeId?: number) =>
+    call<AuditEntry[]>("GET", `/orgs/${org}/audit-logs${q({ limit, before_id: beforeId })}`),
   setOrgRole: (org: string, user: string, role: OrgRole) =>
     call<null>("PUT", `/orgs/${org}/members/${user}`, { role }),
 
@@ -250,6 +265,8 @@ export const session = {
   signInDev: (email: string) => invoke<SessionInfo>("sign_in_dev", { email }),
   signOut: () => invoke<SessionInfo>("sign_out"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
+  /** Erases the account after a fresh sign-in; the app is signed out afterwards. */
+  deleteAccount: (email: string) => invoke<SessionInfo>("delete_account", { email }),
 };
 
 export function orgsOf(me: Me): Org[] {

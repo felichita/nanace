@@ -374,6 +374,44 @@ impl Session {
         }
     }
 
+    /// Erases the account behind `session` (DELETE /me), but only if it is the
+    /// same user this app is signed in as: a fresh Google sign-in could pick
+    /// another account.
+    pub async fn delete_account(&self, server_url: &str, session: &str) -> Result<(), String> {
+        let current = self.request("GET", "/api/v1/me", None).await?;
+        let session_me = {
+            let url = api_url(server_url, "/api/v1/me")?;
+            let resp = self
+                .http
+                .get(url)
+                .bearer_auth(session)
+                .send()
+                .await
+                .map_err(|_| format!("cannot reach {server_url}"))?;
+            resp.json::<Value>().await.unwrap_or(Value::Null)
+        };
+        let id = |v: &Value| v.get("user_id").and_then(Value::as_str).map(str::to_owned);
+        if current.status != 200 || id(&current.body).is_none() || id(&current.body) != id(&session_me) {
+            return Err(
+                "You signed in as a different account than the one this app uses; nothing was deleted.".to_owned(),
+            );
+        }
+        let url = api_url(server_url, "/api/v1/me")?;
+        let resp = self
+            .http
+            .delete(url)
+            .bearer_auth(session)
+            .send()
+            .await
+            .map_err(|_| format!("cannot reach {server_url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        Err(error_message(status, &body))
+    }
+
     /// Revokes the token on the server (best effort) and forgets it locally.
     pub async fn sign_out(&self) -> SessionInfo {
         let (server_url, token) = {

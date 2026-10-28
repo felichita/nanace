@@ -11,6 +11,7 @@ import { MembersDialog, TeamsDialog } from "./components/MembersDialog";
 import { PageView } from "./components/PageView";
 import { Sidebar } from "./components/Sidebar";
 import { Toast, TrashDialog } from "./components/Trash";
+import { DeleteAccountDialog } from "./components/WorkspaceSettings";
 import { Onboarding, SignIn } from "./components/SignIn";
 import { Spinner } from "./components/ui";
 import { listen } from "@tauri-apps/api/event";
@@ -65,6 +66,7 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
   const [importOpen, setImportOpen] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; action?: { label: string; run: () => void } } | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   const [location, navigate] = useLocation();
@@ -188,6 +190,7 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
     trashPage,
     openTrash: () => setTrashOpen(true),
     connectClaude: () => setConnectOpen(true),
+    deleteAccount: () => setDeleteAccountOpen(true),
     toast: showToast,
   };
 
@@ -232,6 +235,7 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
       {importOpen && <ImportMemoryDialog onClose={() => setImportOpen(false)} />}
       {trashOpen && <TrashDialog onClose={() => setTrashOpen(false)} />}
       {connectOpen && <ConnectClaudeDialog serverUrl={info.server_url} onClose={() => setConnectOpen(false)} />}
+      {deleteAccountOpen && <DeleteAccountDialog onClose={() => setDeleteAccountOpen(false)} />}
       {toast && <Toast message={toast.message} action={toast.action} onClose={() => setToast(null)} />}
     </LayoutContext.Provider>
   );

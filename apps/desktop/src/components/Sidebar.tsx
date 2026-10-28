@@ -14,6 +14,7 @@ import {
   Search,
   Settings2,
   Trash2,
+  UserX,
   Users,
 } from "lucide-react";
 import { useState } from "react";
@@ -271,7 +272,7 @@ export function Sidebar({
                   close();
                 }}
               >
-                Teamspaces & members
+                Workspace settings
               </MenuItem>
               <MenuItem
                 icon={<Plug size={14} />}
@@ -293,6 +294,15 @@ export function Sidebar({
                   Import Claude memory
                 </MenuItem>
               )}
+              <MenuItem
+                icon={<UserX size={14} />}
+                onClick={() => {
+                  close();
+                  layout.deleteAccount();
+                }}
+              >
+                Delete my account…
+              </MenuItem>
               <MenuItem
                 icon={<LogOut size={14} />}
                 onClick={() => {
@@ -346,7 +356,7 @@ export function Sidebar({
           <Row icon={<BrainCircuit size={16} />} label="Import Claude memory" onClick={layout.importMemory} />
         )}
         {ws.org.role === "admin" && (
-          <Row icon={<Users size={16} />} label="Teamspaces & members" onClick={onManageTeams} />
+          <Row icon={<Users size={16} />} label="Workspace settings" onClick={onManageTeams} />
         )}
         {writable && <Row icon={<Trash2 size={16} />} label="Trash" onClick={layout.openTrash} />}
         <Row icon={<Plug size={16} />} label="Connect to Claude" onClick={layout.connectClaude} />

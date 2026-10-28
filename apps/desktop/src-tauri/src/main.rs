@@ -240,6 +240,33 @@ async fn connect_claude(
     Ok(claude::status(&paths, &rotation))
 }
 
+/// Erases the signed-in account (GDPR) after a fresh interactive sign-in,
+/// removes this app's Claude connections to the server (their tokens are gone)
+/// and signs out.
+#[tauri::command]
+async fn delete_account(app: AppHandle, session: State<'_, Session>, email: String) -> Result<SessionInfo, String> {
+    let server_url = session.server_url().await;
+    let session_token = if session.google_enabled(&server_url).await? {
+        google_session(&app, &session, &server_url).await?
+    } else {
+        session.dev_login(&server_url, &email).await?
+    };
+    session.delete_account(&server_url, &session_token).await?;
+
+    let _config = CLAUDE_CONFIG_LOCK.lock().await;
+    let paths = claude_paths(&app)?;
+    let status = claude::status(&paths, &claude::RotationState::default());
+    if status.code.connected && status.code.api_url.as_deref() == Some(server_url.as_str()) {
+        let _ = claude::disconnect_code(&paths);
+    }
+    if status.desktop.connected && status.desktop.api_url.as_deref() == Some(server_url.as_str()) {
+        let _ = claude::disconnect_desktop(&paths);
+    }
+    let file = rotation_file(&app)?;
+    let _ = claude::RotationState::default().save(&file);
+    Ok(session.sign_out().await)
+}
+
 #[tauri::command]
 async fn disconnect_claude(
     app: AppHandle,
@@ -362,7 +389,8 @@ fn main() {
             scan_claude_memory,
             claude_status,
             connect_claude,
-            disconnect_claude
+            disconnect_claude,
+            delete_account
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {
