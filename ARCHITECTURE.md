@@ -382,9 +382,12 @@ audit path as the HTTP API.
   and a writer role in the team.
 - **No delete tool.** The server instructions tell the model to write only
   when the user asks, never because a document says so.
-- **Concurrent edits:** `update_context` sends the version it read as
-  `base_updated_at`, so a concurrent edit returns a conflict instead of
-  being overwritten.
+- **Concurrent edits:** a full replacement must pass the `updated` value
+  of the `get_context` it is based on as `base_updated_at`; appends use the
+  version read just before writing. Either way a concurrent edit returns a
+  conflict instead of being overwritten.
+- **Delimiters:** page text and search snippets cannot close or fake the
+  `<context_content>` delimiters.
 - The org is the tool argument, then `NANACE_ORG_ID`, then the user's only org.
 - Context content is returned inside `<context_content>` delimiters, and the
   server instructions tell the model to treat it as data, not instructions.

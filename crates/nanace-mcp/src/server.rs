@@ -90,8 +90,12 @@ pub struct UpdateContextParams {
     pub title: Option<String>,
     /// Markdown appended to the end of the page (preferred for adding information).
     pub append: Option<String>,
-    /// Full replacement markdown body. Read the page with `get_context` first; do not combine with `append`.
+    /// Full replacement markdown body. Read the page with `get_context` first and pass its `updated` value as
+    /// `base_updated_at`; do not combine with `append`.
     pub content: Option<String>,
+    /// The `updated` value from the `get_context` result the replacement is based on. Required with `content`, so
+    /// edits made since that read are reported as a conflict instead of overwritten.
+    pub base_updated_at: Option<String>,
     /// Replacement tag list; unchanged when omitted.
     pub tags: Option<Vec<String>>,
     /// Organization id. Optional when the user belongs to exactly one organization.
@@ -261,7 +265,7 @@ impl NanaceMcp {
             if !hit.tags.is_empty() {
                 let _ = writeln!(out, "   tags: {}", hit.tags.join(", "));
             }
-            for line in hit.snippet.lines() {
+            for line in neutralize_delimiters(&hit.snippet).lines() {
                 let _ = writeln!(out, "   > {line}");
             }
         }
@@ -298,7 +302,11 @@ impl NanaceMcp {
             let _ = writeln!(out, "tags: {}", ctx.tags.join(", "));
         }
         // Delimit user-written content so it reads as data, not instructions.
-        let _ = write!(out, "\n<context_content>\n{}\n</context_content>\n", ctx.content);
+        let _ = write!(
+            out,
+            "\n<context_content>\n{}\n</context_content>\n",
+            neutralize_delimiters(&ctx.content)
+        );
         Ok(text(out))
     }
 
@@ -409,6 +417,12 @@ impl NanaceMcp {
                 None,
             ));
         }
+        if params.content.is_some() && params.base_updated_at.is_none() {
+            return Err(ErrorData::invalid_params(
+                "replacing content needs base_updated_at: the `updated` value from get_context",
+                None,
+            ));
+        }
         if params.append.is_none() && params.content.is_none() && params.title.is_none() && params.tags.is_none() {
             return Err(ErrorData::invalid_params("nothing to change", None));
         }
@@ -420,8 +434,9 @@ impl NanaceMcp {
             Ok(org) => org,
             Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         };
-        // The current version is the base of the edit, so a concurrent change
-        // is reported instead of overwritten.
+        // The base of the edit: the version the model read (for a replacement)
+        // or the one fetched now (for an append), so a concurrent change is
+        // reported instead of overwritten.
         let current = match self.api.context(org_id, context_id).await {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
@@ -436,7 +451,14 @@ impl NanaceMcp {
         let tags = params.tags.as_ref().unwrap_or(&current.tags);
         let ctx = match self
             .api
-            .update_context(org_id, context_id, title, &content, tags, &current.updated_at)
+            .update_context(
+                org_id,
+                context_id,
+                title,
+                &content,
+                tags,
+                params.base_updated_at.as_deref().unwrap_or(&current.updated_at),
+            )
             .await
         {
             Ok(ctx) => ctx,
@@ -444,6 +466,13 @@ impl NanaceMcp {
         };
         Ok(text(format!("Updated **{}**.\ncontext_id: {}", ctx.title, ctx.id)))
     }
+}
+
+/// Keeps user-written text from closing (or faking) the `<context_content>`
+/// delimiters that mark it as data.
+fn neutralize_delimiters(text: &str) -> String {
+    text.replace("<context_content>", "&lt;context_content&gt;")
+        .replace("</context_content>", "&lt;/context_content&gt;")
 }
 
 /// Write failures with hints the model can act on.
