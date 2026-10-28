@@ -157,7 +157,8 @@ only for changed code, new evidence, or an explicit re-review request.
 - The desktop webview never sees tokens: API calls go through the Tauri
   `api` command, which only reaches `<server>/api/v1/`. Do not add Tauri
   permissions or commands that expose HTTP, the filesystem, or the shell to
-  the webview. The one file read is `scan_claude_memory`: fixed to
+  the webview, and keep `/api/v1/me/tokens*` and `/api/v1/auth/*` out of the
+  `api` proxy. The one file read is `scan_claude_memory`: fixed to
   `~/.claude/projects/*/memory/*.md`, no symlinks, size-capped. The one
   config write is "Connect to Claude": `claude mcp add/remove --scope user`
   (the CLI, never editing `~/.claude.json` directly) and a merge of the

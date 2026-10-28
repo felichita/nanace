@@ -43,6 +43,8 @@ struct TokenRow {
     expires_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
+    /// Set when the token was replaced by rotation; it stops working soon after.
+    rotated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -84,9 +86,9 @@ async fn create_token(
         ));
     }
     let row: TokenRow = sqlx::query_as(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scope, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(days => $7)) \
-         RETURNING id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at",
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scope, expires_at, chain_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(days => $7), $1) \
+         RETURNING id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at, rotated_at",
     )
     .bind(Uuid::new_v4())
     .bind(user.user_id)
@@ -115,7 +117,7 @@ async fn create_token(
 
 async fn list_tokens(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
     let rows: Vec<TokenRow> = sqlx::query_as(
-        "SELECT id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at \
+        "SELECT id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at, rotated_at \
          FROM api_tokens WHERE user_id = $1 ORDER BY created_at DESC",
     )
     .bind(user.user_id)
@@ -172,12 +174,14 @@ async fn rotate_current_token(state: web::Data<AppState>, user: AuthUser) -> Api
     }
     // Same lifetime as the old token, capped at one year after the chain began.
     let row: Option<TokenRow> = sqlx::query_as(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scope, expires_at, chain_started_at) \
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scope, expires_at, chain_started_at, \
+                                 chain_id) \
          SELECT $1, user_id, name, $2, $3, scope, \
-                LEAST(now() + (expires_at - created_at), chain_started_at + interval '365 days'), chain_started_at \
+                LEAST(now() + (expires_at - created_at), chain_started_at + interval '365 days'), chain_started_at, \
+                chain_id \
          FROM api_tokens \
          WHERE id = $4 AND chain_started_at + interval '365 days' > now() + interval '1 day' \
-         RETURNING id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at",
+         RETURNING id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at, rotated_at",
     )
     .bind(Uuid::new_v4())
     .bind(sha256_hex(&token))
@@ -212,15 +216,19 @@ async fn rotate_current_token(state: web::Data<AppState>, user: AuthUser) -> Api
     Ok(HttpResponse::Created().json(CreatedToken { row, token }))
 }
 
+/// Revokes the token and every other token of its rotation chain.
 async fn revoke(state: &AppState, user: &AuthUser, token_id: Uuid) -> ApiResult<HttpResponse> {
     let mut tx = state.pool.begin().await?;
-    let revoked =
-        sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL")
-            .bind(token_id)
-            .bind(user.user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+    let revoked = sqlx::query(
+        "UPDATE api_tokens SET revoked_at = now() \
+         WHERE user_id = $2 AND revoked_at IS NULL AND chain_id = \
+               (SELECT chain_id FROM api_tokens WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL)",
+    )
+    .bind(token_id)
+    .bind(user.user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     if revoked == 0 {
         return Err(ApiError::NotFound);
     }
@@ -232,7 +240,7 @@ async fn revoke(state: &AppState, user: &AuthUser, token_id: Uuid) -> ApiResult<
             action: "token.revoke",
             resource_type: "api_token",
             resource_id: Some(token_id),
-            details: serde_json::json!({}),
+            details: serde_json::json!({ "revoked_in_chain": revoked }),
         },
     )
     .await?;

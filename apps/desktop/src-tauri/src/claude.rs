@@ -304,14 +304,23 @@ pub fn update_desktop_config(path: &Path, server: Option<Value>) -> Result<(), S
     let text = serde_json::to_string_pretty(&config).map_err(|err| err.to_string())? + "\n";
     // Write-then-rename so Claude never reads a half-written file.
     let tmp = path.with_extension("json.nanace-tmp");
-    fs::write(&tmp, text).map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+    write_private(&tmp, text.as_bytes()).map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
+/// Writes a file readable only by the user (it holds a token), with no window
+/// in which other users could read it.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let _ = fs::remove_file(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // The file holds a token.
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    fs::rename(&tmp, path).map_err(|err| format!("cannot write {}: {err}", path.display()))
+    options.open(path)?.write_all(bytes)
 }
 
 pub fn connect_desktop(paths: &Paths, binary: &Path, env: &Env) -> Result<(), String> {

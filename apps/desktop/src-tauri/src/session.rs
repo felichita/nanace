@@ -75,6 +75,13 @@ fn api_url(server_url: &str, path: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
+/// API paths the webview may call. Token management stays with this process:
+/// rotating or listing tokens through the webview would hand a credential to
+/// page JavaScript.
+fn webview_may_call(path: &str) -> bool {
+    !path.starts_with("/api/v1/me/tokens") && !path.starts_with("/api/v1/auth/")
+}
+
 fn keychain(server_url: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, server_url).map_err(|err| format!("keychain unavailable: {err}"))
 }
@@ -147,6 +154,9 @@ impl Session {
             (inner.server_url.clone(), inner.token.clone())
         };
         let token = token.ok_or_else(|| "not signed in".to_owned())?;
+        if !webview_may_call(path) {
+            return Err("this API path is not available to the app UI".to_owned());
+        }
         let url = api_url(&server_url, path)?;
         let method = match method {
             "GET" => reqwest::Method::GET,
@@ -411,6 +421,21 @@ mod tests {
             "https://kb.example.com/?x=1",
         ] {
             assert!(normalize_server_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn webview_cannot_reach_token_or_sign_in_endpoints() {
+        for blocked in [
+            "/api/v1/me/tokens",
+            "/api/v1/me/tokens/current/rotate",
+            "/api/v1/me/tokens/current",
+            "/api/v1/auth/exchange",
+        ] {
+            assert!(!webview_may_call(blocked), "{blocked}");
+        }
+        for allowed in ["/api/v1/me", "/api/v1/orgs/x/graph", "/api/v1/orgs/x/contexts/y"] {
+            assert!(webview_may_call(allowed), "{allowed}");
         }
     }
 

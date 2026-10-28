@@ -242,14 +242,17 @@ The desktop app adds two parameters to the login request:
   roles allow). Mutating handlers take `WriteUser`, which rejects read tokens.
 - Expire after 1–365 days (default 90); revocation is immediate. At most 50
   active tokens per user.
-- Creating and revoking tokens requires an interactive session, so a leaked
-  token cannot mint new ones.
+- Creating and revoking tokens by id requires an interactive session, so a
+  leaked token cannot mint unrelated ones.
 - **Rotation:** a token can replace itself (`/me/tokens/current/rotate`) with
   the same name, scope and lifetime.
   - The old token keeps working for a 24-hour grace period but cannot rotate
     again, so a chain never forks.
   - A chain ends one year after its first token was issued, so a leaked token
     cannot keep itself alive forever.
+  - Revoking any token of a chain revokes the whole chain (`chain_id`), so a
+    copy that a thief rotated dies with the original. The token list shows
+    `rotated_at`.
 - Tokens carry the user's identity only; team permissions still come from
   PostgreSQL on every request.
 

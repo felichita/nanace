@@ -29,6 +29,10 @@ const CLAUDE_TOKEN_DAYS: u32 = 30;
 const CLAUDE_ROTATE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 /// How often the app checks whether a rotation is due.
 const CLAUDE_ROTATION_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// Serializes everything that rewrites Claude's configs (connect, disconnect,
+/// background rotation), so a rotation cannot overwrite a fresh connection.
+static CLAUDE_CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Event sent to the UI when a Claude connection can no longer be renewed.
 const CLAUDE_EXPIRED_EVENT: &str = "claude-connection-expired";
 
@@ -129,6 +133,7 @@ fn claude_status(app: AppHandle) -> Result<claude::ClaudeStatus, String> {
 /// older than `CLAUDE_ROTATE_AFTER`, and returns the connections whose token
 /// could not be renewed (expired, revoked, or rotated elsewhere).
 async fn rotate_claude_tokens(app: &AppHandle) -> Result<Vec<claude::Target>, String> {
+    let _config = CLAUDE_CONFIG_LOCK.lock().await;
     let session = app.state::<Session>();
     let paths = claude_paths(app)?;
     let file = rotation_file(app)?;
@@ -202,6 +207,7 @@ async fn connect_claude(
         session.dev_login(&server_url, &email).await?
     };
 
+    let _config = CLAUDE_CONFIG_LOCK.lock().await;
     let file = rotation_file(&app)?;
     let mut rotation = claude::RotationState::load(&file);
     for target in targets {
@@ -240,6 +246,7 @@ async fn disconnect_claude(
     session: State<'_, Session>,
     target: claude::Target,
 ) -> Result<claude::ClaudeStatus, String> {
+    let _config = CLAUDE_CONFIG_LOCK.lock().await;
     let paths = claude_paths(&app)?;
     let file = rotation_file(&app)?;
     let mut rotation = claude::RotationState::load(&file);

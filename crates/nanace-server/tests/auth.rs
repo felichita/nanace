@@ -675,6 +675,38 @@ async fn tokens_rotate_themselves_within_limits() {
     let (status, _, _) = send(&app, rotate(&new)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+    // Revoking a token revokes the tokens rotated from it: a leaked token
+    // that its holder rotated dies with the original.
+    let (_, leaked, _) = send(
+        &app,
+        auth(test::TestRequest::post().uri("/api/v1/me/tokens"), &session)
+            .set_json(json!({ "name": "leaked", "scope": "write", "expires_in_days": 30 })),
+    )
+    .await;
+    let (status, successor, _) = send(&app, rotate(leaked["token"].as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let successor = successor["token"].as_str().unwrap().to_owned();
+    let (status, list, _) = send(&app, auth(test::TestRequest::get().uri("/api/v1/me/tokens"), &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == leaked["id"] && !t["rotated_at"].is_null()),
+        "{list}"
+    );
+    let (status, _, _) = send(
+        &app,
+        auth(
+            test::TestRequest::delete().uri(&format!("/api/v1/me/tokens/{}", leaked["id"].as_str().unwrap())),
+            &session,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(&app, me(&successor)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the rotated successor is revoked too");
+
     let rotations: i64 =
         sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'token.rotate' AND resource_id = $1")
             .bind(second["id"].as_str().unwrap().parse::<Uuid>().unwrap())
