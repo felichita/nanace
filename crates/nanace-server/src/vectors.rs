@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
+use nanace_core::chunk_markdown;
+use nanace_embed::{EmbedError, Embedder};
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::value::Kind;
 use qdrant_client::qdrant::vector_output::Vector;
@@ -19,6 +21,8 @@ use qdrant_client::qdrant::{
 };
 use qdrant_client::{Payload, Qdrant};
 use uuid::Uuid;
+
+use crate::CHUNK_MAX_BYTES;
 
 /// Namespace for deterministic point ids: `uuid_v5(NS, "<context>:<chunk>")`.
 /// Re-indexing a context overwrites its points in place.
@@ -51,6 +55,23 @@ const NEIGHBOR_OVERFETCH: u64 = 4;
 pub struct VectorStore {
     client: Qdrant,
     dimensions: u64,
+}
+
+/// Chunks and embeds a context. The title is prepended to every chunk so each
+/// chunk carries the document's topic; blank content still gets one chunk so
+/// the context is searchable by title.
+pub async fn embed_context(embedder: &dyn Embedder, title: &str, content: &str) -> Result<Vec<Chunk>, EmbedError> {
+    let mut texts = chunk_markdown(content, CHUNK_MAX_BYTES);
+    if texts.is_empty() {
+        texts.push(String::new());
+    }
+    let inputs = texts.iter().map(|t| format!("{title}\n\n{t}")).collect();
+    let vectors = embedder.embed_passages(inputs).await?;
+    Ok(texts
+        .into_iter()
+        .zip(vectors)
+        .map(|(text, vector)| Chunk { text, vector })
+        .collect())
 }
 
 pub fn collection_name(org_id: Uuid) -> String {
@@ -178,6 +199,19 @@ impl VectorStore {
             .await
             .context("failed to delete stale context points")?;
         Ok(())
+    }
+
+    /// Deletes the org's collection (if any) and creates it again empty, with
+    /// the current embedding dimensions.
+    pub async fn recreate_collection(&self, org_id: Uuid) -> anyhow::Result<()> {
+        let name = collection_name(org_id);
+        if self.client.collection_exists(&name).await? {
+            self.client
+                .delete_collection(&name)
+                .await
+                .context("failed to delete Qdrant collection")?;
+        }
+        self.ensure_collection(org_id).await
     }
 
     pub async fn delete_context(&self, org_id: Uuid, context_id: Uuid) -> anyhow::Result<()> {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use actix_web::{HttpResponse, web};
 use chrono::{DateTime, Utc};
-use nanace_core::{TeamRole, chunk_markdown, embedding_input_hash, validate, wiki_links};
+use nanace_core::{TeamRole, embedding_input_hash, validate, wiki_links};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
-use crate::vectors::Chunk;
-use crate::{AppState, CHUNK_MAX_BYTES, LOG_COMPONENT, access, db};
+use crate::vectors::{self, Chunk};
+use crate::{AppState, LOG_COMPONENT, access, db};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route(
@@ -89,24 +89,14 @@ struct ContextSummary {
     updated_at: DateTime<Utc>,
 }
 
-/// Chunks and embeds a context. The title is prepended to every chunk so each
-/// chunk carries the document's topic; blank content still gets one chunk so
-/// the context is searchable by title.
+/// [`vectors::embed_context`] with API errors.
 pub(crate) async fn embed_context(state: &AppState, title: &str, content: &str) -> ApiResult<Vec<Chunk>> {
-    let mut texts = chunk_markdown(content, CHUNK_MAX_BYTES);
-    if texts.is_empty() {
-        texts.push(String::new());
-    }
-    let inputs = texts.iter().map(|t| format!("{title}\n\n{t}")).collect();
-    let vectors = state.embedder.embed_passages(inputs).await.map_err(|err| {
-        tracing::error!(event = "embedding_failed", component = LOG_COMPONENT, error = %err, "embedding failed");
-        ApiError::Unavailable("embedding service")
-    })?;
-    Ok(texts
-        .into_iter()
-        .zip(vectors)
-        .map(|(text, vector)| Chunk { text, vector })
-        .collect())
+    vectors::embed_context(state.embedder.as_ref(), title, content)
+        .await
+        .map_err(|err| {
+            tracing::error!(event = "embedding_failed", component = LOG_COMPONENT, error = %err, "embedding failed");
+            ApiError::Unavailable("embedding service")
+        })
 }
 
 /// Team of a context the caller can read; `NotFound` otherwise.

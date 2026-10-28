@@ -9,7 +9,9 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod oauth;
+pub mod reindex;
 pub mod secret;
+pub mod upgrades;
 pub mod vectors;
 
 use std::sync::Arc;

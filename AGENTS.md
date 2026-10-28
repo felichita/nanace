@@ -165,6 +165,15 @@ only for changed code, new evidence, or an explicit re-review request.
 - `GoogleOAuth::with_token_url` exists for tests: the ID token signature is
   not checked, so production must use Google's HTTPS token endpoint.
 
+## Schema and Upgrades
+
+- Never edit an applied migration (checksums are verified at startup); add a
+  new numbered file.
+- Application upgrades in `crates/nanace-server/src/upgrades.rs` are append
+  only: never renumber or remove an entry. Each runs once, so it may assume
+  every earlier one ran, and must stay correct on databases of any size (it
+  runs at startup unless `NANACE_RUN_MIGRATIONS=false`).
+
 ## Logging
 
 For every added or edited `tracing` call:

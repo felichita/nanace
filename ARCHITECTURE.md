@@ -296,7 +296,42 @@ qa-team@example.com  -> Google Group -> sync -> team example/qa
   permissions are read on every request, so a revoked membership applies
   immediately.
 
+## Upgrades [built]
+
+`src/upgrades.rs` upgrades an installation in two layers, under a PostgreSQL
+advisory lock so replicas starting together upgrade once.
+
+1. **SQL migrations** (`migrations/`, embedded in the binary, tracked in
+   `_sqlx_migrations`) change the schema.
+2. **Application upgrades** are numbered steps written in Rust for what SQL
+   cannot do, tracked in `app_upgrades`, like a module version map.
+   - **Upgrade 1** backfills wiki links of contexts created before
+     `context_links` existed, writing as a team writer under RLS.
+   - **Model changes:** `system_state.embedding_model` records which model
+     produced the vectors. A different configured model triggers a full
+     reindex.
+
+The server runs both at startup unless `NANACE_RUN_MIGRATIONS=false`;
+`nanace-server migrate` runs them as a separate step. With migrations off, the
+server compares the database with its own lists (`migrate --check` does the
+same):
+
+- it refuses to start when anything is pending;
+- it refuses to start when the database has migrations or upgrades it does
+  not know, which means a newer version upgraded it.
+
 ## Embeddings [built]
+
+`nanace-server reindex [--org <id>]` rebuilds Qdrant from PostgreSQL, for
+example after moving to a new Qdrant or changing the model:
+
+- **What it does:** it recreates each org's collection with the current
+  model's dimensions and re-embeds every live (not trashed) context with the
+  same chunking as the API.
+- **RLS:** contexts are read through `db::scoped_tx` as a member of their
+  team, so RLS still applies. Teams without members cannot be read and are
+  reported.
+- **During the run:** search for that org is incomplete until it finishes.
 
 - Model: `BAAI/bge-small-en-v1.5` (384 dimensions, English) running locally
   through `fastembed` / ONNX Runtime. No API key is needed; the model (~130 MB)

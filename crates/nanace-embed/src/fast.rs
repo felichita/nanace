@@ -9,8 +9,8 @@ use crate::{EmbedError, Embedder};
 /// bge v1.5 recommends this instruction for short retrieval queries; passages
 /// are embedded without it.
 const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
-const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
-const DIMENSIONS: usize = 384;
+const MODEL_ID: &str = FastEmbedder::MODEL_ID;
+const DIMENSIONS: usize = FastEmbedder::DIMENSIONS;
 const BATCH_SIZE: usize = 32;
 
 /// Local `bge-small-en-v1.5` inference via ONNX Runtime. Inference is
@@ -21,6 +21,9 @@ pub struct FastEmbedder {
 }
 
 impl FastEmbedder {
+    pub const MODEL_ID: &'static str = "BAAI/bge-small-en-v1.5";
+    pub const DIMENSIONS: usize = 384;
+
     /// Loads the model, downloading it into `cache_dir` on first use.
     /// Blocking: call from a blocking context.
     pub fn load(cache_dir: PathBuf) -> Result<Self, EmbedError> {

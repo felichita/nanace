@@ -15,6 +15,21 @@ pub enum EmbedderKind {
     Hashing,
 }
 
+impl EmbedderKind {
+    /// `<model id>:<dimensions>`, the identity of the vectors this embedder
+    /// produces; known without loading the model.
+    pub fn model_key(self) -> String {
+        match self {
+            Self::FastEmbed => format!(
+                "{}:{}",
+                nanace_embed::FastEmbedder::MODEL_ID,
+                nanace_embed::FastEmbedder::DIMENSIONS
+            ),
+            Self::Hashing => format!("{}:{}", nanace_embed::HashingEmbedder::MODEL_ID, 384),
+        }
+    }
+}
+
 /// Google sign-in settings. Present only when `NANACE_GOOGLE_CLIENT_ID` is set.
 #[derive(Debug, Clone)]
 pub struct GoogleConfig {

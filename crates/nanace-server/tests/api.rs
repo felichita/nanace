@@ -1118,3 +1118,223 @@ async fn org_admins_remove_members_from_the_org() {
             .unwrap();
     assert_eq!(audited, 1);
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn reindex_rebuilds_qdrant_from_postgres() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6336".to_owned());
+    let vectors = VectorStore::connect(&qdrant_url, 384).unwrap();
+    let embedder = HashingEmbedder::new(384);
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let alice = c.login(&email("alice")).await;
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("reindex"), "name": "Reindex" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let base = format!("/api/v1/orgs/{org_id}");
+    let mut teams = Vec::new();
+    for slug in ["docs", "orphan"] {
+        let team = c
+            .ok(
+                "POST",
+                &format!("{base}/teams"),
+                &alice,
+                Some(json!({ "slug": slug, "name": slug })),
+                StatusCode::CREATED,
+            )
+            .await;
+        teams.push(team["id"].as_str().unwrap().to_owned());
+    }
+    let create = |team: &str, title: &str, content: &str| {
+        let uri = format!("{base}/teams/{team}/contexts");
+        let body = json!({ "title": title, "content": content });
+        let c = &c;
+        let alice = alice.clone();
+        async move {
+            c.ok("POST", &uri, &alice, Some(body), StatusCode::CREATED).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let kept = create(&teams[0], "Kept", "glacier migration checklist").await;
+    let trashed = create(&teams[0], "Trashed", "glacier migration rollback").await;
+    create(&teams[1], "Orphaned", "glacier migration orphan").await;
+    c.ok(
+        "DELETE",
+        &format!("{base}/contexts/{trashed}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    // The orphan team loses its only member.
+    let alice_id = c.ok("GET", "/api/v1/me", &alice, None, StatusCode::OK).await["user_id"].clone();
+    c.ok(
+        "DELETE",
+        &format!("{base}/teams/{}/members/{}", teams[1], alice_id.as_str().unwrap()),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let search = || {
+        let uri = format!("{base}/search");
+        let c = &c;
+        let alice = alice.clone();
+        async move {
+            ids(&c
+                .ok(
+                    "POST",
+                    &uri,
+                    &alice,
+                    Some(json!({ "query": "glacier migration" })),
+                    StatusCode::OK,
+                )
+                .await)
+        }
+    };
+    assert!(search().await.contains(&kept));
+
+    // An empty Qdrant (new server, lost volume): nothing is found.
+    vectors.recreate_collection(org_id).await.unwrap();
+    assert!(search().await.is_empty());
+
+    let report = nanace_server::reindex::reindex(&pool, &vectors, &embedder, Some(org_id))
+        .await
+        .unwrap();
+    assert_eq!(report.orgs, 1);
+    assert_eq!(report.contexts, 1, "only the live context of the readable team");
+    assert_eq!(report.skipped_teams, vec![(org_id, teams[1].parse().unwrap())]);
+    assert_eq!(search().await, vec![kept.clone()]);
+
+    let missing = nanace_server::reindex::reindex(&pool, &vectors, &embedder, Some(Uuid::new_v4())).await;
+    assert!(missing.is_err());
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn app_upgrades_backfill_links_and_report_status() {
+    use nanace_server::upgrades;
+
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6336".to_owned());
+    let vectors = VectorStore::connect(&qdrant_url, 384).unwrap();
+    let embedder = HashingEmbedder::new(384);
+    let model_key = "hashing-v1:384";
+    // The test database tracks the hashing model, so no reindex is triggered.
+    upgrades::record_embedding_model(&pool, model_key).await.unwrap();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let alice = c.login(&email("alice")).await;
+    let alice_id: Uuid = c.ok("GET", "/api/v1/me", &alice, None, StatusCode::OK).await["user_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("upgrade"), "name": "Upgrade" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let base = format!("/api/v1/orgs/{org_id}");
+    let team = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "docs", "name": "Docs" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let team = team["id"].as_str().unwrap();
+    let mut ids = Vec::new();
+    for (title, content) in [("Alpha", "see [[Beta]]"), ("Beta", "plain")] {
+        let page = c
+            .ok(
+                "POST",
+                &format!("{base}/teams/{team}/contexts"),
+                &alice,
+                Some(json!({ "title": title, "content": content })),
+                StatusCode::CREATED,
+            )
+            .await;
+        ids.push(page["id"].as_str().unwrap().to_owned());
+    }
+    let links = || {
+        let uri = format!("{base}/graph?semantic=false");
+        let c = &c;
+        let alice = alice.clone();
+        async move { edge_set(&c.ok("GET", &uri, &alice, None, StatusCode::OK).await, "link") }
+    };
+    assert_eq!(links().await.len(), 1);
+
+    // A context from before links existed: its links were never stored.
+    let mut tx = db::scoped_tx(&pool, org_id, alice_id).await.unwrap();
+    sqlx::query("DELETE FROM context_links WHERE source_id = $1")
+        .bind(ids[0].parse::<Uuid>().unwrap())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(links().await.is_empty());
+
+    sqlx::query("DELETE FROM app_upgrades WHERE version = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let status = upgrades::status(&pool, model_key).await.unwrap();
+    assert_eq!(status.pending_upgrades, vec![1]);
+    assert!(status.pending_migrations.is_empty() && !status.is_newer());
+
+    let report = upgrades::run(&pool, &vectors, &embedder).await.unwrap();
+    assert_eq!(report.upgrades, vec![1]);
+    assert!(!report.reindexed);
+    assert_eq!(links().await, vec![(ids[0].clone(), ids[1].clone())]);
+    assert!(upgrades::status(&pool, model_key).await.unwrap().is_current());
+    // Applied once: a second run does nothing.
+    assert!(
+        upgrades::run(&pool, &vectors, &embedder)
+            .await
+            .unwrap()
+            .upgrades
+            .is_empty()
+    );
+
+    // A different configured model is reported as a pending reindex.
+    let status = upgrades::status(&pool, "other-model:768").await.unwrap();
+    assert_eq!(
+        status.model_change,
+        Some((model_key.to_owned(), "other-model:768".to_owned()))
+    );
+
+    // A database upgraded by a newer binary is recognised as newer.
+    sqlx::query("INSERT INTO app_upgrades (version, name) VALUES (9999, 'from the future') ON CONFLICT DO NOTHING")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let status = upgrades::status(&pool, model_key).await.unwrap();
+    sqlx::query("DELETE FROM app_upgrades WHERE version = 9999")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(status.is_newer() && status.unknown_upgrades == vec![9999]);
+}

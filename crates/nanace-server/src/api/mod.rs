@@ -1,7 +1,7 @@
 mod audit_logs;
 mod auth;
 mod complete_page;
-mod contexts;
+pub(crate) mod contexts;
 mod google;
 mod graph;
 mod orgs;
