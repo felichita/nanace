@@ -15,6 +15,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/me/tokens", web::get().to(list_tokens))
         // Before `{token_id}`, which would otherwise match "current".
         .route("/me/tokens/current", web::delete().to(revoke_current_token))
+        .route("/me/tokens/current/rotate", web::post().to(rotate_current_token))
         .route("/me/tokens/{token_id}", web::delete().to(revoke_token));
 }
 
@@ -137,6 +138,78 @@ async fn revoke_current_token(state: web::Data<AppState>, user: AuthUser) -> Api
         ));
     };
     revoke(&state, &user, id).await
+}
+
+/// How long a rotated token keeps working, so clients that already loaded it
+/// (for example a running Claude session) are not cut off mid-task.
+const ROTATION_GRACE_HOURS: i32 = 24;
+
+/// Replaces the token that authenticates this request with a new one of the
+/// same name, scope and lifetime. Lets clients rotate credentials without an
+/// interactive session; the rotation chain still ends one year after the
+/// first token was issued, and a token can be rotated only once.
+async fn rotate_current_token(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+    let AuthMethod::Token { id, .. } = user.method else {
+        return Err(ApiError::BadRequest(
+            "request is not authenticated with a token".to_owned(),
+        ));
+    };
+    let token = format!("{PAT_PREFIX}{}", random_token(32)?);
+
+    let mut tx = state.pool.begin().await?;
+    let rotated: Option<Option<chrono::DateTime<Utc>>> = sqlx::query_scalar(
+        "SELECT rotated_at FROM api_tokens \
+         WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now() FOR UPDATE",
+    )
+    .bind(id)
+    .bind(user.user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match rotated {
+        None => return Err(ApiError::Unauthorized),
+        Some(Some(_)) => return Err(ApiError::Conflict("token was already rotated".to_owned())),
+        Some(None) => {}
+    }
+    // Same lifetime as the old token, capped at one year after the chain began.
+    let row: Option<TokenRow> = sqlx::query_as(
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scope, expires_at, chain_started_at) \
+         SELECT $1, user_id, name, $2, $3, scope, \
+                LEAST(now() + (expires_at - created_at), chain_started_at + interval '365 days'), chain_started_at \
+         FROM api_tokens \
+         WHERE id = $4 AND chain_started_at + interval '365 days' > now() + interval '1 day' \
+         RETURNING id, name, token_prefix, scope, created_at, expires_at, last_used_at, revoked_at",
+    )
+    .bind(Uuid::new_v4())
+    .bind(sha256_hex(&token))
+    .bind(&token[..DISPLAY_PREFIX_LEN])
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let row = row.ok_or_else(|| {
+        ApiError::Conflict("token is at its maximum age; sign in again to issue a new one".to_owned())
+    })?;
+    sqlx::query(
+        "UPDATE api_tokens SET rotated_at = now(), \
+                expires_at = LEAST(expires_at, now() + make_interval(hours => $2)) WHERE id = $1",
+    )
+    .bind(id)
+    .bind(ROTATION_GRACE_HOURS)
+    .execute(&mut *tx)
+    .await?;
+    audit::record(
+        &mut *tx,
+        AuditEvent {
+            org_id: None,
+            actor: user.user_id,
+            action: "token.rotate",
+            resource_type: "api_token",
+            resource_id: Some(row.id),
+            details: serde_json::json!({ "previous_id": id }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(HttpResponse::Created().json(CreatedToken { row, token }))
 }
 
 async fn revoke(state: &AppState, user: &AuthUser, token_id: Uuid) -> ApiResult<HttpResponse> {

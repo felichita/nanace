@@ -218,7 +218,13 @@ export interface ClaudeTargetStatus {
   installed: boolean;
   connected: boolean;
   api_url: string | null;
+  writes: boolean;
+  /** Unix seconds of the last token issue or rotation by this app. */
+  rotated_at: number | null;
 }
+
+/** Sent by the app when a Claude connection's token can no longer be renewed. */
+export const CLAUDE_EXPIRED_EVENT = "claude-connection-expired";
 
 export interface ClaudeStatus {
   code: ClaudeTargetStatus;
@@ -228,8 +234,8 @@ export interface ClaudeStatus {
 
 export const claude = {
   status: () => invoke<ClaudeStatus>("claude_status"),
-  connect: (targets: ClaudeTarget[], orgId: string, email: string) =>
-    invoke<ClaudeStatus>("connect_claude", { targets, orgId, email }),
+  connect: (targets: ClaudeTarget[], orgId: string, email: string, allowWrites: boolean) =>
+    invoke<ClaudeStatus>("connect_claude", { targets, orgId, email, allowWrites }),
   disconnect: (target: ClaudeTarget) => invoke<ClaudeStatus>("disconnect_claude", { target }),
 };
 

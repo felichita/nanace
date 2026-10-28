@@ -586,3 +586,92 @@ async fn desktop_loopback_sign_in() {
     let (status, _, _) = send(&app, auth(test::TestRequest::get().uri("/api/v1/me"), &pat)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn tokens_rotate_themselves_within_limits() {
+    let state = state(None).await;
+    let pool = state.pool.clone();
+    let app = test::init_service(App::new().app_data(state).configure(api::configure)).await;
+    let (_, body, _) = send(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/auth/dev-login")
+            .set_json(json!({ "email": format!("rot.{}@example.com", unique()) })),
+    )
+    .await;
+    let session = body["access_token"].as_str().unwrap().to_owned();
+    let auth = |req: test::TestRequest, token: &str| req.insert_header(("Authorization", format!("Bearer {token}")));
+    let rotate = |token: &str| auth(test::TestRequest::post().uri("/api/v1/me/tokens/current/rotate"), token);
+    let me = |token: &str| auth(test::TestRequest::get().uri("/api/v1/me"), token);
+
+    let (_, first, _) = send(
+        &app,
+        auth(test::TestRequest::post().uri("/api/v1/me/tokens"), &session)
+            .set_json(json!({ "name": "Claude Code (MCP)", "scope": "read", "expires_in_days": 30 })),
+    )
+    .await;
+    let old = first["token"].as_str().unwrap().to_owned();
+    let (status, _, _) = send(&app, rotate(&session)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "sessions do not rotate");
+
+    let (status, second, _) = send(&app, rotate(&old)).await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let new = second["token"].as_str().unwrap().to_owned();
+    assert_ne!(new, old);
+    assert_eq!(second["name"], "Claude Code (MCP)");
+    assert_eq!(second["scope"], "read", "rotation keeps the scope");
+    let lifetime: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM expires_at - created_at)::float8 / 86400 FROM api_tokens WHERE id = $1",
+    )
+    .bind(second["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!((lifetime - 30.0).abs() < 0.01, "same lifetime, got {lifetime} days");
+
+    // Both work during the grace period; the old one cannot rotate again.
+    for token in [&old, &new] {
+        let (status, _, _) = send(&app, me(token)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let old_expiry: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM expires_at - now())::float8 / 3600 FROM api_tokens WHERE id = $1",
+    )
+    .bind(first["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        old_expiry <= 24.0,
+        "old token expires within the grace period, got {old_expiry} h"
+    );
+    let (status, _, _) = send(&app, rotate(&old)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a chain cannot fork");
+
+    // A chain ends one year after it started.
+    sqlx::query("UPDATE api_tokens SET chain_started_at = now() - interval '365 days' WHERE id = $1")
+        .bind(second["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, _) = send(&app, rotate(&new)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Expired tokens cannot rotate.
+    sqlx::query("UPDATE api_tokens SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(second["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, _) = send(&app, rotate(&new)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let rotations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'token.rotate' AND resource_id = $1")
+            .bind(second["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rotations, 1);
+}

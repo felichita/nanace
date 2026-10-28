@@ -44,8 +44,14 @@ agreed design that is not implemented yet.
   - **Registration:** the button registers it with Claude Code
     (`claude mcp add --scope user`) and/or Claude Desktop (merges the
     `nanace` entry into `claude_desktop_config.json`).
-  - **Tokens:** each app gets its own read-scoped token. Minting one needs a
-    fresh interactive sign-in. Reconnecting revokes the previous token, and
+  - **Tokens:** each app gets its own 30-day token, read-scoped or, when
+    "Allow Claude to create and edit pages" is checked, write-scoped with
+    `NANACE_ALLOW_WRITES=true`.
+    - **Issuing:** needs a fresh interactive sign-in, and revokes every
+      earlier token of that kind.
+    - **Rotation:** while the app runs it rotates tokens older than 7 days
+      (`POST /me/tokens/current/rotate`) and rewrites the configs. It notifies
+      the user when a token can no longer be renewed. Reconnecting revokes the previous token, and
     disconnecting revokes it with itself.
 - **Sign-in:** Google in the system browser with a loopback redirect and PKCE
   (RFC 8252), or dev email login. Both end with a write-scoped personal
@@ -238,6 +244,12 @@ The desktop app adds two parameters to the login request:
   active tokens per user.
 - Creating and revoking tokens requires an interactive session, so a leaked
   token cannot mint new ones.
+- **Rotation:** a token can replace itself (`/me/tokens/current/rotate`) with
+  the same name, scope and lifetime.
+  - The old token keeps working for a 24-hour grace period but cannot rotate
+    again, so a chain never forks.
+  - A chain ends one year after its first token was issued, so a leaked token
+    cannot keep itself alive forever.
 - Tokens carry the user's identity only; team permissions still come from
   PostgreSQL on every request.
 
@@ -405,8 +417,11 @@ Claude Desktop / Claude Code
 | `GET/POST` | `/api/v1/me/tokens` | Authenticated / session only |
 | `DELETE` | `/api/v1/me/tokens/{id}` | Session only |
 | `DELETE` | `/api/v1/me/tokens/current` | The token itself (sign-out) |
+| `POST` | `/api/v1/me/tokens/current/rotate` | The token itself; same name, scope and lifetime |
 | `GET` | `/api/v1/me` | Authenticated |
 | `POST` | `/api/v1/orgs` | Authenticated; caller becomes org admin |
+| `GET` | `/api/v1/orgs/{org}/members` | Org admin; members with their teams |
+| `DELETE` | `/api/v1/orgs/{org}/members/{user}` | Org admin; removes from the org and all its teams (not the last admin) |
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |
 | `GET/PUT` | `/api/v1/orgs/{org}/teams/{team}/members` | Team member or org admin / team admin or org admin |
 | `DELETE` | `/api/v1/orgs/{org}/teams/{team}/members/{user}` | Team admin or org admin |
@@ -428,8 +443,6 @@ across teams or orgs.
 
 **In one sentence:** PostgreSQL + Qdrant give a multi-tenant knowledge base
 with team-level RBAC, Google Groups auto-sync, and Claude semantic search.
-| `GET` | `/api/v1/orgs/{org}/members` | Org admin; members with their teams |
-| `DELETE` | `/api/v1/orgs/{org}/members/{user}` | Org admin; removes from the org and all its teams (not the last admin) |
 
 **For managers:**
 

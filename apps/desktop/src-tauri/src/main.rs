@@ -16,13 +16,21 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 use tokio::net::TcpListener;
 
 use session::{ApiResponse, Session, SessionInfo};
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Lifetime of tokens handed to Claude; rotation keeps it.
+const CLAUDE_TOKEN_DAYS: u32 = 30;
+/// Tokens handed to Claude are replaced once they are this old.
+const CLAUDE_ROTATE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How often the app checks whether a rotation is due.
+const CLAUDE_ROTATION_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// Event sent to the UI when a Claude connection can no longer be renewed.
+const CLAUDE_EXPIRED_EVENT: &str = "claude-connection-expired";
 
 #[tauri::command]
 async fn session_info(session: State<'_, Session>) -> Result<SessionInfo, String> {
@@ -103,13 +111,71 @@ fn claude_paths(app: &AppHandle) -> Result<claude::Paths, String> {
     })
 }
 
-#[tauri::command]
-fn claude_status(app: AppHandle) -> Result<claude::ClaudeStatus, String> {
-    Ok(claude::status(&claude_paths(&app)?))
+fn rotation_file(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app
+        .path()
+        .app_config_dir()
+        .map_err(|err| err.to_string())?
+        .join("claude-rotation.json"))
 }
 
-/// Gives Claude Code and/or Claude Desktop read access to `org_id` through the
-/// bundled MCP server. Creating tokens needs a fresh interactive sign-in:
+#[tauri::command]
+fn claude_status(app: AppHandle) -> Result<claude::ClaudeStatus, String> {
+    let rotation = claude::RotationState::load(&rotation_file(&app)?);
+    Ok(claude::status(&claude_paths(&app)?, &rotation))
+}
+
+/// Rotates the tokens of Claude connections to this app's server that are
+/// older than `CLAUDE_ROTATE_AFTER`, and returns the connections whose token
+/// could not be renewed (expired, revoked, or rotated elsewhere).
+async fn rotate_claude_tokens(app: &AppHandle) -> Result<Vec<claude::Target>, String> {
+    let session = app.state::<Session>();
+    let paths = claude_paths(app)?;
+    let file = rotation_file(app)?;
+    let mut rotation = claude::RotationState::load(&file);
+    let server_url = session.server_url().await;
+    let now = claude::now_secs();
+    let mut expired = Vec::new();
+    for target in [claude::Target::Code, claude::Target::Desktop] {
+        let Some((_, env)) = claude::current_entry(&paths, target) else {
+            continue;
+        };
+        let (Some(token), Some(api_url)) = (env.get("NANACE_TOKEN"), env.get("NANACE_API_URL")) else {
+            continue;
+        };
+        // Entries pointing at another server were set up elsewhere.
+        if *api_url != server_url {
+            continue;
+        }
+        let due = rotation
+            .get(target)
+            .is_none_or(|at| now.saturating_sub(at) >= CLAUDE_ROTATE_AFTER.as_secs());
+        if !due {
+            continue;
+        }
+        match session.rotate_token(api_url, token).await {
+            Ok(Some(new_token)) => {
+                if claude::replace_token(&paths, target, &new_token).is_ok() {
+                    rotation.set(target, Some(now));
+                } else {
+                    // The old token now expires within a day; drop the new one
+                    // rather than leave an unused credential behind.
+                    session.revoke_token(api_url, &new_token).await;
+                    expired.push(target);
+                }
+            }
+            Ok(None) => expired.push(target),
+            // Offline or the server is down: try again on the next check.
+            Err(err) => eprintln!("nanace: renewing the {target:?} token failed: {err}"),
+        }
+    }
+    rotation.save(&file)?;
+    Ok(expired)
+}
+
+/// Gives Claude Code and/or Claude Desktop access to `org_id` through the
+/// bundled MCP server: read-only, or with `allow_writes` also creating and
+/// editing pages (never deleting). Creating tokens needs a fresh interactive sign-in:
 /// Google when the server has it, otherwise dev email login as `email`.
 #[tauri::command]
 async fn connect_claude(
@@ -118,6 +184,7 @@ async fn connect_claude(
     targets: Vec<claude::Target>,
     org_id: String,
     email: String,
+    allow_writes: bool,
 ) -> Result<claude::ClaudeStatus, String> {
     if targets.is_empty() {
         return Err("choose Claude Code or Claude Desktop".to_owned());
@@ -135,12 +202,24 @@ async fn connect_claude(
         session.dev_login(&server_url, &email).await?
     };
 
+    let file = rotation_file(&app)?;
+    let mut rotation = claude::RotationState::load(&file);
     for target in targets {
-        let previous = claude::existing_token(&paths, target);
-        let token = session
-            .create_token(&server_url, &session_token, target.token_name(), "read", 365)
+        // Every earlier token for this app goes, including copies that were
+        // rotated since: reconnecting ends any leaked credential.
+        session
+            .revoke_tokens_named(&server_url, &session_token, target.token_name())
             .await?;
-        let env = claude::server_env(&server_url, &token, &org_id);
+        let token = session
+            .create_token(
+                &server_url,
+                &session_token,
+                target.token_name(),
+                if allow_writes { "write" } else { "read" },
+                CLAUDE_TOKEN_DAYS,
+            )
+            .await?;
+        let env = claude::server_env(&server_url, &token, &org_id, allow_writes);
         let written = match target {
             claude::Target::Code => claude::connect_code(&paths, &binary, &env),
             claude::Target::Desktop => claude::connect_desktop(&paths, &binary, &env),
@@ -149,12 +228,10 @@ async fn connect_claude(
             session.revoke_token(&server_url, &token).await;
             return Err(err);
         }
-        // The replaced entry's token is no longer used anywhere.
-        if let Some(old) = previous.filter(|old| *old != token) {
-            session.revoke_token(&server_url, &old).await;
-        }
+        rotation.set(target, Some(claude::now_secs()));
+        rotation.save(&file)?;
     }
-    Ok(claude::status(&paths))
+    Ok(claude::status(&paths, &rotation))
 }
 
 #[tauri::command]
@@ -164,7 +241,9 @@ async fn disconnect_claude(
     target: claude::Target,
 ) -> Result<claude::ClaudeStatus, String> {
     let paths = claude_paths(&app)?;
-    let before = claude::status(&paths);
+    let file = rotation_file(&app)?;
+    let mut rotation = claude::RotationState::load(&file);
+    let before = claude::status(&paths, &rotation);
     let api_url = match target {
         claude::Target::Code => before.code.api_url,
         claude::Target::Desktop => before.desktop.api_url,
@@ -178,7 +257,9 @@ async fn disconnect_claude(
     if let Some(token) = token {
         session.revoke_token(&api_url, &token).await;
     }
-    Ok(claude::status(&paths))
+    rotation.set(target, None);
+    rotation.save(&file)?;
+    Ok(claude::status(&paths, &rotation))
 }
 
 /// Claude Code memory files for the import dialog (read-only, fixed location).
@@ -244,6 +325,23 @@ fn main() {
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true);
             builder.build()?;
+
+            // Keeps the tokens handed to Claude short-lived without asking
+            // the user: rotate weekly while the app runs.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                loop {
+                    match rotate_claude_tokens(&handle).await {
+                        Ok(expired) if !expired.is_empty() => {
+                            let _ = handle.emit(CLAUDE_EXPIRED_EVENT, &expired);
+                        }
+                        Ok(_) => {}
+                        Err(err) => eprintln!("nanace: Claude token renewal failed: {err}"),
+                    }
+                    tokio::time::sleep(CLAUDE_ROTATION_CHECK).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

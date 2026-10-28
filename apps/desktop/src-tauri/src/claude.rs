@@ -4,7 +4,8 @@
 //! Claude Code is configured through its CLI (`claude mcp add --scope user`),
 //! never by editing `~/.claude.json` directly. Claude Desktop has no CLI, so
 //! its `claude_desktop_config.json` is merged in place, keeping every other
-//! setting. Each app gets its own read-scoped token.
+//! setting. Each app gets its own token: read-scoped, or write-scoped with
+//! `NANACE_ALLOW_WRITES=true` when the user lets Claude create and edit pages.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -39,6 +40,10 @@ pub struct TargetStatus {
     pub connected: bool,
     /// Server URL in the existing entry, if connected.
     pub api_url: Option<String>,
+    /// Claude may create and edit pages through this connection.
+    pub writes: bool,
+    /// When the token was last issued or rotated by this app (Unix seconds).
+    pub rotated_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -119,11 +124,13 @@ fn status_of(installed: bool, config: Option<&Value>) -> TargetStatus {
         installed,
         connected: entry.is_some(),
         api_url: env_value(entry, "NANACE_API_URL"),
+        writes: env_value(entry, "NANACE_ALLOW_WRITES").as_deref() == Some("true"),
+        rotated_at: None,
     }
 }
 
-pub fn status(paths: &Paths) -> ClaudeStatus {
-    ClaudeStatus {
+pub fn status(paths: &Paths, rotation: &RotationState) -> ClaudeStatus {
+    let mut status = ClaudeStatus {
         code: status_of(
             paths.claude_cli().is_some(),
             read_json(&paths.code_config()).ok().flatten().as_ref(),
@@ -133,26 +140,106 @@ pub fn status(paths: &Paths) -> ClaudeStatus {
             read_json(&paths.desktop_config()).ok().flatten().as_ref(),
         ),
         mcp_binary: mcp_binary().map(|p| p.display().to_string()),
+    };
+    if status.code.connected {
+        status.code.rotated_at = rotation.code;
     }
+    if status.desktop.connected {
+        status.desktop.rotated_at = rotation.desktop;
+    }
+    status
 }
 
 /// Token in the current entry for `target`, so it can be revoked when the
 /// entry is replaced or removed.
 pub fn existing_token(paths: &Paths, target: Target) -> Option<String> {
+    current_entry(paths, target).and_then(|(_, env)| env.get("NANACE_TOKEN").cloned())
+}
+
+/// Command and environment of the current nanace entry for `target`.
+pub fn current_entry(paths: &Paths, target: Target) -> Option<(PathBuf, Env)> {
     let path = match target {
         Target::Code => paths.code_config(),
         Target::Desktop => paths.desktop_config(),
     };
     let config = read_json(&path).ok().flatten();
-    env_value(entry(config.as_ref()), "NANACE_TOKEN")
+    let entry = entry(config.as_ref())?;
+    let command = PathBuf::from(entry.get("command")?.as_str()?);
+    let env = entry
+        .get("env")?
+        .as_object()?
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+        .collect();
+    Some((command, env))
 }
 
-pub fn server_env(api_url: &str, token: &str, org_id: &str) -> BTreeMap<&'static str, String> {
-    BTreeMap::from([
-        ("NANACE_API_URL", api_url.to_owned()),
-        ("NANACE_TOKEN", token.to_owned()),
-        ("NANACE_ORG_ID", org_id.to_owned()),
-    ])
+/// Swaps the token in an existing entry, keeping its command and settings.
+pub fn replace_token(paths: &Paths, target: Target, token: &str) -> Result<(), String> {
+    let (command, mut env) = current_entry(paths, target).ok_or_else(|| "not connected".to_owned())?;
+    env.insert("NANACE_TOKEN".to_owned(), token.to_owned());
+    match target {
+        Target::Code => connect_code(paths, &command, &env),
+        Target::Desktop => connect_desktop(paths, &command, &env),
+    }
+}
+
+/// When each target's token was last issued or rotated (Unix seconds), kept in
+/// the app's config directory.
+#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+pub struct RotationState {
+    pub code: Option<u64>,
+    pub desktop: Option<u64>,
+}
+
+impl RotationState {
+    pub fn load(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+        }
+        fs::write(path, serde_json::to_vec(self).map_err(|err| err.to_string())?).map_err(|err| err.to_string())
+    }
+
+    pub fn get(&self, target: Target) -> Option<u64> {
+        match target {
+            Target::Code => self.code,
+            Target::Desktop => self.desktop,
+        }
+    }
+
+    pub fn set(&mut self, target: Target, at: Option<u64>) {
+        match target {
+            Target::Code => self.code = at,
+            Target::Desktop => self.desktop = at,
+        }
+    }
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+pub type Env = BTreeMap<String, String>;
+
+pub fn server_env(api_url: &str, token: &str, org_id: &str, allow_writes: bool) -> Env {
+    let mut env = Env::from([
+        ("NANACE_API_URL".to_owned(), api_url.to_owned()),
+        ("NANACE_TOKEN".to_owned(), token.to_owned()),
+        ("NANACE_ORG_ID".to_owned(), org_id.to_owned()),
+    ]);
+    if allow_writes {
+        env.insert("NANACE_ALLOW_WRITES".to_owned(), "true".to_owned());
+    }
+    env
 }
 
 fn run_cli(cli: &Path, args: &[String]) -> Result<(), String> {
@@ -168,7 +255,7 @@ fn run_cli(cli: &Path, args: &[String]) -> Result<(), String> {
     }
 }
 
-pub fn connect_code(paths: &Paths, binary: &Path, env: &BTreeMap<&'static str, String>) -> Result<(), String> {
+pub fn connect_code(paths: &Paths, binary: &Path, env: &Env) -> Result<(), String> {
     let cli = paths
         .claude_cli()
         .ok_or_else(|| "Claude Code CLI (`claude`) not found".to_owned())?;
@@ -227,7 +314,7 @@ pub fn update_desktop_config(path: &Path, server: Option<Value>) -> Result<(), S
     fs::rename(&tmp, path).map_err(|err| format!("cannot write {}: {err}", path.display()))
 }
 
-pub fn connect_desktop(paths: &Paths, binary: &Path, env: &BTreeMap<&'static str, String>) -> Result<(), String> {
+pub fn connect_desktop(paths: &Paths, binary: &Path, env: &Env) -> Result<(), String> {
     update_desktop_config(
         &paths.desktop_config(),
         Some(json!({ "command": binary.display().to_string(), "env": env })),
@@ -259,7 +346,7 @@ mod tests {
         fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         fs::write(&file, r#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#).expect("write");
 
-        let env = server_env("http://127.0.0.1:8080", "nnc_pat_secret", "org-1");
+        let env = server_env("http://127.0.0.1:8080", "nnc_pat_secret", "org-1", true);
         connect_desktop(&paths, Path::new("/opt/nanace-mcp"), &env).expect("connect");
         let config = read_json(&file).expect("read").expect("exists");
         assert_eq!(config["theme"], "dark");
@@ -269,9 +356,10 @@ mod tests {
             existing_token(&paths, Target::Desktop).as_deref(),
             Some("nnc_pat_secret")
         );
-        let status = status(&paths);
+        let status = status(&paths, &RotationState::default());
         assert!(status.desktop.connected);
         assert_eq!(status.desktop.api_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(status.desktop.writes);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -287,12 +375,34 @@ mod tests {
     }
 
     #[test]
+    fn tokens_are_replaced_in_place_and_rotation_state_round_trips() {
+        let paths = temp_paths("rotate");
+        let env = server_env("http://127.0.0.1:8080", "nnc_pat_old", "org-1", true);
+        connect_desktop(&paths, Path::new("/opt/nanace-mcp"), &env).expect("connect");
+        replace_token(&paths, Target::Desktop, "nnc_pat_new").expect("replace");
+        let (command, env) = current_entry(&paths, Target::Desktop).expect("entry");
+        assert_eq!(command, PathBuf::from("/opt/nanace-mcp"));
+        assert_eq!(env["NANACE_TOKEN"], "nnc_pat_new");
+        assert_eq!(env["NANACE_ALLOW_WRITES"], "true");
+        assert_eq!(env["NANACE_ORG_ID"], "org-1");
+
+        let file = paths.home.join("state/claude-rotation.json");
+        let mut state = RotationState::default();
+        state.set(Target::Desktop, Some(42));
+        state.save(&file).expect("save");
+        assert_eq!(RotationState::load(&file).get(Target::Desktop), Some(42));
+        assert_eq!(RotationState::load(&file).get(Target::Code), None);
+        assert_eq!(status(&paths, &state).desktop.rotated_at, Some(42));
+        let _ = fs::remove_dir_all(&paths.home);
+    }
+
+    #[test]
     fn invalid_config_is_never_overwritten() {
         let paths = temp_paths("invalid");
         let file = paths.desktop_config();
         fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         fs::write(&file, "{ not json").expect("write");
-        let env = server_env("http://x", "t", "o");
+        let env = server_env("http://x", "t", "o", false);
         assert!(connect_desktop(&paths, Path::new("/bin/x"), &env).is_err());
         assert_eq!(fs::read_to_string(&file).expect("read"), "{ not json");
         let _ = fs::remove_dir_all(&paths.home);
@@ -306,10 +416,11 @@ mod tests {
             r#"{"mcpServers":{"nanace":{"command":"/x","env":{"NANACE_API_URL":"http://a","NANACE_TOKEN":"nnc_pat_1"}}}}"#,
         )
         .expect("write");
-        let status = status(&paths);
+        let status = status(&paths, &RotationState::default());
         assert!(status.code.connected);
         assert_eq!(status.code.api_url.as_deref(), Some("http://a"));
         assert_eq!(existing_token(&paths, Target::Code).as_deref(), Some("nnc_pat_1"));
+        assert!(!status.code.writes);
         assert!(!status.desktop.connected);
         let _ = fs::remove_dir_all(&paths.home);
     }

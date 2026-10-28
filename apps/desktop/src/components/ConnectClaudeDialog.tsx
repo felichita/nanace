@@ -1,10 +1,10 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Monitor, ShieldCheck, Terminal } from "lucide-react";
+import { Check, Monitor, PenLine, ShieldCheck, Terminal } from "lucide-react";
 import { useState } from "react";
 
 import { claude, type ClaudeTarget, type ClaudeTargetStatus } from "../lib/api";
 import { useWorkspace } from "../lib/workspace";
-import { Button, cx, Dialog, Spinner } from "./ui";
+import { Button, cx, Dialog, relativeTime, Spinner } from "./ui";
 
 const TARGETS: { id: ClaudeTarget; name: string; icon: React.ReactNode; missing: string; after: string }[] = [
   {
@@ -30,6 +30,12 @@ function StatusChip({ status, serverUrl }: { status: ClaudeTargetStatus; serverU
     <span className={cx("flex items-center gap-1 text-xs", elsewhere ? "text-ink-2" : "text-[#0f7b6c]")}>
       <Check size={12} strokeWidth={3} />
       {elsewhere ? `Connected to ${status.api_url}` : "Connected"}
+      <span className="text-ink-3">· {status.writes ? "can edit" : "read-only"}</span>
+      {status.rotated_at && (
+        <span className="text-ink-3">
+          · token renewed {relativeTime(new Date(status.rotated_at * 1000).toISOString())}
+        </span>
+      )}
     </span>
   );
 }
@@ -43,6 +49,7 @@ export function ConnectClaudeDialog({ serverUrl, onClose }: { serverUrl: string;
   const [busy, setBusy] = useState<"connect" | ClaudeTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<ClaudeTarget[] | null>(null);
+  const [allowWrites, setAllowWrites] = useState(false);
 
   const s = status.data;
   // Default selection: every target that is available and not yet connected.
@@ -64,7 +71,7 @@ export function ConnectClaudeDialog({ serverUrl, onClose }: { serverUrl: string;
     setError(null);
     setDone(null);
     try {
-      const next = await claude.connect(targets, orgId, ws.me.email);
+      const next = await claude.connect(targets, orgId, ws.me.email, allowWrites);
       client.setQueryData(["claude-status"], next);
       setDone(targets);
       setChosen(new Set());
@@ -90,8 +97,8 @@ export function ConnectClaudeDialog({ serverUrl, onClose }: { serverUrl: string;
   return (
     <Dialog title="Connect to Claude" onClose={busy ? () => {} : onClose} width={560}>
       <p className="mb-4 text-sm text-ink-2">
-        Claude can search and read the pages of a workspace through MCP, from any project or chat. Access is
-        read-only: Claude never changes or deletes your pages.
+        Claude can search and read the pages of a workspace through MCP, from any project or chat. By default it is
+        read-only; you can also let Claude save notes.
       </p>
 
       {status.isLoading && <Spinner />}
@@ -173,11 +180,32 @@ export function ConnectClaudeDialog({ serverUrl, onClose }: { serverUrl: string;
         </label>
       )}
 
-      <div className="mt-4 flex items-start gap-2 text-xs text-ink-3">
+      <label className="mt-4 flex cursor-default items-start gap-2.5 rounded-lg border border-line px-3 py-2.5 hover:bg-hover">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={allowWrites}
+          disabled={busy !== null}
+          onChange={(e) => setAllowWrites(e.target.checked)}
+        />
+        <span>
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <PenLine size={14} /> Allow Claude to create and edit pages
+          </span>
+          <span className="block text-xs text-ink-3">
+            Ask Claude to “save this to nanace” or “add this to the Deploy Guide”. Claude writes as you, only in
+            teamspaces where you can edit, and can never delete pages. Every change is in the audit log.
+          </span>
+        </span>
+      </label>
+
+      <div className="mt-3 flex items-start gap-2 text-xs text-ink-3">
         <ShieldCheck size={14} className="mt-px shrink-0" />
         <span>
-          Each app gets its own read-only access token, stored in its config. Connecting asks you to sign in again;
-          disconnecting revokes the token. The nanace server ({serverUrl}) must be running when Claude uses it.
+          Each app gets its own access token, stored in its config. While this app runs, tokens are renewed every 7
+          days automatically; an unused token expires after 30 days. Connecting asks you to sign in once and revokes
+          earlier tokens; disconnecting revokes the token. The nanace server ({serverUrl}) must be running when Claude
+          uses it.
         </span>
       </div>
 

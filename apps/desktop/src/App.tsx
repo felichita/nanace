@@ -13,7 +13,9 @@ import { Sidebar } from "./components/Sidebar";
 import { Toast, TrashDialog } from "./components/Trash";
 import { Onboarding, SignIn } from "./components/SignIn";
 import { Spinner } from "./components/ui";
-import { api, canWrite, session, SIGNED_OUT_EVENT, type SessionInfo, type Team } from "./lib/api";
+import { listen } from "@tauri-apps/api/event";
+
+import { api, canWrite, CLAUDE_EXPIRED_EVENT, session, SIGNED_OUT_EVENT, type SessionInfo, type Team } from "./lib/api";
 import { LayoutContext, type Layout } from "./lib/layout";
 import { WorkspaceProvider, type Workspace } from "./lib/workspace";
 
@@ -167,6 +169,16 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
     },
     [client, location, navigate, showToast, ws],
   );
+
+  // The app renews Claude's tokens in the background; when that is no longer
+  // possible, ask the user to connect again.
+  useEffect(() => {
+    const unlisten = listen<string[]>(CLAUDE_EXPIRED_EVENT, (event) => {
+      const names = event.payload.map((t) => (t === "code" ? "Claude Code" : "Claude Desktop")).join(" and ");
+      showToast(`${names} lost access to nanace`, { label: "Reconnect", run: () => setConnectOpen(true) });
+    });
+    return () => void unlisten.then((stop) => stop());
+  }, [showToast]);
 
   const layout: Layout = {
     sidebarOpen: sidebar.open,

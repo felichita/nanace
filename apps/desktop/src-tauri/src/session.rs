@@ -289,6 +289,73 @@ impl Session {
             .ok_or_else(|| "server did not return a token".to_owned())
     }
 
+    /// Replaces `token` with a new one of the same name, scope and lifetime.
+    /// `Ok(None)` means the token is no longer valid (expired, revoked, or
+    /// rotated elsewhere) and the user has to connect again.
+    pub async fn rotate_token(&self, server_url: &str, token: &str) -> Result<Option<String>, String> {
+        let url = api_url(server_url, "/api/v1/me/tokens/current/rotate")?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| format!("cannot reach {server_url}"))?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::CONFLICT {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(error_message(status, &body));
+        }
+        body.get("token")
+            .and_then(Value::as_str)
+            .map(|t| Some(t.to_owned()))
+            .ok_or_else(|| "server did not return a token".to_owned())
+    }
+
+    /// Revokes every active token named `name` (needs an interactive
+    /// session). Connecting again this way also ends any copy of an earlier
+    /// token, including ones that were rotated since.
+    pub async fn revoke_tokens_named(&self, server_url: &str, session: &str, name: &str) -> Result<usize, String> {
+        let url = api_url(server_url, "/api/v1/me/tokens")?;
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(session)
+            .send()
+            .await
+            .map_err(|_| format!("cannot reach {server_url}"))?;
+        let status = resp.status();
+        let list: Value = resp.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(error_message(status, &list));
+        }
+        let mut revoked = 0;
+        for token in list.as_array().into_iter().flatten() {
+            let active = token.get("revoked_at").is_some_and(Value::is_null);
+            let named = token.get("name").and_then(Value::as_str) == Some(name);
+            let Some(id) = token.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if active && named {
+                let url = api_url(server_url, &format!("/api/v1/me/tokens/{id}"))?;
+                if self
+                    .http
+                    .delete(url)
+                    .bearer_auth(session)
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+                {
+                    revoked += 1;
+                }
+            }
+        }
+        Ok(revoked)
+    }
+
     /// Revokes `token` with itself (best effort); used for tokens handed to
     /// other apps, such as Claude.
     pub async fn revoke_token(&self, server_url: &str, token: &str) {

@@ -34,8 +34,9 @@ curl -s -X POST localhost:8080/api/v1/auth/dev-login \
 
 In the desktop app, choose **Connect to Claude** in the sidebar. It
 registers the bundled MCP server with Claude Code (all projects) and/or
-Claude Desktop, each with its own read-only token. To set it up by hand
-instead, build the MCP server once:
+Claude Desktop, each with its own read-only token. Check **Allow Claude to
+create and edit pages** to let Claude save notes ("save this to nanace").
+To set it up by hand instead, build the MCP server once:
 
 ```bash
 cargo build --release -p nanace-mcp
