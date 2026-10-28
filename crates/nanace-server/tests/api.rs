@@ -1385,3 +1385,129 @@ async fn app_upgrades_backfill_links_and_report_status() {
         .unwrap();
     assert!(status.is_newer() && status.unknown_upgrades == vec![9999]);
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn rls_pins_context_identity_and_trash_rows() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let bob_email = email("bob");
+    let alice = c.login(&email("alice")).await;
+    let bob = c.login(&bob_email).await;
+    let user_id = |token: String| {
+        let c = &c;
+        async move {
+            c.ok("GET", "/api/v1/me", &token, None, StatusCode::OK).await["user_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap()
+        }
+    };
+    let (alice_id, bob_id) = (user_id(alice.clone()).await, user_id(bob.clone()).await);
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("pin"), "name": "Pin" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let base = format!("/api/v1/orgs/{org_id}");
+    let mut teams = Vec::new();
+    for slug in ["dev", "qa"] {
+        let team = c
+            .ok(
+                "POST",
+                &format!("{base}/teams"),
+                &alice,
+                Some(json!({ "slug": slug, "name": slug })),
+                StatusCode::CREATED,
+            )
+            .await;
+        teams.push(team["id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+    c.ok(
+        "PUT",
+        &format!("{base}/teams/{}/members", teams[0]),
+        &alice,
+        Some(json!({ "email": bob_email, "role": "writer" })),
+        StatusCode::OK,
+    )
+    .await;
+    let ctx = c
+        .ok(
+            "POST",
+            &format!("{base}/teams/{}/contexts", teams[0]),
+            &alice,
+            Some(json!({ "title": "Mine", "content": "by alice" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let ctx_id: Uuid = ctx["id"].as_str().unwrap().parse().unwrap();
+
+    // Alice writes to both teams, yet SQL cannot move or re-attribute a context.
+    for (sql, value) in [
+        (
+            "UPDATE contexts SET team_id = $2, updated_by = $3 WHERE id = $1",
+            teams[1],
+        ),
+        (
+            "UPDATE contexts SET created_by = $2, updated_by = $3 WHERE id = $1",
+            bob_id,
+        ),
+    ] {
+        let mut tx = db::scoped_tx(&pool, org_id, alice_id).await.unwrap();
+        let changed = sqlx::query(sql)
+            .bind(ctx_id)
+            .bind(value)
+            .bind(alice_id)
+            .execute(&mut *tx)
+            .await;
+        assert!(changed.is_err(), "{sql}");
+    }
+
+    // A trash row must mirror a live context, so it cannot name another
+    // author (for a fresh id or for Alice's own context).
+    for id in [Uuid::new_v4(), ctx_id] {
+        let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+        let forged = sqlx::query(
+            "INSERT INTO context_trash (id, org_id, team_id, title, content, tags, created_by, created_at, \
+                                        updated_by, updated_at, deleted_by) \
+             VALUES ($1, $2, $3, 't', 'c', '{}', $4, now(), $4, now(), $5)",
+        )
+        .bind(id)
+        .bind(org_id)
+        .bind(teams[0])
+        .bind(if id == ctx_id { bob_id } else { alice_id })
+        .bind(bob_id)
+        .execute(&mut *tx)
+        .await;
+        assert!(forged.is_err(), "forged trash row for {id}");
+    }
+
+    // The API's own trash and restore still work.
+    c.ok(
+        "DELETE",
+        &format!("{base}/contexts/{ctx_id}"),
+        &bob,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let restored = c
+        .ok(
+            "POST",
+            &format!("{base}/trash/{ctx_id}/restore"),
+            &bob,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(restored["created_by"], alice_id.to_string());
+}

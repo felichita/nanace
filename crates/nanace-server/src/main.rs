@@ -113,7 +113,11 @@ async fn main() -> anyhow::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
-            .wrap(middleware::Logger::default())
+            // Path only: query strings carry one-time login codes and OAuth state.
+            .wrap(
+                middleware::Logger::new("%a \"%{request}xi\" %s %b %T")
+                    .custom_request_replace("request", |req| format!("{} {}", req.method(), req.path())),
+            )
             .configure(api::configure)
     })
     .bind(config.bind)?

@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::api::contexts::replace_links;
 use crate::vectors::VectorStore;
-use crate::{LOG_COMPONENT, db, reindex};
+use crate::{LOG_COMPONENT, audit, db, reindex};
 
 /// Serializes upgrades across processes (an arbitrary, fixed key).
 const UPGRADE_LOCK: i64 = 0x6e61_6e61_6365_0001;
@@ -158,6 +158,13 @@ async fn run_locked(pool: &PgPool, vectors: &VectorStore, embedder: &dyn Embedde
             1 => backfill_wiki_links(pool).await?,
             other => anyhow::bail!("no handler for application upgrade {other}"),
         };
+        audit::record_system(
+            pool,
+            None,
+            "system.upgrade",
+            serde_json::json!({ "version": version, "name": name, "result": details }),
+        )
+        .await?;
         sqlx::query("INSERT INTO app_upgrades (version, name, details) VALUES ($1, $2, $3)")
             .bind(version)
             .bind(name)

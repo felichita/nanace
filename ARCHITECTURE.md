@@ -274,6 +274,10 @@ The desktop app adds two parameters to the login request:
 
 ### Trash [built]
 
+- **Below the API** (migration 0009): a trash row must mirror a live context
+  (same id, org, team, author and creation time), and a trigger keeps a
+  context's id, org, team, author and creation time from ever changing.
+
 - **Deleting:** deleting a context moves it to `context_trash` and removes its
   vectors and links. Trashed pages are outside `contexts`, so search, the
   graph and MCP never see them.

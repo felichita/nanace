@@ -78,6 +78,11 @@ impl Config {
         if jwt_secret.expose_secret().len() < MIN_JWT_SECRET_BYTES {
             bail!("NANACE_JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes");
         }
+        // The .env.example placeholder is long enough but public: anyone could
+        // forge sessions with it.
+        if jwt_secret.expose_secret().to_ascii_lowercase().contains("change-me") {
+            bail!("NANACE_JWT_SECRET is the example placeholder; generate one with `openssl rand -base64 48`");
+        }
 
         let embedder = match get("NANACE_EMBEDDER").as_deref() {
             None | Some("fastembed") => EmbedderKind::FastEmbed,
@@ -186,6 +191,7 @@ mod tests {
         assert!(config(&[("NANACE_JWT_SECRET", "short")]).is_err());
         assert!(config(&[("NANACE_DEV_LOGIN", "yes")]).is_err());
         assert!(config(&[("NANACE_EMBEDDER", "unknown-model")]).is_err());
+        assert!(config(&[("NANACE_JWT_SECRET", "change-me-to-at-least-32-random-bytes")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "59")]).is_err());
         assert!(config(&[("NANACE_JWT_TTL_SECS", "86401")]).is_err());
         assert!(config(&[("NANACE_BIND", "localhost")]).is_err());

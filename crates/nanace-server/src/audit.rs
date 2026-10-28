@@ -12,6 +12,26 @@ pub struct AuditEvent<'a> {
     pub details: serde_json::Value,
 }
 
+/// Records a maintenance action that no user performed (reindex, upgrades),
+/// with no actor.
+pub async fn record_system(
+    executor: impl PgExecutor<'_>,
+    org_id: Option<Uuid>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO audit_logs (org_id, actor_user_id, action, resource_type, resource_id, details) \
+         VALUES ($1, NULL, $2, 'organization', $1, $3)",
+    )
+    .bind(org_id)
+    .bind(action)
+    .bind(details)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 pub async fn record(executor: impl PgExecutor<'_>, event: AuditEvent<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO audit_logs (org_id, actor_user_id, action, resource_type, resource_id, details) \

@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::vectors::{VectorStore, embed_context};
-use crate::{LOG_COMPONENT, db};
+use crate::{LOG_COMPONENT, audit, db};
 
 #[derive(Debug, Default)]
 pub struct ReindexReport {
@@ -49,6 +49,7 @@ pub async fn reindex(
 
     let mut report = ReindexReport::default();
     for org_id in orgs {
+        let (contexts_before, chunks_before) = (report.contexts, report.chunks);
         vectors.recreate_collection(org_id).await?;
         // Any member can read a team's contexts under RLS.
         let teams: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
@@ -87,6 +88,18 @@ pub async fn reindex(
             }
         }
         report.orgs += 1;
+        // Reindexing reads every context of the org: audit it like a read.
+        audit::record_system(
+            pool,
+            Some(org_id),
+            "system.reindex",
+            serde_json::json!({
+                "contexts": report.contexts - contexts_before,
+                "chunks": report.chunks - chunks_before,
+                "model": embedder.model_id(),
+            }),
+        )
+        .await?;
         tracing::info!(event = "reindex_org_done", component = LOG_COMPONENT, org_id = %org_id, "organization reindexed");
     }
     Ok(report)
