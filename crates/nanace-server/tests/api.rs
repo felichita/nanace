@@ -480,6 +480,12 @@ async fn auth_is_required_and_dev_login_is_opt_in() {
     let c = Client {
         app: test::init_service(App::new().app_data(state(false).await).configure(api::configure)).await,
     };
+    // Probes need no credentials.
+    for probe in ["/livez", "/readyz", "/healthz"] {
+        let (status, body) = c.call("GET", probe, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{probe}");
+        assert_eq!(body["status"], "ok");
+    }
     let (status, _) = c
         .call(
             "POST",

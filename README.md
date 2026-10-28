@@ -112,7 +112,9 @@ contain `nanace-mcp`: Claude runs that on each user's machine (it ships with
 the desktop app and the release archives) and points it at the server. Configure it with the same environment variables as
 `.env.example` (`DATABASE_URL`, `QDRANT_URL`, `NANACE_JWT_SECRET`,
 `NANACE_PUBLIC_URL`, ...); PostgreSQL must give it a non-superuser role (see
-`deploy/postgres/init.sql`). `GET /healthz` checks PostgreSQL and Qdrant.
+`deploy/postgres/init.sql`). Probes: `GET /livez` (liveness: the process
+answers, no dependencies touched) and `GET /readyz` (readiness: PostgreSQL and
+Qdrant answer; `/healthz` is the same).
 
 Build it locally with `docker build -t nanace-server .`, or run the whole
 stack (API server, PostgreSQL, Qdrant) with Docker Compose:

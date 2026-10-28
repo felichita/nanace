@@ -21,6 +21,11 @@ const JSON_LIMIT_BYTES: usize = 1024 * 1024;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.app_data(web::JsonConfig::default().limit(JSON_LIMIT_BYTES))
+        // Liveness: the process answers. Readiness: dependencies answer too.
+        // Probing liveness through dependencies would restart every replica
+        // whenever PostgreSQL or Qdrant has a hiccup.
+        .route("/livez", web::get().to(livez))
+        .route("/readyz", web::get().to(healthz))
         .route("/healthz", web::get().to(healthz))
         .configure(complete_page::configure)
         .service(
@@ -36,6 +41,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 .configure(graph::configure)
                 .configure(audit_logs::configure),
         );
+}
+
+async fn livez() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
 }
 
 async fn healthz(state: web::Data<AppState>) -> ApiResult<HttpResponse> {

@@ -469,7 +469,8 @@ Claude Desktop / Claude Code
 | `DELETE` | `/api/v1/orgs/{org}/trash/{id}` | Team writer; permanent |
 | `POST` | `/api/v1/orgs/{org}/search` | Org member; results limited to readable teams |
 | `GET` | `/api/v1/orgs/{org}/audit-logs` | Org admin |
-| `GET` | `/healthz` | Anyone |
+| `GET` | `/livez` | Anyone; liveness, touches no dependencies |
+| `GET` | `/readyz`, `/healthz` | Anyone; readiness, checks PostgreSQL and Qdrant |
 
 Resources the caller may not know about return `404`, so ids cannot be probed
 across teams or orgs.
