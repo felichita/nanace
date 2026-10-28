@@ -142,8 +142,10 @@ only for changed code, new evidence, or an explicit re-review request.
 - Every state change, and every content read, writes an `audit_logs` row in the
   same transaction as the change.
 - `nanace-mcp` talks only to the REST API as the configured user; it never
-  gets database or Qdrant credentials. Tools stay read-only unless writes are
-  explicitly requested, and never take tenant scope from context content.
+  gets database or Qdrant credentials. Write tools (`create_context`,
+  `update_context`) are registered only with `NANACE_ALLOW_WRITES=true` and
+  need a write-scoped token; there is no delete tool. Tools never take tenant
+  scope from context content.
   stdout is the MCP channel: log to stderr only.
 - JWTs and personal access tokens identify the user only. Never put roles or
   team ids in tokens; permissions are read from PostgreSQL per request.

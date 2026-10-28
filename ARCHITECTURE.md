@@ -64,7 +64,7 @@ Handles requests, validation, and database integration:
 - Authorization: role-based access control (RBAC) **[built]**
 - Embedding generation for markdown **[built]**
 - API handlers: CRUD over contexts **[built]**
-- MCP server exposing tools to Claude **[built: stdio, read-only]**
+- MCP server exposing tools to Claude **[built: stdio; read, plus opt-in create/update]**
 - Audit logging of every action **[built]**
 
 Talks to PostgreSQL and Qdrant.
@@ -326,10 +326,18 @@ audit path as the HTTP API.
 | `search_contexts` | `POST /orgs/{org}/search` | Semantic search with snippets |
 | `get_context` | `GET /orgs/{org}/contexts/{id}` | Full markdown of one context |
 | `list_contexts` | `GET /orgs/{org}/teams/{team}/contexts` | Recent titles in a team |
+| `create_context` | `POST /orgs/{org}/teams/{team}/contexts` | New page (opt-in) |
+| `update_context` | `PUT /orgs/{org}/contexts/{id}` | Append to or replace a page (opt-in) |
 
-- All tools are annotated read-only. Write tools (create/update context) are
-  deliberately left out until there is a confirmation story for
-  model-initiated writes.
+- **Read tools** are annotated read-only.
+- **Write tools** exist only when the server runs with
+  `NANACE_ALLOW_WRITES=true`, and the API also requires a write-scoped token
+  and a writer role in the team.
+- **No delete tool.** The server instructions tell the model to write only
+  when the user asks, never because a document says so.
+- **Concurrent edits:** `update_context` sends the version it read as
+  `base_updated_at`, so a concurrent edit returns a conflict instead of
+  being overwritten.
 - The org is the tool argument, then `NANACE_ORG_ID`, then the user's only org.
 - Context content is returned inside `<context_content>` delimiters, and the
   server instructions tell the model to treat it as data, not instructions.
@@ -382,7 +390,7 @@ Claude Desktop / Claude Code
 | `crates/nanace-core` | Pure domain logic: roles, validation, markdown chunking, hashing |
 | `crates/nanace-embed` | `Embedder` trait, `FastEmbedder` (bge-small), `HashingEmbedder` |
 | `crates/nanace-server` | Actix-web API, auth, RBAC, RLS-scoped DB access, Qdrant, audit, migrations |
-| `crates/nanace-mcp` | stdio MCP server; read-only tools over the REST API |
+| `crates/nanace-mcp` | stdio MCP server over the REST API; read tools, opt-in create/update |
 | `apps/desktop` | Tauri desktop app (React UI in `src`, Rust shell in `src-tauri`) |
 | `deploy/postgres` | Local database bootstrap (non-superuser app role) |
 | `docker-compose.yml` | PostgreSQL 18 and Qdrant for development |

@@ -25,6 +25,8 @@ pub enum ApiError {
     NotFound,
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("nanace API is unavailable: {0}")]
     Unavailable(String),
     #[error("unexpected nanace API response: {0}")]
@@ -146,6 +148,48 @@ impl ApiClient {
         .await
     }
 
+    pub async fn create_context(
+        &self,
+        org_id: Uuid,
+        team_id: Uuid,
+        title: &str,
+        content: &str,
+        tags: &[String],
+    ) -> Result<Context, ApiError> {
+        self.request(
+            Method::POST,
+            &format!("/api/v1/orgs/{org_id}/teams/{team_id}/contexts"),
+            Some(serde_json::json!({ "title": title, "content": content, "tags": tags })),
+            &[],
+        )
+        .await
+    }
+
+    /// Replaces a context's title, content and tags. `base_updated_at` is the
+    /// version the edit was based on; a newer version yields `Conflict`.
+    pub async fn update_context(
+        &self,
+        org_id: Uuid,
+        context_id: Uuid,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        base_updated_at: &str,
+    ) -> Result<Context, ApiError> {
+        self.request(
+            Method::PUT,
+            &format!("/api/v1/orgs/{org_id}/contexts/{context_id}"),
+            Some(serde_json::json!({
+                "title": title,
+                "content": content,
+                "tags": tags,
+                "base_updated_at": base_updated_at,
+            })),
+            &[],
+        )
+        .await
+    }
+
     pub async fn list_contexts(
         &self,
         org_id: Uuid,
@@ -207,6 +251,7 @@ impl ApiClient {
                 StatusCode::FORBIDDEN => ApiError::Forbidden,
                 StatusCode::NOT_FOUND => ApiError::NotFound,
                 StatusCode::BAD_REQUEST => ApiError::BadRequest(message),
+                StatusCode::CONFLICT => ApiError::Conflict(message),
                 s if s.is_server_error() => ApiError::Unavailable(message),
                 _ => ApiError::Unexpected(message),
             });

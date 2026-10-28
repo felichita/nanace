@@ -132,8 +132,12 @@ async fn seed(base: &str) -> Seed {
 }
 
 async fn connect(base: &str, credentials: Credentials) -> RunningService<RoleClient, ()> {
+    connect_with(base, credentials, false).await
+}
+
+async fn connect_with(base: &str, credentials: Credentials, allow_writes: bool) -> RunningService<RoleClient, ()> {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let server = NanaceMcp::new(ApiClient::new(base, credentials).unwrap(), None);
+    let server = NanaceMcp::new(ApiClient::new(base, credentials).unwrap(), None, allow_writes);
     tokio::spawn(async move {
         let service = server.serve(server_io).await.unwrap();
         service.waiting().await.unwrap();
@@ -279,4 +283,149 @@ async fn invalid_token_reports_authentication_error() {
     let client = connect(&base, Credentials::Token(SecretString::from("not-a-token".to_owned()))).await;
     let (is_error, text) = call(&client, "list_teams", json!({})).await;
     assert!(is_error && text.contains("not authenticated"), "{text}");
+}
+
+async fn pat(base: &str, email: &str, scope: &str) -> String {
+    let http = reqwest::Client::new();
+    let session: Value = http
+        .post(format!("{base}/api/v1/auth/dev-login"))
+        .json(&json!({ "email": email }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pat: Value = http
+        .post(format!("{base}/api/v1/me/tokens"))
+        .bearer_auth(session["access_token"].as_str().unwrap())
+        .json(&json!({ "name": "mcp", "scope": scope }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    pat["token"].as_str().unwrap().to_owned()
+}
+
+fn context_id_of(text: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix("context_id: "))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn write_tools_need_opt_in_and_write_access() {
+    let base = start_api().await;
+    let seed = seed(&base).await;
+    let write_token = pat(&base, &seed.alice, "write").await;
+    let read_token = pat(&base, &seed.alice, "read").await;
+
+    // Not registered unless writes are allowed.
+    let read_only = connect(&base, Credentials::Token(SecretString::from(write_token.clone()))).await;
+    let names: Vec<String> = read_only
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("create") || n.contains("update")),
+        "{names:?}"
+    );
+
+    let alice = connect_with(&base, Credentials::Token(SecretString::from(write_token)), true).await;
+    let tools = alice.list_all_tools().await.unwrap();
+    for name in ["create_context", "update_context"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(tool.annotations.as_ref().and_then(|a| a.read_only_hint), Some(false));
+    }
+    assert!(!tools.iter().any(|t| t.name.contains("delete")));
+    let instructions = alice
+        .peer_info()
+        .and_then(|i| i.instructions.clone())
+        .unwrap_or_default();
+    assert!(instructions.contains("Only write when the user asks"), "{instructions}");
+
+    // Alice can write to two teams, so the team must be named.
+    let (is_error, text) = call(&alice, "create_context", json!({ "title": "Notes", "content": "x" })).await;
+    assert!(is_error && text.contains("dev") && text.contains("qa"), "{text}");
+
+    let (is_error, text) = call(
+        &alice,
+        "create_context",
+        json!({
+            "team": "dev",
+            "title": "Release checklist",
+            "content": "1. Tag the release. See [[API Authentication]].",
+            "tags": ["release"],
+        }),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("Created **Release checklist** in team `dev`"), "{text}");
+    let id = context_id_of(&text);
+
+    let (is_error, text) = call(
+        &alice,
+        "update_context",
+        json!({ "context_id": id, "append": "2. Check that every build uploaded its assets." }),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    let (_, page) = call(&alice, "get_context", json!({ "context_id": id })).await;
+    assert!(
+        page.contains("1. Tag the release.")
+            && page.contains("2. Check that every build")
+            && page.contains("tags: release"),
+        "{page}"
+    );
+
+    // Saved pages are searchable and linked like any other.
+    let (_, hits) = call(&alice, "search_contexts", json!({ "query": "release checklist tag" })).await;
+    assert!(hits.contains(&id), "{hits}");
+
+    // Contradictory arguments are protocol errors.
+    let mut params = CallToolRequestParams::new("update_context");
+    params = params.with_arguments(
+        json!({ "context_id": id, "append": "a", "content": "b" })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    assert!(alice.call_tool(params).await.is_err());
+
+    // A read-scoped token cannot write even with the tools registered.
+    let reader = connect_with(&base, Credentials::Token(SecretString::from(read_token)), true).await;
+    let (is_error, text) = call(
+        &reader,
+        "create_context",
+        json!({ "team": "dev", "title": "Nope", "content": "x" }),
+    )
+    .await;
+    assert!(is_error && text.contains("read-only"), "{text}");
+
+    // Bob writes only to qa.
+    let bob = connect_with(&base, Credentials::DevEmail(seed.bob.clone()), true).await;
+    let (is_error, text) = call(
+        &bob,
+        "create_context",
+        json!({ "team": "dev", "title": "Nope", "content": "x" }),
+    )
+    .await;
+    assert!(is_error && text.contains("cannot write to team"), "{text}");
+    let (is_error, text) = call(&bob, "update_context", json!({ "context_id": id, "append": "x" })).await;
+    assert!(is_error && text.contains("not found"), "{text}");
+    let (is_error, text) = call(
+        &bob,
+        "create_context",
+        json!({ "title": "QA notes", "content": "Bob's notes" }),
+    )
+    .await;
+    assert!(!is_error && text.contains("team `qa`"), "{text}");
 }

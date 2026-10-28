@@ -68,6 +68,8 @@ Claude Desktop (`claude_desktop_config.json`):
 
 Against a development API you can use `NANACE_DEV_EMAIL=you@example.com`
 instead of a token. `NANACE_ORG_ID` picks a default organization.
+`NANACE_ALLOW_WRITES=true` (with a write-scoped token) adds the
+`create_context` and `update_context` tools.
 
 ## Desktop app
 

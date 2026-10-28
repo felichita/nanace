@@ -5,6 +5,8 @@
 //! - `NANACE_TOKEN`: bearer token for the API, or
 //! - `NANACE_DEV_EMAIL`: log in through the API's dev-only login instead.
 //! - `NANACE_ORG_ID`: default organization (optional).
+//! - `NANACE_ALLOW_WRITES`: `true` adds the `create_context` / `update_context`
+//!   tools (the token also needs `write` scope). Read-only by default.
 
 use anyhow::{Context, bail};
 use nanace_mcp::{ApiClient, Credentials, NanaceMcp};
@@ -36,7 +38,9 @@ async fn main() -> anyhow::Result<()> {
         .transpose()
         .context("NANACE_ORG_ID must be a UUID")?;
 
-    let server = NanaceMcp::new(ApiClient::new(&base_url, credentials)?, default_org);
+    let allow_writes = std::env::var("NANACE_ALLOW_WRITES").is_ok_and(|v| matches!(v.trim(), "true" | "1"));
+
+    let server = NanaceMcp::new(ApiClient::new(&base_url, credentials)?, default_org, allow_writes);
     let service = server
         .serve(rmcp::transport::stdio())
         .await
