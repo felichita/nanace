@@ -101,12 +101,19 @@ async fn exchange(state: web::Data<AppState>, body: web::Json<ExchangeRequest>) 
     .fetch_optional(&state.pool)
     .await?;
     let (user_id, email, challenge) = row.ok_or(ApiError::Unauthorized)?;
-    if let Some(challenge) = challenge {
-        let verifier = body.code_verifier.as_deref().ok_or(ApiError::Unauthorized)?;
-        let matches: bool = pkce_challenge(verifier).as_bytes().ct_eq(challenge.as_bytes()).into();
-        if !matches {
-            return Err(ApiError::Unauthorized);
+    match (challenge, body.code_verifier.as_deref()) {
+        // Browser sign-in: no PKCE on either side.
+        (None, None) => {}
+        (Some(challenge), Some(verifier)) => {
+            let matches: bool = pkce_challenge(verifier).as_bytes().ct_eq(challenge.as_bytes()).into();
+            if !matches {
+                return Err(ApiError::Unauthorized);
+            }
         }
+        // A client that sends a verifier started its own PKCE sign-in and
+        // must get a code bound to it. Accepting someone else's browser code
+        // here would sign it into that person's account (login CSRF).
+        (None, Some(_)) | (Some(_), None) => return Err(ApiError::Unauthorized),
     }
     Ok(HttpResponse::Ok().json(TokenResponse {
         access_token: state.jwt.issue(user_id, &email)?,

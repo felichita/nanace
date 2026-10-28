@@ -543,6 +543,14 @@ async fn desktop_loopback_sign_in() {
     assert_eq!(status, StatusCode::OK, "{session}");
     let session = session["access_token"].as_str().unwrap().to_owned();
 
+    // A code from a browser sign-in (no PKCE) must not be accepted by a
+    // client that sent a verifier: a page could otherwise feed its own code to
+    // the desktop app's loopback listener and sign the app into its account.
+    let browser_code =
+        query(&google_round_trip(&app, "", &mock, |n| google_claims(&sub, &email, n), false).await)["code"].clone();
+    let (status, _, _) = send(&app, exchange(&browser_code, Some(&verifier))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "login CSRF");
+
     // Errors after a verified state also reach the desktop app.
     let target = google_round_trip(
         &app,
