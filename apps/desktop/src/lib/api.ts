@@ -180,6 +180,8 @@ export const api = {
     call<unknown>("DELETE", `/orgs/${org}/teams/${team}/members/${user}`),
   orgMembers: (org: string) => call<OrgMember[]>("GET", `/orgs/${org}/members`),
   removeOrgMember: (org: string, user: string) => call<null>("DELETE", `/orgs/${org}/members/${user}`),
+  setOrgRole: (org: string, user: string, role: OrgRole) =>
+    call<null>("PUT", `/orgs/${org}/members/${user}`, { role }),
 
   /** Every context of a team, following pagination. */
   async contexts(org: string, team: string): Promise<ContextSummary[]> {

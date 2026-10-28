@@ -456,6 +456,7 @@ Claude Desktop / Claude Code
 | `GET` | `/api/v1/me` | Authenticated |
 | `POST` | `/api/v1/orgs` | Authenticated; caller becomes org admin |
 | `GET` | `/api/v1/orgs/{org}/members` | Org admin; members with their teams |
+| `PUT` | `/api/v1/orgs/{org}/members/{user}` | Org admin; role `admin` or `member` (not the last admin) |
 | `DELETE` | `/api/v1/orgs/{org}/members/{user}` | Org admin; removes from the org and all its teams (not the last admin) |
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |
 | `GET/PUT` | `/api/v1/orgs/{org}/teams/{team}/members` | Team member or org admin / team admin or org admin |

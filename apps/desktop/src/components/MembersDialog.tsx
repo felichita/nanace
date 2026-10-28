@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2, Users } from "lucide-react";
 import { useState } from "react";
 
-import { api, slugify, type OrgMember, type Team, type TeamRole } from "../lib/api";
+import { api, slugify, type OrgMember, type OrgRole, type Team, type TeamRole } from "../lib/api";
 import { useWorkspace } from "../lib/workspace";
 import { Button, Dialog, IconButton, Input, Spinner, TeamIcon } from "./ui";
 
@@ -113,6 +113,18 @@ function WorkspaceMembers() {
   const [confirm, setConfirm] = useState<OrgMember | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  async function setRole(member: OrgMember, role: OrgRole) {
+    setError(null);
+    try {
+      await api.setOrgRole(orgId, member.user_id, role);
+      void client.invalidateQueries({ queryKey: ["org-members", orgId] });
+      // Demoting yourself takes away this dialog's admin views.
+      if (member.user_id === ws.me.user_id) void client.invalidateQueries({ queryKey: ["me"] });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function remove(member: OrgMember) {
     setError(null);
     try {
@@ -148,7 +160,15 @@ function WorkspaceMembers() {
                 {m.teams.length ? m.teams.join(", ") : "No teamspaces"}
               </div>
             </div>
-            <span className="shrink-0 text-xs text-ink-2">{m.role === "admin" ? "Workspace admin" : "Member"}</span>
+            <select
+              value={m.role}
+              onChange={(e) => void setRole(m, e.target.value as OrgRole)}
+              title="Workspace admins manage teamspaces and members; they do not see pages of teamspaces they are not in."
+              className="h-7 shrink-0 rounded-md bg-transparent px-1 text-xs text-ink-2 outline-none hover:bg-hover"
+            >
+              <option value="member">Member</option>
+              <option value="admin">Workspace admin</option>
+            </select>
             {m.user_id !== ws.me.user_id && (
               <IconButton title="Remove from workspace" onClick={() => setConfirm(m)}>
                 <Trash2 size={14} />

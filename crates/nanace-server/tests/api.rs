@@ -1116,6 +1116,47 @@ async fn org_admins_remove_members_from_the_org() {
     )
     .await;
 
+    // Roles: only admins change them, and the org keeps at least one admin.
+    let carol_id = me(carol.clone()).await;
+    let role = |r: &str| Some(json!({ "role": r }));
+    let member = |id: &str| format!("{base}/members/{id}");
+    c.ok("PUT", &member(&carol_id), &carol, role("admin"), StatusCode::FORBIDDEN)
+        .await;
+    c.ok(
+        "PUT",
+        &member(&carol_id),
+        &alice,
+        role("owner"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    c.ok("PUT", &member(&bob_id), &alice, role("admin"), StatusCode::NOT_FOUND)
+        .await;
+    c.ok("PUT", &member(&carol_id), &alice, role("admin"), StatusCode::NO_CONTENT)
+        .await;
+    c.ok("GET", &format!("{base}/members"), &carol, None, StatusCode::OK)
+        .await;
+    c.ok(
+        "PUT",
+        &member(&alice_id),
+        &carol,
+        role("member"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok("PUT", &member(&carol_id), &carol, role("member"), StatusCode::CONFLICT)
+        .await;
+    c.ok("GET", &format!("{base}/members"), &alice, None, StatusCode::FORBIDDEN)
+        .await;
+    let org_uuid: Uuid = base.rsplit('/').next().unwrap().parse().unwrap();
+    let role_changes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'org.member.role' AND org_id = $1")
+            .bind(org_uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(role_changes, 2);
+
     let audited: i64 =
         sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'org.member.remove' AND resource_id = $1")
             .bind(bob_id.parse::<Uuid>().unwrap())

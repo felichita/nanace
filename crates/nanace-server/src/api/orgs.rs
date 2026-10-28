@@ -1,5 +1,5 @@
 use actix_web::{HttpResponse, web};
-use nanace_core::validate;
+use nanace_core::{OrgRole, validate};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,6 +11,7 @@ use crate::{AppState, access};
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/orgs", web::post().to(create_org))
         .route("/orgs/{org_id}/members", web::get().to(list_org_members))
+        .route("/orgs/{org_id}/members/{user_id}", web::put().to(set_org_role))
         .route("/orgs/{org_id}/members/{user_id}", web::delete().to(remove_org_member));
 }
 
@@ -112,6 +113,67 @@ async fn list_org_members(
     .fetch_all(&state.pool)
     .await?;
     Ok(HttpResponse::Ok().json(members))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetOrgRoleRequest {
+    role: OrgRole,
+}
+
+/// Makes a member an org admin or a plain member. Org admins manage teams and
+/// membership but get no implicit access to team content. The last admin
+/// cannot be demoted.
+async fn set_org_role(
+    state: web::Data<AppState>,
+    user: WriteUser,
+    path: web::Path<(Uuid, Uuid)>,
+    body: web::Json<SetOrgRoleRequest>,
+) -> ApiResult<HttpResponse> {
+    let (org_id, member_id) = path.into_inner();
+    access::require_org_admin(&state.pool, org_id, user.user_id).await?;
+    let role = body.role;
+
+    let mut tx = state.pool.begin().await?;
+    // Same locking as removal: two admins cannot demote each other at once.
+    let admins: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM org_members WHERE org_id = $1 AND role = 'admin' FOR UPDATE")
+            .bind(org_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2 FOR UPDATE")
+            .bind(org_id)
+            .bind(member_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current = current.ok_or(ApiError::NotFound)?;
+    if current == role.as_str() {
+        return Ok(HttpResponse::NoContent().finish());
+    }
+    if current == "admin" && admins.len() <= 1 {
+        return Err(ApiError::Conflict("cannot demote the last workspace admin".to_owned()));
+    }
+    sqlx::query("UPDATE org_members SET role = $3 WHERE org_id = $1 AND user_id = $2")
+        .bind(org_id)
+        .bind(member_id)
+        .bind(role.as_str())
+        .execute(&mut *tx)
+        .await?;
+    audit::record(
+        &mut *tx,
+        AuditEvent {
+            org_id: Some(org_id),
+            actor: user.user_id,
+            action: "org.member.role",
+            resource_type: "user",
+            resource_id: Some(member_id),
+            details: serde_json::json!({ "from": current, "to": role.as_str() }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 /// Removes a member from the org and, through the foreign key, from every
