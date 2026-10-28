@@ -4,6 +4,8 @@
 //! time, so they survive the target being created later and never point at a
 //! context the reader cannot see.
 
+use std::collections::HashSet;
+
 use crate::validate::MAX_TITLE_CHARS;
 
 /// Upper bound on distinct link targets stored per context.
@@ -15,6 +17,9 @@ pub const MAX_LINKS_PER_CONTEXT: usize = 200;
 /// function that normalizes titles when links are resolved.
 pub fn wiki_links(content: &str) -> Vec<String> {
     let mut targets: Vec<String> = Vec::new();
+    // Lowercased keys seen so far: one lookup per link keeps the scan linear
+    // in the content size, whatever the mix of distinct and repeated links.
+    let mut seen: HashSet<String> = HashSet::new();
     let mut fence: Option<&str> = None;
     for line in content.lines() {
         let trimmed = line.trim_start();
@@ -36,8 +41,7 @@ pub fn wiki_links(content: &str) -> Vec<String> {
             if targets.len() == MAX_LINKS_PER_CONTEXT {
                 return targets;
             }
-            let key = target.to_lowercase();
-            if !targets.iter().any(|t| t.to_lowercase() == key) {
+            if seen.insert(target.to_lowercase()) {
                 targets.push(target);
             }
         }
@@ -98,6 +102,24 @@ mod tests {
     fn ignores_code_and_malformed_links() {
         let md = "`[[inline]]` text [[real]]\n```\n[[fenced]]\n```\n~~~md\n[[tilde]]\n~~~\n[[]] [[ ]] [[unclosed\n``[[double `tick`]]`` [[after]]";
         assert_eq!(wiki_links(md), vec!["real", "after"]);
+    }
+
+    #[test]
+    fn many_repeated_links_stay_cheap() {
+        // Near the cap with long non-ASCII titles, then the same link repeated
+        // to the content limit: a quadratic dedupe took seconds here.
+        let mut md: String = (0..198).map(|i| format!("[[{}{i}]] ", "ж".repeat(150))).collect();
+        while md.len() < 256 * 1024 {
+            md.push_str("[[x]] ");
+        }
+        let started = std::time::Instant::now();
+        let links = wiki_links(&md);
+        assert_eq!(links.len(), 199);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
