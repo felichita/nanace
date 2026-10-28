@@ -44,6 +44,13 @@ describe("wiki links", () => {
     expect(blocksToMarkdown(editorWith(out))).toBe(out);
   });
 
+  it("survives pages crafted to make the link regex backtrack", () => {
+    const started = Date.now();
+    const out = blocksToMarkdown(editorWith(`[[${"\\".repeat(200)}`));
+    expect(out.length).toBeGreaterThan(0);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it("serializes an empty page as empty content", () => {
     expect(blocksToMarkdown(editorWith(""))).toBe("");
   });

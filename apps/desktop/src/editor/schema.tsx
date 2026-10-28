@@ -121,7 +121,9 @@ export function markdownToBlocks(editor: Editor, markdown: string): Block[] {
 
 /** Undoes markdown escaping inside `[[...]]`, which serializers apply to brackets. */
 function unescapeWikiLinks(markdown: string): string {
-  return markdown.replace(/\\?\[\\?\[((?:\\.|[^\]\n])+?)\\?\]\\?\]/g, (_m, inner: string) => {
+  // The two alternatives must not overlap (a backslash is only ever `\\.`),
+  // or a long run of backslashes backtracks exponentially and freezes the UI.
+  return markdown.replace(/\\?\[\\?\[((?:\\.|[^\]\n\\])+?)\\?\]\\?\]/g, (_m, inner: string) => {
     return `[[${inner.replace(/\\([\\`*_{}[\]()#+\-.!|<>~])/g, "$1")}]]`;
   });
 }
