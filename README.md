@@ -82,8 +82,8 @@ instead of a token. `NANACE_ORG_ID` picks a default organization.
 PROJECT-2345` records what was done in the current session on the task's page
 (appending a dated section, or creating the page). It treats each team as a
 wiki: before writing it reads the team's `Wiki: Schema` page (page types, title
-prefixes, templates, tags), and afterwards it updates the related `Topic:` page,
-`Wiki: Index` and `Wiki: Log`. A team without a schema is initialized from
+prefixes, templates, tags), and afterwards it updates the related `Topic:` page
+and `Wiki: Index`. A team without a schema is initialized from
 `schema-template.md`, and the new schema is marked as the default for review.
 It needs the write tools (**Allow Claude to create and edit pages**).
 
