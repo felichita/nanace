@@ -3,12 +3,20 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Rebuilds an existing tag with this workflow, e.g. to add missing assets.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, e.g. v0.1.1
+        required: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   create-release:
@@ -18,13 +26,21 @@ jobs:
       id: ${{ steps.release.outputs.id }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      # The id comes straight from the API response: listing releases right
+      # after creating one may not show the new draft yet.
       - id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --title "nanace $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes
-          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")
+          gh api "repos/$GH_REPO/git/ref/tags/$TAG" --silent
+          id=$(gh release view "$TAG" --json databaseId --jq .databaseId 2>/dev/null || true)
+          if [ -z "$id" ]; then
+            id=$(gh api -X POST "repos/$GH_REPO/releases" -f tag_name="$TAG" -f name="nanace $TAG" \
+              -F draft=true -F generate_release_notes=true -f body="$(cat .github/release-notes.md)" --jq .id)
+          fi
+          test -n "$id"
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
   server:
@@ -43,6 +59,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -55,7 +73,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          name="nanace-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          name="nanace-${TAG#v}-${{ matrix.target }}"
           ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/nanace-server$ext" "target/${{ matrix.target }}/release/nanace-mcp$ext" \
@@ -66,7 +84,7 @@ jobs:
             archive="$name.tar.gz"; tar czf "$archive" "$name"
           fi
           if command -v sha256sum >/dev/null; then sha256sum "$archive" > "$archive.sha256"; else shasum -a 256 "$archive" > "$archive.sha256"; fi
-          gh release upload "$GITHUB_REF_NAME" "$archive" "$archive.sha256" --clobber
+          gh release upload "$TAG" "$archive" "$archive.sha256" --clobber
 
   desktop:
     name: Desktop ${{ matrix.name }}
@@ -83,6 +101,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - name: Install Tauri system libraries
         if: runner.os == 'Linux'
         run: |
@@ -121,5 +141,4 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+        run: gh release edit "$TAG" --draft=false --latest
