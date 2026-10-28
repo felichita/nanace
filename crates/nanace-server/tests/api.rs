@@ -1836,3 +1836,86 @@ async fn orgs_are_renamed_and_deleted_and_accounts_erased() {
     assert_ne!(fresh["user_id"], carol_id);
     assert_eq!(fresh["memberships"], json!([]));
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn search_snippets_never_show_stale_vector_text() {
+    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6336".to_owned());
+    let vectors = VectorStore::connect(&qdrant_url, 384).unwrap();
+    let embedder = HashingEmbedder::new(384);
+    let c = Client {
+        app: test::init_service(App::new().app_data(state(true).await).configure(api::configure)).await,
+    };
+    let alice = c.login(&email("alice")).await;
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("stale"), "name": "Stale" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let base = format!("/api/v1/orgs/{org_id}");
+    let team = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "ops", "name": "Ops" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let team_id: Uuid = team["id"].as_str().unwrap().parse().unwrap();
+    let old = "Database runbook. The root password is hunter2 for now.";
+    let page = c
+        .ok(
+            "POST",
+            &format!("{base}/teams/{team_id}/contexts"),
+            &alice,
+            Some(json!({ "title": "Runbook", "content": old })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let page_id: Uuid = page["id"].as_str().unwrap().parse().unwrap();
+    let current = c
+        .ok(
+            "GET",
+            &format!("{base}/contexts/{page_id}"),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    c.ok(
+        "PUT",
+        &format!("{base}/contexts/{page_id}"),
+        &alice,
+        Some(json!({
+            "title": "Runbook",
+            "content": "Database runbook. Passwords live in the vault.",
+            "base_updated_at": current["updated_at"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    // Vectors left over from the old text (as after a failed commit).
+    let stale = nanace_server::vectors::embed_context(&embedder, "Runbook", old)
+        .await
+        .unwrap();
+    vectors.replace_context(org_id, team_id, page_id, stale).await.unwrap();
+
+    let hits = c
+        .ok(
+            "POST",
+            &format!("{base}/search"),
+            &alice,
+            Some(json!({ "query": "root password hunter2" })),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(hits[0]["context_id"], page_id.to_string());
+    let snippet = hits[0]["snippet"].as_str().unwrap();
+    assert!(!snippet.contains("hunter2") && snippet.contains("vault"), "{snippet}");
+}

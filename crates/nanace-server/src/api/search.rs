@@ -2,13 +2,14 @@ use std::collections::HashMap;
 
 use actix_web::{HttpResponse, web};
 use chrono::{DateTime, Utc};
+use nanace_core::chunk_markdown;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
-use crate::{AppState, LOG_COMPONENT, access, db};
+use crate::{AppState, CHUNK_MAX_BYTES, LOG_COMPONENT, access, db};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/orgs/{org_id}/search", web::post().to(search));
@@ -48,6 +49,22 @@ struct HitRow {
     title: String,
     tags: Vec<String>,
     updated_at: DateTime<Utc>,
+    content: String,
+}
+
+/// The snippet shown for a hit, always taken from the current content in
+/// PostgreSQL: the matched chunk when it is still part of the page, else the
+/// page's first chunk. Text stored with the vectors can be stale (a failed
+/// commit, a reindex racing an edit) and must never resurface.
+fn snippet_for(content: &str, matched_chunk: &str) -> String {
+    let matched = matched_chunk.trim();
+    if !matched.is_empty() && content.contains(matched) {
+        return matched.to_owned();
+    }
+    chunk_markdown(content, CHUNK_MAX_BYTES)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 async fn search(
@@ -108,7 +125,7 @@ async fn search(
     // anything the caller can no longer read.
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     let rows: Vec<HitRow> =
-        sqlx::query_as("SELECT id, team_id, title, tags, updated_at FROM contexts WHERE id = ANY($1)")
+        sqlx::query_as("SELECT id, team_id, title, tags, updated_at, content FROM contexts WHERE id = ANY($1)")
             .bind(&ids)
             .fetch_all(&mut *tx)
             .await?;
@@ -123,7 +140,7 @@ async fn search(
                 title: row.title,
                 tags: row.tags,
                 score,
-                snippet,
+                snippet: snippet_for(&row.content, &snippet),
                 updated_at: row.updated_at,
             })
         })
@@ -147,4 +164,22 @@ async fn search(
     .await?;
     tx.commit().await?;
     Ok(HttpResponse::Ok().json(hits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snippet_for;
+
+    #[test]
+    fn snippets_come_from_current_content() {
+        let content = "# Deploy\n\nRoll out with a canary.";
+        assert_eq!(
+            snippet_for(content, "Roll out with a canary."),
+            "Roll out with a canary."
+        );
+        // A stale chunk (text no longer in the page) is never shown.
+        let stale = snippet_for(content, "The root password is hunter2.");
+        assert!(!stale.contains("hunter2") && stale.contains("canary"), "{stale}");
+        assert_eq!(snippet_for("", "old text"), "");
+    }
 }
