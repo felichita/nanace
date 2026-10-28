@@ -2,7 +2,8 @@
 //!
 //! Start dependencies with `docker compose up -d --wait`, then run
 //! `cargo test -p nanace-server -- --ignored`. Override endpoints with
-//! `NANACE_TEST_DATABASE_URL` / `NANACE_TEST_QDRANT_URL`.
+//! `NANACE_TEST_DATABASE_URL` / `NANACE_TEST_QDRANT_URL`. The defaults are the
+//! `nanace_test` database and the `qdrant-test` service, never the dev data.
 
 use std::sync::Arc;
 
@@ -20,8 +21,8 @@ use uuid::Uuid;
 
 async fn state(dev_login: bool) -> web::Data<AppState> {
     let db_url = std::env::var("NANACE_TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanace:nanace@127.0.0.1:5432/nanace".to_owned());
-    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6334".to_owned());
+        .unwrap_or_else(|_| "postgres://nanace:nanace@127.0.0.1:5432/nanace_test".to_owned());
+    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6336".to_owned());
     let pool = PgPool::connect(&db_url).await.expect("PostgreSQL is reachable");
     db::MIGRATOR.run(&pool).await.expect("migrations apply");
     assert!(

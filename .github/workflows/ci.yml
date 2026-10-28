@@ -30,7 +30,8 @@ jobs:
           --health-interval 2s --health-timeout 5s --health-retries 30
       qdrant:
         image: qdrant/qdrant:v1.20.0
-        ports: ["6333:6333", "6334:6334"]
+        # Same ports as the local qdrant-test service.
+        ports: ["6335:6333", "6336:6334"]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -47,7 +48,7 @@ jobs:
         run: psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -f deploy/postgres/init.sql
       - name: Wait for Qdrant
         run: |
-          for i in $(seq 1 60); do curl -sf http://127.0.0.1:6333/readyz && exit 0; sleep 1; done
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:6335/readyz && exit 0; sleep 1; done
           exit 1
       - run: cargo test -p nanace-server -p nanace-mcp --locked -- --ignored
 

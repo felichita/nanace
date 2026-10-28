@@ -46,7 +46,7 @@ rules. A skill cannot expand the user's requested scope or grant authorization.
 ```bash
 make deps               # start PostgreSQL + Qdrant (docker compose)
 make check              # fmt check + clippy -D warnings + unit tests
-make test-integration   # API, RLS and MCP tests against compose services
+make test-integration   # API, RLS and MCP tests (nanace_test DB + qdrant-test)
 make test-model         # real bge-small model test (downloads ~130 MB once)
 make run                # run the API with .env (copy from .env.example)
 make desktop-check      # desktop app: tsc, vitest, Tauri clippy + tests

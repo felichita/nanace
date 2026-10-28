@@ -23,8 +23,8 @@ use uuid::Uuid;
 /// Starts the API on an ephemeral port and returns its base URL.
 async fn start_api() -> String {
     let db_url = std::env::var("NANACE_TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanace:nanace@127.0.0.1:5432/nanace".to_owned());
-    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6334".to_owned());
+        .unwrap_or_else(|_| "postgres://nanace:nanace@127.0.0.1:5432/nanace_test".to_owned());
+    let qdrant_url = std::env::var("NANACE_TEST_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6336".to_owned());
     let pool = sqlx::PgPool::connect(&db_url).await.expect("PostgreSQL is reachable");
     db::MIGRATOR.run(&pool).await.expect("migrations apply");
     assert!(

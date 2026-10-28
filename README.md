@@ -105,7 +105,7 @@ code-signed yet.
 
 ```bash
 make check              # fmt, clippy -D warnings, unit tests
-make test-integration   # API, RLS and MCP tests against docker compose
+make test-integration   # API, RLS and MCP tests (nanace_test DB + qdrant-test)
 make test-model         # real embedding model test
 make desktop-check      # desktop: tsc, vitest, clippy, Rust tests
 ```
