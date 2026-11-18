@@ -1,0 +1,81 @@
+[package]
+name = "nanace-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Peer-to-peer messaging between agents of a nanace team: network node and per-user daemon"
+
+[features]
+default = ["daemon"]
+# Everything but the local IPC client: the daemon, the node and libp2p.
+# `nanace-mcp` turns it off and gets a client with no networking code.
+daemon = [
+    "dep:anyhow",
+    "dep:async-trait",
+    "dep:base64",
+    "dep:chrono",
+    "dep:ed25519-dalek",
+    "dep:futures-util",
+    "dep:getrandom",
+    "dep:libp2p",
+    "dep:nanace-core",
+    "dep:regex",
+    "dep:reqwest",
+    "dep:secrecy",
+    "dep:subtle",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:uuid",
+    "serde/derive",
+    "tokio/fs",
+    "tokio/io-std",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+    "tokio/time",
+]
+
+[dependencies]
+nanace-core = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+futures-util = { workspace = true, features = ["std"], optional = true }
+getrandom = { workspace = true, optional = true }
+libp2p = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+subtle = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[[bin]]
+name = "nanace-p2p"
+required-features = ["daemon"]
+
+[[test]]
+name = "daemon"
+required-features = ["daemon"]
+
+[dev-dependencies]
+actix-web.workspace = true
+nanace-embed.workspace = true
+nanace-server = { path = "../nanace-server" }
+secrecy.workspace = true
+sqlx.workspace = true
+
+[[test]]
+name = "network"
+required-features = ["daemon"]
+
+[[test]]
+name = "e2e"
+required-features = ["daemon"]

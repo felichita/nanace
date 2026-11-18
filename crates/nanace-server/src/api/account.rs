@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::audit::{self, AuditEvent};
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
-use crate::{AppState, LOG_COMPONENT};
+use crate::{AppState, LOG_COMPONENT, db};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/me", web::delete().to(delete_account));
@@ -102,6 +102,14 @@ async fn delete_account(state: web::Data<AppState>, user: AuthUser) -> ApiResult
         },
     )
     .await?;
+    // The user row stays, so nothing cascades from it: P2P peers (and with
+    // them any presence left) are deleted here. Last in the transaction:
+    // from here on it runs under row-level security.
+    db::enter_user_scope(&mut tx, user.user_id).await?;
+    sqlx::query("DELETE FROM p2p_peers WHERE user_id = $1")
+        .bind(user.user_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     for org_id in sole {

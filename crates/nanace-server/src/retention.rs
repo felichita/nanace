@@ -2,8 +2,10 @@
 //! `NANACE_TRASH_RETENTION_DAYS` (default 7) and are then deleted for good.
 //!
 //! The purge runs under RLS like any other trash access: for each team it
-//! deletes as one of the team's writers (only writers may purge). Teams with
-//! no writer keep their trash until they have one. Every purge is audited as
+//! deletes as one of the team's admins, or as a writer when the team has no
+//! admin. Only an admin may purge `Policy:` and `Wiki:` pages, so a team
+//! without an admin keeps those in the trash until it has one, and a team
+//! with no writer keeps all of its trash. Every purge is audited as
 //! `system.trash_purge`. Running it from several replicas is harmless: a
 //! second run finds nothing to delete.
 
@@ -19,7 +21,7 @@ pub async fn purge_expired(pool: &PgPool, retention_days: u32, only_org: Option<
     let teams: Vec<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT t.org_id, t.id, (SELECT m.user_id FROM team_members m \
                                  WHERE m.team_id = t.id AND m.role IN ('writer', 'admin') \
-                                 ORDER BY m.user_id LIMIT 1) \
+                                 ORDER BY (m.role = 'admin') DESC, m.user_id LIMIT 1) \
          FROM teams t WHERE $1::uuid IS NULL OR t.org_id = $1 ORDER BY t.org_id, t.id",
     )
     .bind(only_org)

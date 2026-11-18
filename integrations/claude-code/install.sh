@@ -2,7 +2,9 @@
 # Installs or updates the nanace Claude Code integration:
 #   - the `nanace-mcp` binary (MCP server) from the latest GitHub release,
 #   - the `/nanace` skill in ~/.claude/skills/nanace,
-#   - optionally connects Claude Code to a nanace server (token + `claude mcp add`).
+#   - optionally connects Claude Code to a nanace server (token + `claude mcp add`),
+#   - with NANACE_P2P=1, the `nanace-p2p` daemon as a background service of
+#     this user, so Claude gets the `p2p_*` tools without the desktop app.
 #
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.sh)"
 #
@@ -15,9 +17,22 @@
 #   NANACE_VERSION     release tag for nanace-mcp, e.g. v0.1.3 (default: latest release)
 #   NANACE_BIN_DIR     where nanace-mcp goes (default: ~/.local/bin)
 #   NANACE_SKIP_BINARY 1 = install only the skill (implies no connect)
+#   NANACE_LOCAL_BIN_DIR  take the binaries from this directory (e.g. target/release
+#                      of a clone) instead of a release
+#   NANACE_P2P         1 = also install and start the P2P daemon (see below)
+#   NANACE_P2P_TEAMS   teams the daemon takes part in, `<org id>:<team id>:<accept mode>`
+#                      comma separated (default: ask, with accept mode `team`)
+#   NANACE_P2P_TOKEN_FILE  the daemon's `p2p`-scoped token (default: ~/.config/nanace/p2p.token)
+#   NANACE_P2P_DIR     the daemon's state: peer key, socket, log (default: ~/.local/share/nanace/p2p)
 #   NANACE_REF         git ref the skill is installed from (default: main)
 #   NANACE_BASE_URL    override the skill download base (e.g. file:// of a clone)
 #   CLAUDE_CONFIG_DIR  Claude Code config dir (default: ~/.claude)
+#
+# NANACE_P2P=1 runs the daemon the way an agent in a container runs it: there
+# is no window to ask you about a request, so it answers on its own within the
+# team's `Policy: P2P`. The team owner has to list your account under
+# `server_peers` and set `max_accept_mode: team`. To be asked about every
+# request, use the nanace desktop app instead.
 set -euo pipefail
 
 REPO="felichita/nanace"
@@ -28,11 +43,17 @@ SKILL_DIR="$CONFIG_DIR/skills/nanace"
 SKILL_FILES=(SKILL.md schema-template.md)
 BIN_DIR="${NANACE_BIN_DIR:-$HOME/.local/bin}"
 BIN="$BIN_DIR/nanace-mcp"
-# Records which release the installed binary came from and its checksum.
-MARKER="$BIN_DIR/.nanace-mcp.version"
+P2P_BIN="$BIN_DIR/nanace-p2p"
+BINARIES=(nanace-mcp)
+if [ "${NANACE_P2P:-0}" = 1 ]; then BINARIES+=(nanace-p2p); fi
 API_URL="${NANACE_API_URL:-http://127.0.0.1:8080}"
 API_URL="${API_URL%/}"
 TOKEN_FILE="${NANACE_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/nanace/claude-code.token}"
+P2P_TOKEN_FILE="${NANACE_P2P_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/nanace/p2p.token}"
+P2P_DIR="${NANACE_P2P_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/nanace/p2p}"
+P2P_LABEL="dev.nanace.p2p"
+# Set once the daemon answers on its socket.
+P2P_READY=0
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -81,11 +102,59 @@ latest_tag() {
   case "$url" in */tag/*) echo "${url##*/}" ;; *) return 1 ;; esac
 }
 
-install_binary() {
-  local target tag marker_tag="" marker_sum="" name archive have want
+# True when the installed binary $1 is the one recorded for release $2.
+# `.<name>.version` records which release a binary came from and its checksum.
+binary_current() {
+  local bin="$BIN_DIR/$1" marker="$BIN_DIR/.$1.version" tag="" sum=""
+  if [ -f "$marker" ]; then read -r tag sum < "$marker" || true; fi
+  [ -x "$bin" ] && [ "$tag" = "$2" ] && [ "$(sha256 "$bin")" = "$sum" ]
+}
+
+# place_binary <name> <tag> <file>: installs <file> as $BIN_DIR/<name>.
+place_binary() {
+  local name="$1" tag="$2" src="$3" bin="$BIN_DIR/$1" marker="$BIN_DIR/.$1.version"
+  local have marker_tag="" existed=0
+  if [ -f "$marker" ]; then read -r marker_tag _ < "$marker" || true; fi
+  have="$(sha256 "$src")"
+  mkdir -p "$BIN_DIR"
+  if [ -x "$bin" ] && [ "$(sha256 "$bin")" = "$have" ]; then
+    say "$name $tag is already installed: $bin"
+  else
+    [ -e "$bin" ] && existed=1
+    # Copy next to the target and rename, so a running binary is never half-written.
+    cp "$src" "$bin.new"
+    chmod 755 "$bin.new"
+    mv -f "$bin.new" "$bin"
+    if [ "$marker_tag" = "$tag" ]; then
+      say "Reinstalled $name $tag (the installed file did not match): $bin"
+    elif [ -n "$marker_tag" ]; then
+      say "Updated $name $marker_tag -> $tag: $bin"
+    elif [ "$existed" = 1 ]; then
+      say "Replaced an unmanaged $name with $tag: $bin"
+    else
+      say "Installed $name $tag: $bin"
+    fi
+  fi
+  printf '%s %s\n' "$tag" "$have" > "$marker"
+}
+
+path_note() {
+  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "Note: $BIN_DIR is not on your PATH (Claude uses the absolute path, so this is optional)." ;; esac
+}
+
+install_binaries() {
+  local target tag name archive want b missing=0
+  if [ -n "${NANACE_LOCAL_BIN_DIR:-}" ]; then
+    for b in "${BINARIES[@]}"; do
+      [ -f "$NANACE_LOCAL_BIN_DIR/$b" ] || die "$b not found in $NANACE_LOCAL_BIN_DIR (NANACE_LOCAL_BIN_DIR)"
+      place_binary "$b" local "$NANACE_LOCAL_BIN_DIR/$b"
+    done
+    path_note
+    return 0
+  fi
   if ! target="$(release_target)"; then
-    warn "no nanace-mcp release build for $(uname -s) $(uname -m); skipping the binary"
-    warn "use the nanace desktop app (it bundles nanace-mcp) or: cargo build --release -p nanace-mcp"
+    warn "no nanace release build for $(uname -s) $(uname -m); skipping the binaries"
+    warn "use the nanace desktop app (it bundles them) or: cargo build --release -p nanace-mcp"
     return 0
   fi
   tag="${NANACE_VERSION:-}"
@@ -94,49 +163,35 @@ install_binary() {
   fi
   case "$tag" in v*) ;; *) tag="v$tag" ;; esac
 
-  if [ -f "$MARKER" ]; then
-    read -r marker_tag marker_sum < "$MARKER" || true
-  fi
-  if [ -x "$BIN" ] && [ "$marker_tag" = "$tag" ] && [ "$(sha256 "$BIN")" = "$marker_sum" ]; then
-    say "nanace-mcp $tag is up to date: $BIN"
-    return 0
-  fi
+  for b in "${BINARIES[@]}"; do
+    if binary_current "$b" "$tag"; then
+      say "$b $tag is up to date: $BIN_DIR/$b"
+    else
+      missing=1
+    fi
+  done
+  [ "$missing" = 1 ] || return 0
 
   name="nanace-${tag#v}-$target"
   archive="$TMP/$name.tar.gz"
-  say "Downloading nanace-mcp $tag ($target)..."
+  say "Downloading nanace $tag ($target)..."
   fetch "https://github.com/$REPO/releases/download/$tag/$name.tar.gz" "$archive" \
     || die "could not download $name.tar.gz from release $tag"
   fetch "https://github.com/$REPO/releases/download/$tag/$name.tar.gz.sha256" "$archive.sha256" \
     || die "could not download the checksum for $name.tar.gz"
   want="$(cut -d' ' -f1 < "$archive.sha256")"
   [ "$(sha256 "$archive")" = "$want" ] || die "checksum mismatch for $name.tar.gz"
-  tar -xzf "$archive" -C "$TMP" "$name/nanace-mcp" || die "nanace-mcp not found in $name.tar.gz"
-
-  have="$(sha256 "$TMP/$name/nanace-mcp")"
-  mkdir -p "$BIN_DIR"
-  if [ -x "$BIN" ] && [ "$(sha256 "$BIN")" = "$have" ]; then
-    say "nanace-mcp $tag is already installed: $BIN"
-  else
-    local existed=0
-    [ -e "$BIN" ] && existed=1
-    # Copy next to the target and rename, so a running nanace-mcp is never half-written.
-    cp "$TMP/$name/nanace-mcp" "$BIN.new"
-    chmod 755 "$BIN.new"
-    mv -f "$BIN.new" "$BIN"
-    if [ "$marker_tag" = "$tag" ]; then
-      say "Reinstalled nanace-mcp $tag (the installed file did not match): $BIN"
-    elif [ -n "$marker_tag" ]; then
-      say "Updated nanace-mcp $marker_tag -> $tag: $BIN"
-    elif [ "$existed" = 1 ]; then
-      say "Replaced an unmanaged nanace-mcp with $tag: $BIN"
-    else
-      say "Installed nanace-mcp $tag: $BIN"
+  for b in "${BINARIES[@]}"; do
+    if binary_current "$b" "$tag"; then continue; fi
+    if ! tar -xzf "$archive" -C "$TMP" "$name/$b" 2>/dev/null; then
+      [ "$b" = nanace-p2p ] || die "$b not found in $name.tar.gz"
+      warn "release $tag has no nanace-p2p; P2P needs a newer release (NANACE_VERSION)"
+      warn "or binaries you built yourself (NANACE_LOCAL_BIN_DIR)"
+      continue
     fi
-  fi
-  printf '%s %s\n' "$tag" "$have" > "$MARKER"
-
-  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "Note: $BIN_DIR is not on your PATH (Claude uses the absolute path, so this is optional)." ;; esac
+    place_binary "$b" "$tag" "$TMP/$name/$b"
+  done
+  path_note
 }
 
 # --- skill -----------------------------------------------------------------
@@ -186,11 +241,12 @@ registered_command() {
   claude mcp get nanace 2>/dev/null | sed -n 's/^ *Command: //p' | head -n 1
 }
 
-# API GET authenticated with the token in $TOKEN_FILE. The header is passed to
-# curl through a file, so the token never appears in process arguments.
+# api_get <path> [token file]: API GET authenticated with the token in the
+# file (default $TOKEN_FILE). The header is passed to curl through a file, so
+# the token never appears in process arguments.
 api_get() {
   local hdr="$TMP/auth.header" token status=0
-  token="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  token="$(tr -d '[:space:]' < "${2:-$TOKEN_FILE}")"
   (umask 077 && printf 'Authorization: Bearer %s\n' "$token" > "$hdr")
   curl -fsS --max-time 20 -H @"$hdr" "$API_URL$1" || status=$?
   rm -f "$hdr"
@@ -203,16 +259,17 @@ open_browser() {
   fi
 }
 
-# Reads a new token (hidden input) and stores it in $TOKEN_FILE (mode 600).
+# prompt_token <file> <me.json> <step 2 text> <what for>: reads a new token
+# (hidden input), stores it in <file> (mode 600) and saves /me to <me.json>.
 prompt_token() {
-  local token tries=0
-  say "Create an access token for Claude Code:"
+  local file="$1" me="$2" token tries=0
+  say "Create an access token for $4:"
   say "  1. Open $API_URL/auth/complete and sign in."
-  say "  2. Create a token: scope 'write' (needed to save pages), any name, up to 365 days."
+  say "  2. $3"
   say "  3. Copy it and paste it here (input is hidden)."
   open_browser "$API_URL/auth/complete"
-  mkdir -p "$(dirname "$TOKEN_FILE")"
-  chmod 700 "$(dirname "$TOKEN_FILE")" 2>/dev/null || true
+  mkdir -p "$(dirname "$file")"
+  chmod 700 "$(dirname "$file")" 2>/dev/null || true
   while [ "$tries" -lt 3 ]; do
     tries=$((tries + 1))
     printf 'Token: ' > /dev/tty
@@ -223,13 +280,13 @@ prompt_token() {
       nnc_pat_?*) ;;
       *) warn "that does not look like a nanace token (it starts with nnc_pat_)"; continue ;;
     esac
-    (umask 077 && printf '%s\n' "$token" > "$TOKEN_FILE.new")
-    mv -f "$TOKEN_FILE.new" "$TOKEN_FILE"
+    (umask 077 && printf '%s\n' "$token" > "$file.new")
+    mv -f "$file.new" "$file"
     unset token
-    if api_get /api/v1/me > "$TMP/me.json" 2>/dev/null; then return 0; fi
+    if api_get /api/v1/me "$file" > "$me" 2>/dev/null; then return 0; fi
     warn "the server rejected this token (invalid, expired or revoked); try again"
   done
-  rm -f "$TOKEN_FILE"
+  rm -f "$file"
   return 1
 }
 
@@ -288,7 +345,8 @@ connect_claude() {
     return 0
   fi
   cur="$(registered_command || true)"
-  if [ "$cur" = "$BIN" ] && [ "${NANACE_RECONNECT:-0}" != 1 ]; then
+  # With the daemon up, connect again: the registration needs its socket.
+  if [ "$cur" = "$BIN" ] && [ "${NANACE_RECONNECT:-0}" != 1 ] && [ "$P2P_READY" != 1 ]; then
     say "Claude Code is connected through this nanace-mcp: $BIN"
     say "(NANACE_RECONNECT=1 connects again, e.g. with a new token or server.)"
     return 0
@@ -317,7 +375,9 @@ connect_claude() {
     && ask "Use the token saved in $TOKEN_FILE?" y; then
     :
   else
-    prompt_token || { warn "no valid token; Claude Code was not connected"; manual_connect_help; return 0; }
+    prompt_token "$TOKEN_FILE" "$TMP/me.json" \
+      "Create a token: scope 'write' (needed to save pages), any name, up to 365 days." "Claude Code" \
+      || { warn "no valid token; Claude Code was not connected"; manual_connect_help; return 0; }
   fi
   chmod 600 "$TOKEN_FILE"
 
@@ -326,7 +386,7 @@ connect_claude() {
   if [ "$scope" = read ]; then
     warn "this token has 'read' scope: Claude can search but /nanace cannot save pages"
   fi
-  grep -qE '"team_role":"(writer|admin)"' "$TMP/me.json" \
+  grep -qE '"team_role":"(agent|writer|admin)"' "$TMP/me.json" \
     || warn "you are not a writer in any team yet: /nanace can only save after a team admin adds you"
   org="$(choose_org)"
 
@@ -334,9 +394,14 @@ connect_claude() {
   local args=(mcp add nanace --scope user --env "NANACE_API_URL=$API_URL" --env "NANACE_TOKEN_FILE=$TOKEN_FILE")
   [ "$scope" = read ] || args+=(--env NANACE_ALLOW_WRITES=true)
   [ -z "$org" ] || args+=(--env "NANACE_ORG_ID=$org")
+  if [ "$P2P_READY" = 1 ]; then
+    args+=(--env NANACE_ALLOW_P2P=true --env "NANACE_P2P_SOCKET=$P2P_DIR/p2p.sock"
+      --env "NANACE_P2P_SECRET_FILE=$P2P_DIR/ipc.secret")
+  fi
   args+=(-- "$BIN")
   claude "${args[@]}" >/dev/null || { warn "claude mcp add failed"; manual_connect_help; return 0; }
   say "Connected Claude Code to $API_URL as ${email:-you} (token file: $TOKEN_FILE)."
+  [ "$P2P_READY" != 1 ] || say "Claude has the p2p_* tools through the daemon in $P2P_DIR."
   # Capture first: with pipefail, `grep -q` closing the pipe early would fail it.
   local status_out
   status_out="$(claude mcp get nanace 2>/dev/null || true)"
@@ -347,12 +412,150 @@ connect_claude() {
   fi
 }
 
+# --- P2P daemon ------------------------------------------------------------
+
+p2p_help() {
+  say "P2P was not set up. What it needs:"
+  say "  - a server that runs a P2P node (NANACE_P2P_BOOTSTRAP on the server),"
+  say "  - a page 'Policy: P2P' in the team, with your account under server_peers.users"
+  say "    and max_accept_mode: team (this daemon has no window to ask you),"
+  say "  - a token with scope 'p2p' in $P2P_TOKEN_FILE."
+  say "Run the installer again with NANACE_P2P=1 once these are in place."
+}
+
+# Prints the chosen teams as `<org id>:<team id>:team,...`.
+choose_p2p_teams() {
+  local rows org team name role picked=""
+  rows="$(awk '{ gsub(/\},\{/, "}\n{"); print }' "$TMP/p2p-me.json" | sed -n \
+    's/.*"org_id":"\([^"]*\)","org_slug":"\([^"]*\)".*"team_id":"\([^"]*\)","team_slug":"\([^"]*\)","team_role":"\([^"]*\)".*/\1 \3 \2\/\4 \5/p')"
+  [ -n "$rows" ] || return 0
+  while read -r org team name role; do
+    if ask "Take part in P2P in team $name (your role: $role)?" y; then
+      picked="${picked:+$picked,}$org:$team:team"
+    fi
+  done <<< "$rows"
+  printf '%s\n' "$picked"
+}
+
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# start_p2p_service KEY=VALUE...: runs `nanace-p2p daemon` as a service of
+# this user with that environment, replacing a previous one.
+start_p2p_service() {
+  local kv unit plist
+  case "$(uname -s)" in
+    Darwin)
+      plist="$HOME/Library/LaunchAgents/$P2P_LABEL.plist"
+      mkdir -p "$(dirname "$plist")"
+      {
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+          '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+          '<plist version="1.0"><dict>' \
+          "<key>Label</key><string>$P2P_LABEL</string>" \
+          "<key>ProgramArguments</key><array><string>$(xml_escape "$P2P_BIN")</string><string>daemon</string></array>" \
+          '<key>EnvironmentVariables</key><dict>'
+        for kv in "$@"; do
+          printf '<key>%s</key><string>%s</string>\n' "${kv%%=*}" "$(xml_escape "${kv#*=}")"
+        done
+        printf '%s\n' '</dict>' \
+          '<key>RunAtLoad</key><true/>' '<key>KeepAlive</key><true/>' '<key>ThrottleInterval</key><integer>30</integer>' \
+          "<key>StandardErrorPath</key><string>$(xml_escape "$P2P_DIR/daemon.log")</string>" \
+          '</dict></plist>'
+      } > "$plist"
+      launchctl bootout "gui/$(id -u)/$P2P_LABEL" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$(id -u)" "$plist" || return 1
+      say "Service: $plist (stop it with: launchctl bootout gui/$(id -u)/$P2P_LABEL)"
+      ;;
+    Linux)
+      systemctl --user show-environment >/dev/null 2>&1 || { warn "no systemd user session to run the daemon in"; return 1; }
+      unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/nanace-p2p.service"
+      mkdir -p "$(dirname "$unit")"
+      {
+        printf '%s\n' '[Unit]' 'Description=nanace P2P daemon' 'After=network-online.target' '' '[Service]'
+        for kv in "$@"; do printf 'Environment="%s"\n' "$(printf '%s' "$kv" | sed 's/%/%%/g')"; done
+        printf '%s\n' "ExecStart=\"$P2P_BIN\" daemon" "StandardError=append:$P2P_DIR/daemon.log" \
+          'Restart=on-failure' 'RestartSec=30' '' '[Install]' 'WantedBy=default.target'
+      } > "$unit"
+      systemctl --user daemon-reload || return 1
+      systemctl --user enable nanace-p2p.service >/dev/null 2>&1 || true
+      systemctl --user restart nanace-p2p.service || return 1
+      say "Service: $unit (stop it with: systemctl --user disable --now nanace-p2p)"
+      ;;
+    *) warn "no service setup for $(uname -s)"; return 1 ;;
+  esac
+}
+
+setup_p2p() {
+  local bootstrap teams i=0
+  say ""
+  if [ ! -x "$P2P_BIN" ]; then
+    say "nanace-p2p is not installed here, so P2P was not set up."
+    return 0
+  fi
+  if ! curl -fsS -o /dev/null --max-time 10 "$API_URL/livez" 2>/dev/null; then
+    warn "cannot reach $API_URL (set NANACE_API_URL to your nanace server)"
+    p2p_help
+    return 0
+  fi
+  if [ -s "$P2P_TOKEN_FILE" ] && api_get /api/v1/me "$P2P_TOKEN_FILE" > "$TMP/p2p-me.json" 2>/dev/null; then
+    say "Using the P2P token in $P2P_TOKEN_FILE."
+  elif has_tty; then
+    prompt_token "$P2P_TOKEN_FILE" "$TMP/p2p-me.json" \
+      "Create a token: scope 'p2p' (it can only do P2P, not read pages), any name." "the P2P daemon" \
+      || { warn "no valid token"; p2p_help; return 0; }
+  else
+    say "No terminal to ask for a token."
+    p2p_help
+    return 0
+  fi
+  chmod 600 "$P2P_TOKEN_FILE"
+
+  bootstrap="$(api_get /api/v1/p2p/config "$P2P_TOKEN_FILE" 2>/dev/null | sed -n 's/.*"bootstrap":"\([^"]*\)".*/\1/p')" || true
+  if [ -z "$bootstrap" ]; then
+    warn "the server at $API_URL runs no P2P node"
+    p2p_help
+    return 0
+  fi
+
+  teams="${NANACE_P2P_TEAMS:-}"
+  if [ -z "$teams" ] && has_tty; then teams="$(choose_p2p_teams)"; fi
+  if [ -z "$teams" ]; then
+    warn "no team chosen (set NANACE_P2P_TEAMS=<org id>:<team id>:team)"
+    p2p_help
+    return 0
+  fi
+
+  mkdir -p "$P2P_DIR"
+  chmod 700 "$P2P_DIR"
+  : > "$P2P_DIR/daemon.log"
+  start_p2p_service "NANACE_API_URL=$API_URL" "NANACE_TOKEN_FILE=$P2P_TOKEN_FILE" "NANACE_P2P_DIR=$P2P_DIR" \
+    "NANACE_P2P_BOOTSTRAP=$bootstrap" "NANACE_P2P_KIND=server" "NANACE_P2P_TEAMS=$teams" \
+    || { warn "could not start the daemon as a service"; p2p_help; return 0; }
+
+  while [ "$i" -lt 20 ]; do
+    if NANACE_P2P_DIR="$P2P_DIR" "$P2P_BIN" call whoami > "$TMP/whoami.json" 2>/dev/null; then
+      P2P_READY=1
+      say "The P2P daemon is running: peer $(sed -n 's/.*"peer_id": *"\([^"]*\)".*/\1/p' "$TMP/whoami.json" | head -n 1)"
+      say "Check it any time: NANACE_P2P_DIR=$P2P_DIR $P2P_BIN call whoami"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  warn "the daemon did not come up; the end of $P2P_DIR/daemon.log:"
+  tail -n 5 "$P2P_DIR/daemon.log" >&2 || true
+  p2p_help
+}
+
 if [ "${NANACE_SKIP_BINARY:-0}" = 1 ]; then
-  say "Skipping nanace-mcp (NANACE_SKIP_BINARY=1)."
+  say "Skipping the binaries (NANACE_SKIP_BINARY=1)."
 else
-  install_binary
+  install_binaries
 fi
 install_skill
-[ "${NANACE_SKIP_BINARY:-0}" = 1 ] || connect_claude
+if [ "${NANACE_SKIP_BINARY:-0}" != 1 ]; then
+  if [ "${NANACE_P2P:-0}" = 1 ]; then setup_p2p; fi
+  connect_claude
+fi
 say ""
 say "Restart Claude Code to pick up changes, then run: /nanace <TASK-KEY>"

@@ -25,6 +25,16 @@ pub enum ApiError {
     Unauthorized,
     #[error("permission denied")]
     Forbidden,
+    #[error(
+        "Policy: and Wiki: pages are edited only by the teamspace owner (team role `admin`). \
+         Tell the user instead of retrying or saving under a similar title."
+    )]
+    ProtectedPage,
+    #[error(
+        "Your role in that team is `agent`, which edits only pages it created. \
+         Create a page of your own or tell the user what should be added to this one."
+    )]
+    NotAuthor,
     #[error("not found (or not visible to you)")]
     NotFound,
     #[error("invalid request: {0}")]
@@ -87,6 +97,8 @@ pub struct ContextSummary {
 
 #[derive(Deserialize)]
 struct ErrorBody {
+    #[serde(default)]
+    error: String,
     message: String,
 }
 
@@ -200,12 +212,17 @@ impl ApiClient {
         team_id: Uuid,
         limit: u32,
         offset: u32,
+        tag: Option<&str>,
     ) -> Result<Vec<ContextSummary>, ApiError> {
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(tag) = tag {
+            query.push(("tag", tag.to_owned()));
+        }
         self.request(
             Method::GET,
             &format!("/api/v1/orgs/{org_id}/teams/{team_id}/contexts"),
             None,
-            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+            &query,
         )
         .await
     }
@@ -245,13 +262,15 @@ impl ApiClient {
                     .await
                     .map_err(|e| ApiError::Unexpected(e.without_url().to_string()));
             }
-            let message = resp
+            let (code, message) = resp
                 .json::<ErrorBody>()
                 .await
-                .map(|b| b.message)
-                .unwrap_or_else(|_| status.to_string());
+                .map(|b| (b.error, b.message))
+                .unwrap_or_else(|_| (String::new(), status.to_string()));
             return Err(match status {
                 StatusCode::UNAUTHORIZED => ApiError::Unauthorized,
+                StatusCode::FORBIDDEN if code == "protected_page" => ApiError::ProtectedPage,
+                StatusCode::FORBIDDEN if code == "not_author" => ApiError::NotAuthor,
                 StatusCode::FORBIDDEN => ApiError::Forbidden,
                 StatusCode::NOT_FOUND => ApiError::NotFound,
                 StatusCode::BAD_REQUEST => ApiError::BadRequest(message),

@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use actix_web::{HttpResponse, web};
 use chrono::{DateTime, Utc};
+use nanace_core::policy::is_policy_page_title;
 use nanace_core::{TeamRole, embedding_input_hash, validate, wiki_links};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use super::p2p::{PolicyChange, check_policy_page, sync_policy};
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
@@ -99,13 +101,82 @@ pub(crate) async fn embed_context(state: &AppState, title: &str, content: &str) 
         })
 }
 
-/// Team of a context the caller can read; `NotFound` otherwise.
-async fn readable_team_of(tx: &mut Transaction<'static, Postgres>, context_id: Uuid) -> ApiResult<Uuid> {
-    let team_id: Option<Uuid> = sqlx::query_scalar("SELECT team_id FROM contexts WHERE id = $1")
-        .bind(context_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    team_id.ok_or(ApiError::NotFound)
+/// Team, title and author of a context the caller can read; `NotFound`
+/// otherwise.
+async fn readable_context(
+    tx: &mut Transaction<'static, Postgres>,
+    context_id: Uuid,
+) -> ApiResult<(Uuid, String, Uuid)> {
+    let row: Option<(Uuid, String, Uuid)> =
+        sqlx::query_as("SELECT team_id, title, created_by FROM contexts WHERE id = $1")
+            .bind(context_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    row.ok_or(ApiError::NotFound)
+}
+
+/// A write to a page, as far as its title matters.
+pub(crate) struct TitleWrite<'a> {
+    pub org_id: Uuid,
+    pub team_id: Uuid,
+    pub user_id: Uuid,
+    pub role: TeamRole,
+    /// `None` when the page is being created.
+    pub context_id: Option<Uuid>,
+    pub operation: &'static str,
+    /// The page's title before the write, if it exists.
+    pub current: Option<&'a str>,
+    /// The title the write gives the page, if it sets one.
+    pub new: Option<&'a str>,
+    /// Who created the page, if it exists.
+    pub created_by: Option<Uuid>,
+}
+
+/// Page-level write rules on top of the team role. `Policy:` and `Wiki:`
+/// pages are written only by an admin of their team, and a team `agent` edits
+/// only the pages it created: refuses the write otherwise, and audits the
+/// refusal. Row-level security
+/// enforces the same rule again for protected titles. A new title that only
+/// looks protected (letters of another script) is refused here as well, so a
+/// writer cannot plant a page that reads like the team's policy.
+pub(crate) async fn require_title_access(state: &AppState, write: TitleWrite<'_>) -> ApiResult<()> {
+    // The look-alike check applies to a title being given, not to one a page
+    // already has: an existing page stays editable under its own title.
+    let protected = write.current.is_some_and(validate::is_protected_title)
+        || write.new.is_some_and(|new| {
+            validate::is_protected_title(new)
+                || (write.current != Some(new) && validate::resembles_protected_title(new))
+        });
+    // A team `agent` edits only the pages it created.
+    let not_author = write.role == TeamRole::Agent && write.created_by.is_some_and(|author| author != write.user_id);
+    // The protected rule is reported first: it holds whoever wrote the page.
+    let protected_denied = protected && write.role != TeamRole::Admin;
+    if !not_author && !protected_denied {
+        return Ok(());
+    }
+    let not_author = !protected_denied;
+    // Its own statement: the refused write is rolled back or never starts.
+    audit::record(
+        &state.pool,
+        AuditEvent {
+            org_id: Some(write.org_id),
+            actor: write.user_id,
+            action: if not_author {
+                "context.agent_denied"
+            } else {
+                "context.protected_denied"
+            },
+            resource_type: "context",
+            resource_id: write.context_id,
+            details: serde_json::json!({ "team_id": write.team_id, "operation": write.operation }),
+        },
+    )
+    .await?;
+    Err(if not_author {
+        ApiError::NotAuthor
+    } else {
+        ApiError::ProtectedPage
+    })
 }
 
 /// Replaces the context's stored wiki links with those in `content`.
@@ -146,8 +217,24 @@ async fn create_context(
     body: web::Json<ContextInput>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id) = path.into_inner();
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Agent).await?;
     let input = body.into_inner().validate()?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: None,
+            operation: "create",
+            current: None,
+            new: Some(&input.title),
+            created_by: None,
+        },
+    )
+    .await?;
+    check_policy_page(&input.title, &input.content)?;
     let context_id = Uuid::new_v4();
 
     let chunks = embed_context(&state, &input.title, &input.content).await?;
@@ -174,6 +261,10 @@ async fn create_context(
     .fetch_one(&mut *tx)
     .await?;
     replace_links(&mut tx, org_id, context_id, &input.content).await?;
+    if is_policy_page_title(&input.title) {
+        let saved = PolicyChange::Saved(&input.content);
+        sync_policy(&mut tx, org_id, team_id, user.user_id, context_id, saved).await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {
@@ -204,6 +295,9 @@ async fn create_context(
 struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    /// Only pages carrying this tag (compared after the usual tag
+    /// normalization, so case does not matter).
+    tag: Option<String>,
 }
 
 async fn list_contexts(
@@ -222,15 +316,22 @@ async fn list_contexts(
         ));
     }
 
+    let tag = match &query.tag {
+        Some(tag) => validate::tags(std::slice::from_ref(tag))?.pop(),
+        None => None,
+    };
+
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     let rows: Vec<ContextSummary> = sqlx::query_as(
         "SELECT id, team_id, title, tags, updated_by, updated_at FROM contexts \
-         WHERE org_id = $1 AND team_id = $2 ORDER BY updated_at DESC, id LIMIT $3 OFFSET $4",
+         WHERE org_id = $1 AND team_id = $2 AND ($5::text IS NULL OR tags @> ARRAY[$5::text]) \
+         ORDER BY updated_at DESC, id LIMIT $3 OFFSET $4",
     )
     .bind(org_id)
     .bind(team_id)
     .bind(limit)
     .bind(offset)
+    .bind(tag)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -281,8 +382,24 @@ async fn update_context(
     let input = body.into_inner().validate()?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let team_id = readable_team_of(&mut tx, context_id).await?;
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let (team_id, title, created_by) = readable_context(&mut tx, context_id).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Agent).await?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: Some(context_id),
+            operation: "update",
+            current: Some(&title),
+            new: Some(&input.title),
+            created_by: Some(created_by),
+        },
+    )
+    .await?;
+    check_policy_page(&input.title, &input.content)?;
     // Serializes concurrent updates so PostgreSQL and Qdrant end up holding
     // the same version. Taken after the role check: under RLS, FOR UPDATE
     // also applies the UPDATE policy and would hide the row from readers.
@@ -327,6 +444,20 @@ async fn update_context(
     .fetch_one(&mut *tx)
     .await?;
     replace_links(&mut tx, org_id, context_id, &input.content).await?;
+    if is_policy_page_title(&input.title) {
+        let saved = PolicyChange::Saved(&input.content);
+        sync_policy(&mut tx, org_id, team_id, user.user_id, context_id, saved).await?;
+    } else if is_policy_page_title(&title) {
+        sync_policy(
+            &mut tx,
+            org_id,
+            team_id,
+            user.user_id,
+            context_id,
+            PolicyChange::Removed,
+        )
+        .await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {
@@ -359,8 +490,23 @@ async fn delete_context(
     access::require_org_member(&state.pool, org_id, user.user_id).await?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let team_id = readable_team_of(&mut tx, context_id).await?;
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let (team_id, title, created_by) = readable_context(&mut tx, context_id).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: Some(context_id),
+            operation: "delete",
+            current: Some(&title),
+            new: None,
+            created_by: Some(created_by),
+        },
+    )
+    .await?;
 
     // Moves the context to the trash; restoring it re-embeds the content.
     let trashed = sqlx::query(
@@ -382,6 +528,17 @@ async fn delete_context(
         .bind(context_id)
         .execute(&mut *tx)
         .await?;
+    if is_policy_page_title(&title) {
+        sync_policy(
+            &mut tx,
+            org_id,
+            team_id,
+            user.user_id,
+            context_id,
+            PolicyChange::Removed,
+        )
+        .await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {
@@ -446,7 +603,7 @@ async fn context_links(
     let teams = access::readable_teams(&state.pool, org_id, user.user_id).await?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    readable_team_of(&mut tx, context_id).await?;
+    readable_context(&mut tx, context_id).await?;
     let outgoing: Vec<LinkedContext> = sqlx::query_as(
         "SELECT DISTINCT c.id, c.team_id, c.title FROM context_links l \
          JOIN contexts c ON c.org_id = l.org_id AND lower(c.title) = l.target_key \

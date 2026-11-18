@@ -110,4 +110,26 @@ describe("PageView", () => {
     expect(api.updateContext).toHaveBeenCalledTimes(1);
     expect(vi.mocked(api.updateContext).mock.calls[0][2]).toMatchObject({ title: "Deploy Runbook", tags: ["ops"] });
   });
+
+  it("shows a Wiki: page read-only to a writer", async () => {
+    client.setQueryData(["page", "org-1", PAGE.id], { ...PAGE, title: "Wiki: Index" });
+    await render();
+    expect(document.querySelector("textarea")?.readOnly).toBe(true);
+    expect(document.body.textContent).toContain("Edited only by the teamspace owner");
+
+    await act(async () => root.unmount());
+    expect(api.updateContext).not.toHaveBeenCalled();
+  });
+
+  it("does not send a rename into a protected title by a writer", async () => {
+    await render();
+    const input = document.querySelector("textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, " wiki : Runbook");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    await act(async () => root.unmount());
+    expect(api.updateContext).not.toHaveBeenCalled();
+  });
 });

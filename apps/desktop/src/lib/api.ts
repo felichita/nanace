@@ -3,7 +3,9 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-export type TeamRole = "reader" | "writer" | "admin";
+import type { TeamPolicy } from "./p2p";
+
+export type TeamRole = "reader" | "agent" | "writer" | "admin";
 export type OrgRole = "member" | "admin";
 
 export interface SessionInfo {
@@ -182,6 +184,8 @@ const PAGE_SIZE = 200;
 
 export const api = {
   me: () => call<Me>("GET", "/me"),
+  p2pPolicy: (org: string, team: string) => call<TeamPolicy>("GET", `/orgs/${org}/teams/${team}/p2p/policy`),
+  p2pPolicyTemplate: () => call<{ title: string; content: string }>("GET", "/p2p/policy-template"),
   createOrg: (slug: string, name: string) => call<{ id: string }>("POST", "/orgs", { slug, name }),
   teams: (org: string) => call<Team[]>("GET", `/orgs/${org}/teams`),
   createTeam: (org: string, slug: string, name: string) =>

@@ -86,6 +86,149 @@ pub fn title(value: &str) -> Result<String, ValidationError> {
     Ok(trimmed.to_owned())
 }
 
+/// Title prefixes of pages only a team admin may write: team policies and
+/// the wiki's service pages.
+pub const PROTECTED_TITLE_PREFIXES: [&str; 2] = ["wiki", "policy"];
+
+/// Shown when a write to a protected page is refused.
+pub const PROTECTED_TITLE_MESSAGE: &str = "Policy: and Wiki: pages are edited only by the teamspace owner";
+
+/// Invisible format characters (Unicode category Cf), which could hide a
+/// protected prefix from a comparison while looking the same to a reader.
+/// SQL `nanace_is_protected_title` lists the same ranges.
+const FORMAT_CHARS: [(u32, u32); 21] = [
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// White space as SQL `nanace_is_protected_title` lists it (Unicode
+/// White_Space).
+fn is_title_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{D}'
+            | ' '
+            | '\u{85}'
+            | '\u{A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
+/// True when `title` names a protected page: after NFKC normalization and
+/// with invisible format characters removed, it starts with `wiki` or
+/// `policy` in any ASCII case, optional white space and a colon. Only ASCII
+/// case is folded, so the result does not depend on a locale and matches the
+/// SQL function of the same name exactly.
+pub fn is_protected_title(title: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+
+    let normalized: String = title
+        .nfkc()
+        .filter(|c| !FORMAT_CHARS.iter().any(|(lo, hi)| (*lo..=*hi).contains(&u32::from(*c))))
+        .collect();
+    let rest = normalized.trim_start_matches(is_title_space);
+    PROTECTED_TITLE_PREFIXES.iter().any(|prefix| {
+        rest.get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .is_some_and(|_| rest[prefix.len()..].trim_start_matches(is_title_space).starts_with(':'))
+    })
+}
+
+/// Letters and colons of other scripts that read as the ASCII ones in a
+/// protected prefix.
+fn ascii_look_alike(c: char) -> char {
+    match c {
+        'ԝ' | 'Ԝ' | 'ѡ' | 'Ѡ' | 'ω' => 'w',
+        'і' | 'І' | 'ı' | 'ι' | 'Ι' => 'i',
+        'к' | 'К' | 'κ' | 'Κ' => 'k',
+        'р' | 'Р' | 'ρ' | 'Ρ' => 'p',
+        'о' | 'О' | 'ο' | 'Ο' | '0' => 'o',
+        'ӏ' | 'Ӏ' => 'l',
+        'с' | 'С' | 'ϲ' | 'Ϲ' => 'c',
+        'у' | 'У' | 'γ' | 'Υ' => 'y',
+        '∶' | '꞉' | 'ː' | '։' | '׃' => ':',
+        other => other,
+    }
+}
+
+/// True when `title` is not protected but reads like a protected one to a
+/// person (`Wіki:` with a Cyrillic letter). Handlers refuse such titles from
+/// non-admins as a courtesy; the security boundary is [`is_protected_title`],
+/// which the policy loader and the database use.
+pub fn resembles_protected_title(title: &str) -> bool {
+    !is_protected_title(title) && is_protected_title(&title.chars().map(ascii_look_alike).collect::<String>())
+}
+
+/// Titles and what [`is_protected_title`] and SQL `nanace_is_protected_title`
+/// must both answer for them.
+#[doc(hidden)]
+pub const PROTECTED_TITLE_CASES: [(&str, bool); 34] = [
+    ("Wiki: Schema", true),
+    ("Wiki: Index", true),
+    ("Policy: P2P", true),
+    ("wiki: schema", true),
+    ("WIKI:", true),
+    ("pOlIcY:x", true),
+    ("Wiki : Schema", true),
+    ("Wiki\t:\u{A0}Schema", true),
+    ("  Wiki: Schema", true),
+    ("\u{3000}Policy: P2P", true),
+    // Full-width and compatibility forms fold under NFKC.
+    ("Ｗｉｋｉ： Schema", true),
+    ("Wiki： Schema", true),
+    ("Wi\u{212A}i: Schema", true),
+    ("ℙolicy: P2P", true),
+    ("Wiki︓ Schema", true),
+    // Invisible format characters are ignored.
+    ("\u{200B}Wiki: Schema", true),
+    ("W\u{200D}iki: Schema", true),
+    ("Wiki\u{FEFF}: Schema", true),
+    ("\u{202E}Policy\u{2060}: P2P", true),
+    ("Wi\u{AD}ki: Schema", true),
+    ("Wiki\u{E0041}: Schema", true),
+    // Not protected.
+    ("Wiki", false),
+    ("Wikipedia: notes", false),
+    ("Policies: travel", false),
+    ("Topic: Wiki: Schema", false),
+    ("My Wiki: Schema", false),
+    ("Wiki- Schema", false),
+    ("W iki: Schema", false),
+    ("", false),
+    (":", false),
+    // Look-alikes of other scripts are different titles.
+    ("Wіki: Schema", false),
+    ("Роlісу: P2P", false),
+    ("Wiki∶ Schema", false),
+    // Turkish dotted capital I does not fold to ASCII `i`.
+    ("Wİki: Schema", false),
+];
+
 /// Content may be empty: a new page starts blank and is still findable by
 /// its title.
 pub fn content(value: &str) -> Result<(), ValidationError> {
@@ -125,6 +268,37 @@ pub fn tags(values: &[String]) -> Result<Vec<String>, ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_titles_are_recognized() {
+        for (title, expected) in PROTECTED_TITLE_CASES {
+            assert_eq!(is_protected_title(title), expected, "{title:?}");
+        }
+    }
+
+    #[test]
+    fn look_alike_titles_are_flagged_but_not_protected() {
+        for title in [
+            "Wіki: Schema",
+            "Роlісу: P2P",
+            "Wiki∶ Schema",
+            "Poӏicy: x",
+            "P0licy: x",
+            "Wıki: Index",
+        ] {
+            assert!(!is_protected_title(title), "{title}");
+            assert!(resembles_protected_title(title), "{title}");
+        }
+        for title in [
+            "Wiki: Schema",
+            "Topic: Wiki",
+            "Wikipedia: notes",
+            "PROJECT-1: task",
+            "Рабочая: заметка",
+        ] {
+            assert!(!resembles_protected_title(title), "{title}");
+        }
+    }
 
     #[test]
     fn slug_rules() {

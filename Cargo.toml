@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/nanace-core", "crates/nanace-embed", "crates/nanace-mcp", "crates/nanace-server"]
+members = ["crates/nanace-core", "crates/nanace-embed", "crates/nanace-mcp", "crates/nanace-p2p", "crates/nanace-server"]
 # Built with its own lockfile and target dir by the Tauri CLI (apps/desktop).
 exclude = ["apps/desktop/src-tauri"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"
@@ -18,23 +18,29 @@ actix-web = "4.18"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"
+bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+ed25519-dalek = "2"
 futures-util = { version = "0.3", default-features = false }
 getrandom = "0.4"
 hmac = "0.13"
 fastembed = { version = "7.5", default-features = false, features = ["ort-download-binaries", "hf-hub-native-tls"] }
+libp2p = { version = "0.57", features = ["tokio", "tcp", "quic", "noise", "yamux", "identify", "ping", "relay", "dcutr", "autonat", "request-response", "json", "macros", "ed25519"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 qdrant-client = "1.20"
 prometheus = { version = "0.14", default-features = false }
+regex = "1.13"
 reqwest = { version = "0.13", features = ["json", "query", "form"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_norway = "0.9"
 sha2 = "0.11"
 subtle = "2.6"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
+unicode-normalization = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }

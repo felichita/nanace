@@ -8,6 +8,7 @@
 mod claude;
 mod loopback;
 mod memory;
+mod p2p;
 mod session;
 
 use std::time::Duration;
@@ -35,6 +36,10 @@ static CLAUDE_CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 /// Event sent to the UI when a Claude connection can no longer be renewed.
 const CLAUDE_EXPIRED_EVENT: &str = "claude-connection-expired";
+/// Emitted when the P2P daemon's token could not be renewed and P2P stopped.
+const P2P_EXPIRED_EVENT: &str = "p2p-token-expired";
+/// How often the app checks that the P2P daemon it wants is running.
+const P2P_WATCHDOG: Duration = Duration::from_secs(5);
 
 #[tauri::command]
 async fn session_info(session: State<'_, Session>) -> Result<SessionInfo, String> {
@@ -94,8 +99,186 @@ async fn sign_in_dev(session: State<'_, Session>, email: String) -> Result<Sessi
 }
 
 #[tauri::command]
-async fn sign_out(session: State<'_, Session>) -> Result<SessionInfo, String> {
+async fn sign_out(app: AppHandle, session: State<'_, Session>) -> Result<SessionInfo, String> {
+    // The daemon acts as the signed-in user; it stops with the session. Its
+    // token and setting stay, so signing in again resumes P2P.
+    app.state::<p2p::P2p>().stop().await;
     Ok(session.sign_out().await)
+}
+
+fn p2p_paths(app: &AppHandle) -> Result<p2p::Paths, String> {
+    Ok(p2p::Paths {
+        dir: app.path().app_config_dir().map_err(|err| err.to_string())?.join("p2p"),
+    })
+}
+
+/// What the P2P settings screen shows before it can ask the daemon.
+#[derive(serde::Serialize)]
+struct P2pState {
+    /// The daemon binary ships with this build.
+    available: bool,
+    /// The user turned P2P on for the current server.
+    enabled: bool,
+    running: bool,
+    /// The server has a network node; without one P2P cannot start.
+    node_configured: bool,
+    error: Option<String>,
+}
+
+/// The network node this server tells daemons to use.
+async fn p2p_bootstrap(session: &Session) -> Result<Option<String>, String> {
+    let response = session.request("GET", "/api/v1/p2p/config", None).await?;
+    if response.status != 200 {
+        return Err("the server did not say which P2P node to use".to_owned());
+    }
+    Ok(response
+        .body
+        .get("bootstrap")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
+/// Starts the daemon when P2P is on for the current server and the user is
+/// signed in; stops it otherwise. Called at startup and by the watchdog, so
+/// a daemon that crashed comes back.
+async fn p2p_reconcile(app: &AppHandle) -> Result<(), String> {
+    let (session, daemon) = (app.state::<Session>(), app.state::<p2p::P2p>());
+    let paths = p2p_paths(app)?;
+    let saved = p2p::Saved::load(&paths);
+    let info = session.info().await;
+    let wanted = saved.enabled && info.signed_in && saved.server_url == info.server_url;
+    if !wanted {
+        daemon.stop().await;
+        return Ok(());
+    }
+    if daemon.is_running().await {
+        return Ok(());
+    }
+    let Some(bootstrap) = p2p_bootstrap(&session).await? else {
+        return Err("this server has no P2P node configured".to_owned());
+    };
+    daemon.start(app, &paths, &info.server_url, &bootstrap).await
+}
+
+#[tauri::command]
+async fn p2p_state(app: AppHandle, session: State<'_, Session>) -> Result<P2pState, String> {
+    let paths = p2p_paths(&app)?;
+    let saved = p2p::Saved::load(&paths);
+    let info = session.info().await;
+    let enabled = saved.enabled && saved.server_url == info.server_url;
+    let (node_configured, error) = match p2p_bootstrap(&session).await {
+        Ok(bootstrap) => (bootstrap.is_some(), None),
+        Err(err) => (false, Some(err)),
+    };
+    Ok(P2pState {
+        available: p2p::binary().is_some(),
+        enabled,
+        running: app.state::<p2p::P2p>().is_running().await,
+        node_configured,
+        error,
+    })
+}
+
+/// Turns P2P on: issues the daemon its own token and starts it. The token
+/// has the `p2p` scope, which reaches the peer registry and nothing else,
+/// and issuing it needs a fresh interactive sign-in like Claude's tokens.
+#[tauri::command]
+async fn p2p_enable(app: AppHandle, session: State<'_, Session>, email: String) -> Result<P2pState, String> {
+    if p2p::binary().is_none() {
+        return Err("The P2P daemon is missing next to the app (build it with `make desktop-deps`).".to_owned());
+    }
+    let server_url = session.server_url().await;
+    if p2p_bootstrap(&session).await?.is_none() {
+        return Err("This server has no P2P node configured; ask its administrator.".to_owned());
+    }
+    let session_token = if session.google_enabled(&server_url).await? {
+        google_session(&app, &session, &server_url).await?
+    } else {
+        session.dev_login(&server_url, &email).await?
+    };
+    let paths = p2p_paths(&app)?;
+    app.state::<p2p::P2p>().stop().await;
+    // Every earlier daemon token goes, including rotated copies.
+    session
+        .revoke_tokens_named(&server_url, &session_token, p2p::TOKEN_NAME)
+        .await?;
+    let token = session
+        .create_token(&server_url, &session_token, p2p::TOKEN_NAME, "p2p", p2p::TOKEN_DAYS)
+        .await?;
+    if let Err(err) = p2p::write_token(&paths, &token) {
+        session.revoke_token(&server_url, &token).await;
+        return Err(err);
+    }
+    let mut saved = p2p::Saved::load(&paths);
+    saved.enabled = true;
+    saved.server_url = server_url;
+    saved.token_at = Some(claude::now_secs());
+    saved.save(&paths)?;
+    let error = p2p_reconcile(&app).await.err();
+    let mut state = p2p_state(app, session).await?;
+    state.error = error.or(state.error);
+    Ok(state)
+}
+
+/// Turns P2P off: stops the daemon, revokes its token and forgets the peer
+/// key, so nothing on this machine can act as a peer afterwards.
+#[tauri::command]
+async fn p2p_disable(app: AppHandle, session: State<'_, Session>) -> Result<P2pState, String> {
+    let paths = p2p_paths(&app)?;
+    app.state::<p2p::P2p>().stop().await;
+    let mut saved = p2p::Saved::load(&paths);
+    if let Some(token) = p2p::read_token(&paths) {
+        session.revoke_token(&saved.server_url, &token).await;
+    }
+    p2p::remove_token(&paths);
+    let _ = std::fs::remove_file(paths.secret_file());
+    p2p::forget_peer_key(&saved.server_url);
+    saved.enabled = false;
+    saved.token_at = None;
+    saved.save(&paths)?;
+    p2p_state(app, session).await
+}
+
+/// One call from the P2P screens to the daemon: consent decisions,
+/// settings, activity. The daemon side of the allow list is in `p2p.rs`.
+#[tauri::command]
+async fn p2p_call(app: AppHandle, method: String, params: Option<Value>) -> Result<Value, String> {
+    app.state::<p2p::P2p>()
+        .call(&method, params.unwrap_or_else(|| serde_json::json!({})))
+        .await
+}
+
+/// Rotates the daemon's token once it is older than a week. The daemon
+/// reads the file on every request, so nothing has to be restarted.
+async fn rotate_p2p_token(app: &AppHandle) -> Result<(), String> {
+    let session = app.state::<Session>();
+    let paths = p2p_paths(app)?;
+    let mut saved = p2p::Saved::load(&paths);
+    let now = claude::now_secs();
+    let due = saved
+        .token_at
+        .is_none_or(|at| now.saturating_sub(at) >= CLAUDE_ROTATE_AFTER.as_secs());
+    let (true, true, Some(token)) = (saved.enabled, due, p2p::read_token(&paths)) else {
+        return Ok(());
+    };
+    match session.rotate_token(&saved.server_url, &token).await? {
+        Some(new_token) => {
+            if let Err(err) = p2p::write_token(&paths, &new_token) {
+                session.revoke_token(&saved.server_url, &new_token).await;
+                return Err(err);
+            }
+            saved.token_at = Some(now);
+            saved.save(&paths)
+        }
+        // Expired or revoked: P2P stops until the user turns it on again.
+        None => {
+            app.state::<p2p::P2p>().stop().await;
+            saved.enabled = false;
+            saved.save(&paths)?;
+            let _ = app.emit(P2P_EXPIRED_EVENT, ());
+            Ok(())
+        }
+    }
 }
 
 #[tauri::command]
@@ -238,7 +421,14 @@ async fn connect_claude(
                 return Err(err);
             }
         };
-        let env = claude::server_env(&server_url, &token_file, &org_id, allow_writes);
+        let mut env = claude::server_env(&server_url, &token_file, &org_id, allow_writes);
+        // With P2P on, Claude also gets the tools to talk to teammates'
+        // agents, through this app's daemon.
+        let p2p_paths = p2p_paths(&app)?;
+        let p2p_saved = p2p::Saved::load(&p2p_paths);
+        if p2p_saved.enabled && p2p_saved.server_url == server_url {
+            env.extend(p2p::mcp_env(&p2p_paths, &p2p_saved));
+        }
         let written = match target {
             claude::Target::Code => claude::connect_code(&paths, &binary, &env),
             claude::Target::Desktop => claude::connect_desktop(&paths, &binary, &env),
@@ -265,6 +455,16 @@ async fn delete_account(app: AppHandle, session: State<'_, Session>, email: Stri
         session.dev_login(&server_url, &email).await?
     };
     session.delete_account(&server_url, &session_token).await?;
+    // The account's peers and tokens are gone on the server; stop acting
+    // as one of them.
+    app.state::<p2p::P2p>().stop().await;
+    if let Ok(paths) = p2p_paths(&app) {
+        p2p::remove_token(&paths);
+        p2p::forget_peer_key(&server_url);
+        let mut saved = p2p::Saved::load(&paths);
+        saved.enabled = false;
+        let _ = saved.save(&paths);
+    }
 
     let _config = CLAUDE_CONFIG_LOCK.lock().await;
     let paths = claude_paths(&app)?;
@@ -352,6 +552,7 @@ fn main() {
         .setup(|app| {
             let settings = app.path().app_config_dir()?.join("settings.json");
             app.manage(Session::load(settings)?);
+            app.manage(p2p::P2p::default());
 
             let handle = app.handle().clone();
             let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
@@ -386,7 +587,24 @@ fn main() {
                         Ok(_) => {}
                         Err(err) => eprintln!("nanace: Claude token renewal failed: {err}"),
                     }
+                    if let Err(err) = rotate_p2p_token(&handle).await {
+                        eprintln!("nanace: P2P token renewal failed: {err}");
+                    }
                     tokio::time::sleep(CLAUDE_ROTATION_CHECK).await;
+                }
+            });
+            // Keeps the P2P daemon running while P2P is on, and stopped
+            // otherwise. The daemon itself stops when this app exits.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut reported = String::new();
+                loop {
+                    let outcome = p2p_reconcile(&handle).await.err().unwrap_or_default();
+                    if outcome != reported && !outcome.is_empty() {
+                        eprintln!("nanace: P2P daemon: {outcome}");
+                    }
+                    reported = outcome;
+                    tokio::time::sleep(P2P_WATCHDOG).await;
                 }
             });
             Ok(())
@@ -403,7 +621,11 @@ fn main() {
             claude_status,
             connect_claude,
             disconnect_claude,
-            delete_account
+            delete_account,
+            p2p_state,
+            p2p_enable,
+            p2p_disable,
+            p2p_call
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {

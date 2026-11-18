@@ -83,8 +83,11 @@ PROJECT-2345` records what was done in the current session on the task's page
 (appending a dated section, or creating the page). It treats each team as a
 wiki: before writing it reads the team's `Wiki: Schema` page (page types, title
 prefixes, templates, tags), and afterwards it updates the related `Topic:` page
-and `Wiki: Index`. A team without a schema is initialized from
-`schema-template.md`, and the new schema is marked as the default for review.
+and `Wiki: Index`. `Wiki:` pages are edited only by the teamspace owner (team
+role `admin`): for the owner, a team without a schema is initialized from
+`schema-template.md` and marked as the default for review; for anyone else the
+skill creates no `Wiki:` page and ends with the lines for the owner to add to
+the index.
 It needs the write tools (**Allow Claude to create and edit pages**).
 
 Install or update the MCP server binary and the skill, and connect Claude Code
@@ -153,6 +156,106 @@ To install the skill from a local clone instead of GitHub:
 NANACE_BASE_URL="file://$PWD/integrations/claude-code/skills/nanace" integrations/claude-code/install.sh
 ```
 
+## Agents (P2P)
+
+Agents of teammates can ask each other questions directly: Claude Code on
+one laptop asks, Claude Code on another answers, after that laptop's owner
+agreed. The text travels between the two machines; nanace records who talked
+to whom, never what was said. Everything is off until it is turned on in
+three places.
+
+1. **The installation runs a network node.** `nanace-p2p node` is a relay
+   that laptops behind NAT are reached through. It asks the server which
+   peers may connect, on a listener that must not be public:
+
+   ```bash
+   # server
+   NANACE_INTERNAL_BIND=10.0.0.5:9191
+   NANACE_P2P_NODE_SECRET=<openssl rand -base64 48>
+   NANACE_P2P_BOOTSTRAP=/dns4/p2p.example.com/udp/4001/quic-v1/p2p/<node peer id>
+
+   # node (print its peer id with: nanace-p2p peer-id)
+   NANACE_P2P_KEY_FILE=/var/lib/nanace-p2p/node.key
+   NANACE_P2P_LISTEN=/ip4/0.0.0.0/udp/4001/quic-v1,/ip4/0.0.0.0/tcp/4001
+   NANACE_P2P_EXTERNAL_ADDRS=/dns4/p2p.example.com/udp/4001/quic-v1,/dns4/p2p.example.com/tcp/4001
+   NANACE_INTERNAL_URL=http://10.0.0.5:9191
+   NANACE_P2P_NODE_SECRET_FILE=/run/secrets/nanace-p2p-node
+   ```
+
+2. **The teamspace owner creates the page `Policy: P2P`.** Its first
+   ```` ```yaml p2p-policy ```` block says who may message whom (by team
+   role), the limits, and how freely requests may be accepted. The desktop
+   app offers the template; `Policy:` and `Wiki:` pages are edited only by
+   the owner.
+
+3. **Each person turns it on in the desktop app** (*Agents (P2P)*): which
+   teams, and whether to be asked for every request. After that, *Connect to
+   Claude* gives Claude the `p2p_*` tools.
+
+Without the desktop app, the installer sets up the daemon as a service of
+your user (launchd on macOS, `systemd --user` on Linux) and gives Claude
+Code the `p2p_*` tools:
+
+```bash
+NANACE_P2P=1 NANACE_API_URL=https://nanace.example.com \
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.sh)"
+```
+
+It asks for a second token with the scope `p2p` and for the teams to take
+part in. This daemon has no window to ask you about a request, so it answers
+on its own within the policy: the team owner must list your account under
+`server_peers.users` and set `max_accept_mode: team`. Windows has no such
+mode yet; use the desktop app there.
+
+To try it between two computers, run that command on both, signed in as two
+members of one team, then on each:
+
+```bash
+export NANACE_P2P_DIR=~/.local/share/nanace/p2p
+nanace-p2p call whoami   # peer id, org and team ids
+nanace-p2p call find_peers '{"org_id":"<org id>","team_id":"<team id>"}'   # the other computer
+```
+
+and ask Claude on one of them to message the other (`p2p_peers`, `p2p_ask`);
+the other's Claude reads it with `p2p_inbox` and answers with `p2p_reply`.
+The owner sees the exchange, without its text, in the team's journal. From a
+clone, `NANACE_LOCAL_BIN_DIR=target/release` installs binaries you built
+instead of a release.
+
+An agent without a person, in a container, runs the same daemon with the
+team role `agent` and a `p2p`-scoped token:
+
+```bash
+NANACE_API_URL=https://kb.example.com
+NANACE_TOKEN_FILE=/run/secrets/nanace-p2p.token
+NANACE_P2P_DIR=/var/lib/nanace-p2p
+NANACE_P2P_BOOTSTRAP=/dns4/p2p.example.com/udp/4001/quic-v1/p2p/<node peer id>
+NANACE_P2P_KIND=server
+NANACE_P2P_TEAMS=<org id>:<team id>:team
+nanace-p2p daemon
+```
+
+Its account must be listed under `server_peers` in the team policy. Keep
+`NANACE_P2P_DIR` on a volume: it holds the peer key, and a new key on every
+restart leaves a bound peer behind each time. `nanace-mcp` in the same
+container gets `NANACE_ALLOW_P2P=true`, `NANACE_P2P_SOCKET=$NANACE_P2P_DIR/p2p.sock`
+and `NANACE_P2P_SECRET_FILE=$NANACE_P2P_DIR/ipc.secret`.
+
+Check a running daemon by hand with `nanace-p2p call whoami`.
+
+What to know before relying on it:
+
+- A request is delivered only when both daemons are online at the same time
+  before it expires; there is no mailbox on the server.
+- Secrets are blocked by pattern in both directions. That catches known
+  formats, not every secret.
+- Messages from other agents are data for the model, not instructions. That
+  is stated to the model and cannot be enforced on it.
+
+Conventions for summary pages and an example verdict agent are in
+`integrations/claude-code/p2p/`. Design and threat model:
+`docs/adr/0001-p2p.md`.
+
 ## Desktop app
 
 Requires Node 20+ and the Rust toolchain. With the API running:
@@ -177,7 +280,10 @@ docker pull ghcr.io/felichita/nanace-server:latest   # or :0.1.2, :0.1
 ```
 
 The image runs `nanace-server` as a non-root user on port 8080 and has the
-embedding model baked in, so it starts without internet access. It does not
+embedding model baked in, so it starts without internet access. It also has
+`nanace-p2p`: run the P2P network node from the same image as a second
+container with the entrypoint `nanace-p2p` and the command `node` (key on a
+volume at `/var/lib/nanace-p2p`, port 4001 TCP and UDP). It does not
 contain `nanace-mcp`: Claude runs that on each user's machine (it ships with
 the desktop app and the release archives) and points it at the server. Configure it with the same environment variables as
 `.env.example` (`DATABASE_URL`, `QDRANT_URL`, `NANACE_JWT_SECRET`,
@@ -193,6 +299,19 @@ stack (API server, PostgreSQL, Qdrant) with Docker Compose:
 make up      # docker compose --profile app up -d --build; settings from .env
 make logs    # follow the server logs
 make down    # stop it (data volumes are kept)
+```
+
+With the P2P network node as well:
+
+```bash
+echo "NANACE_P2P_NODE_SECRET=$(openssl rand -base64 48)" >> .env
+# the node's peer id (creates its key on the first run)
+docker compose --profile p2p run --rm --no-deps p2p-node peer-id
+# add to .env, with the address agents reach this machine at:
+#   NANACE_P2P_BOOTSTRAP=/dns4/p2p.example.com/udp/4001/quic-v1/p2p/<peer id>
+#   NANACE_P2P_EXTERNAL_ADDRS=/dns4/p2p.example.com/udp/4001/quic-v1,/dns4/p2p.example.com/tcp/4001
+#   NANACE_HOST_BIND=0.0.0.0     # the node must be reachable from outside (this also publishes the API port)
+make up-p2p
 ```
 
 The server listens on `127.0.0.1:8080`; set `NANACE_HOST_BIND=0.0.0.0` to

@@ -1,6 +1,6 @@
 ---
 name: nanace
-description: Save a work log of the current task to the nanace knowledge base, e.g. `/nanace project-2345`. Reads the team's `Wiki: Schema` first (initializes the wiki if it has none), finds the task's page by its key and appends a dated section or creates the page, then updates the related Topic and `Wiki: Index`. Use when the user asks to record, log or save what was done for a task in nanace.
+description: Save a work log of the current task to the nanace knowledge base, e.g. `/nanace project-2345`. Reads the team's `Wiki: Schema` first (the teamspace owner initializes the wiki if it has none), finds the task's page by its key and appends a dated section or creates the page, then updates the related Topic and, for the owner, `Wiki: Index`. Use when the user asks to record, log or save what was done for a task in nanace.
 argument-hint: <task-key> [what to focus on]
 ---
 
@@ -56,6 +56,12 @@ next to `Wiki: Index` (catalog). The schema is the authority on page types,
 title prefixes, templates, tags and links; follow it over the defaults in this
 skill wherever they differ.
 
+`Wiki:` pages (like `Policy:` pages) are edited only by the **teamspace
+owner**: the user whose role in that team is `admin` in `list_teams`. Writers
+and readers can read them. Note the user's role in the team you pick; steps 2
+and 5 depend on it. Never work around this by saving under a similar title
+(`Wiki-Index`, `Index draft`, …).
+
 1. Pick the team: the only team the user can write to; otherwise the team that
    clearly matches the work (for example `platform`) from `list_teams`; ask the
    user when it is not clear.
@@ -63,8 +69,13 @@ skill wherever they differ.
    (page through with `offset` if needed; match the titles exactly). Do not
    rely on `search_contexts` for this.
 3. `get_context` the `Wiki: Schema` page and read it before writing anything.
-4. **No schema, or its body is empty** (blank or only whitespace): initialize
-   the wiki.
+4. **No schema, or its body is empty** (blank or only whitespace), and the
+   user is **not** the teamspace owner: do not create anything. Use
+   [schema-template.md](schema-template.md) in this skill's directory as the
+   schema for this run, and tell the user in the report that the team has no
+   `Wiki: Schema` and that its owner can create it by running `/nanace`.
+5. **No schema, or its body is empty**, and the user **is** the teamspace
+   owner: initialize the wiki.
    - Create or fill `Wiki: Schema` from [schema-template.md](schema-template.md)
      in this skill's directory, with `{{DATE}}` replaced by today's date. The
      template keeps its note that it was initialized automatically. Tags:
@@ -134,12 +145,18 @@ not changing, and on a conflict read it again and retry once. At minimum:
 1. **Topic**: if a `Topic:` page covers this task, update it — add the task link
    if missing, adjust "Current state" / "Open items" when this session changed
    them. Do not create a new Topic just for one task.
-2. **Index**: if the task page is new (or any other page was created), add it to
-   `Wiki: Index` under the right section with a one-line summary; for task rows
-   also update the status when it changed.
+2. **Index**: if the task page is new (or any other page was created), it
+   belongs in `Wiki: Index` under the right section with a one-line summary;
+   for task rows the status is updated when it changed.
+   - **Teamspace owner**: make the change in `Wiki: Index`.
+   - **Anyone else**: do not try to edit it. Put the exact lines to add or
+     change in the report, under "For the teamspace owner to add to
+     `Wiki: Index`", so the owner can paste them.
 
 ## 6. Report
 
 Tell the user whether the task page was created or appended to, its title, team
 and `context_id`, which Topic/Index pages were updated, whether the wiki was
-initialized in step 2, and give a 2–3 line summary of what was recorded.
+initialized in step 2, and give a 2–3 line summary of what was recorded. When
+the user is not the teamspace owner, end with the `Wiki: Index` lines for the
+owner (step 5) and, if the team has no schema, say so.

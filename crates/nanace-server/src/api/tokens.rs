@@ -4,11 +4,11 @@ use nanace_core::validate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::AppState;
 use crate::audit::{self, AuditEvent};
-use crate::auth::{AuthMethod, AuthUser, PAT_PREFIX, TokenScope};
+use crate::auth::{AnyScopeUser, AuthMethod, AuthUser, PAT_PREFIX, TokenScope};
 use crate::error::{ApiError, ApiResult};
 use crate::secret::{random_token, sha256_hex};
+use crate::{AppState, db};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/me/tokens", web::post().to(create_token))
@@ -133,7 +133,7 @@ async fn revoke_token(state: web::Data<AppState>, user: AuthUser, path: web::Pat
 
 /// Revokes the token that authenticates this request (sign-out for clients
 /// such as the desktop app). Any scope may revoke itself.
-async fn revoke_current_token(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+async fn revoke_current_token(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let AuthMethod::Token { id, .. } = user.method else {
         return Err(ApiError::BadRequest(
             "request is not authenticated with a token".to_owned(),
@@ -150,7 +150,7 @@ const ROTATION_GRACE_HOURS: i32 = 24;
 /// same name, scope and lifetime. Lets clients rotate credentials without an
 /// interactive session; the rotation chain still ends one year after the
 /// first token was issued, and a token can be rotated only once.
-async fn rotate_current_token(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+async fn rotate_current_token(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let AuthMethod::Token { id, .. } = user.method else {
         return Err(ApiError::BadRequest(
             "request is not authenticated with a token".to_owned(),
@@ -219,19 +219,20 @@ async fn rotate_current_token(state: web::Data<AppState>, user: AuthUser) -> Api
 /// Revokes the token and every other token of its rotation chain.
 async fn revoke(state: &AppState, user: &AuthUser, token_id: Uuid) -> ApiResult<HttpResponse> {
     let mut tx = state.pool.begin().await?;
-    let revoked = sqlx::query(
+    let chains: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE api_tokens SET revoked_at = now() \
          WHERE user_id = $2 AND revoked_at IS NULL AND chain_id = \
-               (SELECT chain_id FROM api_tokens WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL)",
+               (SELECT chain_id FROM api_tokens WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL) \
+         RETURNING chain_id",
     )
     .bind(token_id)
     .bind(user.user_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if revoked == 0 {
+    .fetch_all(&mut *tx)
+    .await?;
+    let Some(chain_id) = chains.first().copied() else {
         return Err(ApiError::NotFound);
-    }
+    };
+    let revoked = chains.len();
     audit::record(
         &mut *tx,
         AuditEvent {
@@ -244,6 +245,14 @@ async fn revoke(state: &AppState, user: &AuthUser, token_id: Uuid) -> ApiResult<
         },
     )
     .await?;
+    // A P2P peer announced with this token stops being present with it. Last
+    // in the transaction: from here on it runs under row-level security.
+    db::enter_user_scope(&mut tx, user.user_id).await?;
+    sqlx::query("DELETE FROM p2p_presence WHERE user_id = $1 AND auth_chain_id = $2")
+        .bind(user.user_id)
+        .bind(chain_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(HttpResponse::NoContent().finish())
 }

@@ -1,4 +1,4 @@
-.PHONY: deps deps-down up down logs fmt fmt-check lint test test-integration test-model check run desktop-deps desktop-dev desktop-build desktop-check
+.PHONY: deps deps-down up up-p2p down logs fmt fmt-check lint test test-integration test-model check run desktop-deps desktop-dev desktop-build desktop-check
 
 DESKTOP := apps/desktop
 
@@ -11,8 +11,11 @@ deps-down: ## Stop dependencies (keeps volumes)
 up: ## Build and run the API server in Docker with PostgreSQL and Qdrant
 	docker compose --profile app up -d --build --wait
 
+up-p2p: ## The same plus the P2P network node (needs NANACE_P2P_NODE_SECRET in .env)
+	docker compose --profile app --profile p2p up -d --build --wait
+
 down: ## Stop the Docker stack (keeps volumes)
-	docker compose --profile app down
+	docker compose --profile app --profile p2p down
 
 logs: ## Follow the API server logs
 	docker compose logs -f server
@@ -29,19 +32,19 @@ lint:
 test: ## Unit tests; no external services
 	cargo test --workspace
 
-test-integration: deps ## API, RLS and MCP tests against compose services
+test-integration: deps ## API, RLS, MCP and P2P tests against compose services
 	# qdrant-test keeps data in memory: start it empty and stop it afterwards
 	# (even when tests fail) so test collections do not hold RAM.
 	docker compose --profile test up -d --force-recreate qdrant-test
 	until curl -sf http://127.0.0.1:6335/readyz >/dev/null; do sleep 0.5; done
-	cargo test -p nanace-server -p nanace-mcp -- --ignored; status=$$?; docker compose --profile test stop qdrant-test; exit $$status
+	cargo test -p nanace-server -p nanace-mcp -p nanace-p2p -- --ignored; status=$$?; docker compose --profile test stop qdrant-test; exit $$status
 
 test-model: ## Real bge-small-en-v1.5 test; downloads the model on first run
 	cargo test -p nanace-embed -- --ignored
 
 check: fmt-check lint test ## Fast local gate
 
-desktop-deps: ## npm packages and the bundled MCP server (Tauri sidecar)
+desktop-deps: ## npm packages and the bundled sidecars (MCP server, P2P daemon)
 	cd $(DESKTOP) && npm ci && npm run mcp
 
 desktop-dev: desktop-deps ## Run the desktop app against the API

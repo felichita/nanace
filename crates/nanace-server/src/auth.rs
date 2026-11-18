@@ -98,6 +98,9 @@ pub enum TokenScope {
     Read,
     /// Everything the user's roles allow.
     Write,
+    /// The peer registry only: binding a peer, presence, lookups, `GET /me`
+    /// and rotating or revoking itself. No access to pages.
+    P2p,
 }
 
 impl TokenScope {
@@ -105,6 +108,7 @@ impl TokenScope {
         match self {
             Self::Read => "read",
             Self::Write => "write",
+            Self::P2p => "p2p",
         }
     }
 }
@@ -118,8 +122,10 @@ pub enum AuthMethod {
 }
 
 /// The authenticated caller. Extracting it rejects requests without a valid
-/// session JWT or personal access token. Any token scope may read; handlers
-/// that change state take [`WriteUser`] instead.
+/// session JWT or personal access token, and tokens of scope `p2p`, which
+/// reach only the handlers that take [`AnyScopeUser`] or [`PeerUser`]. A
+/// `read` or `write` token may read; handlers that change state take
+/// [`WriteUser`] instead.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: Uuid,
@@ -159,6 +165,7 @@ async fn authenticate_pat(state: &AppState, token: &str) -> ApiResult<AuthUser> 
     let scope = match scope.as_str() {
         "read" => TokenScope::Read,
         "write" => TokenScope::Write,
+        "p2p" => TokenScope::P2p,
         other => return Err(anyhow::anyhow!("unknown token scope `{other}`").into()),
     };
     // Coarse last-use tracking: at most one write per token per minute.
@@ -176,32 +183,104 @@ async fn authenticate_pat(state: &AppState, token: &str) -> ApiResult<AuthUser> 
     })
 }
 
+impl AuthUser {
+    fn has_scope(&self, scope: TokenScope) -> bool {
+        matches!(self.method, AuthMethod::Token { scope: s, .. } if s == scope)
+    }
+}
+
 impl FromRequest for AuthUser {
     type Error = ApiError;
     type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
-        let state = req.app_data::<web::Data<AppState>>().cloned();
-        let token = bearer(req);
+        let user = authenticate(req);
         Box::pin(async move {
-            let (Some(state), Some(token)) = (state, token) else {
-                return Err(ApiError::Unauthorized);
-            };
-            if token.starts_with(PAT_PREFIX) {
-                authenticate_pat(&state, &token).await
-            } else {
-                let user = state.jwt.verify(&token).ok_or(ApiError::Unauthorized)?;
-                // Sessions are stateless; a deleted account must still stop
-                // working before its session expires.
-                let active: Option<bool> = sqlx::query_scalar("SELECT deleted_at IS NULL FROM users WHERE id = $1")
-                    .bind(user.user_id)
-                    .fetch_optional(&state.pool)
-                    .await?;
-                if active != Some(true) {
-                    return Err(ApiError::Unauthorized);
-                }
-                Ok(user)
+            let user = user.await?;
+            // Fail closed: a `p2p` token reaches only handlers that opt in.
+            if user.has_scope(TokenScope::P2p) {
+                return Err(ApiError::Forbidden);
             }
+            Ok(user)
+        })
+    }
+}
+
+/// Identifies the caller from the request, whatever the token's scope.
+fn authenticate(req: &HttpRequest) -> LocalBoxFuture<'static, ApiResult<AuthUser>> {
+    let state = req.app_data::<web::Data<AppState>>().cloned();
+    let token = bearer(req);
+    Box::pin(async move {
+        let (Some(state), Some(token)) = (state, token) else {
+            return Err(ApiError::Unauthorized);
+        };
+        if token.starts_with(PAT_PREFIX) {
+            authenticate_pat(&state, &token).await
+        } else {
+            let user = state.jwt.verify(&token).ok_or(ApiError::Unauthorized)?;
+            // Sessions are stateless; a deleted account must still stop
+            // working before its session expires.
+            let active: Option<bool> = sqlx::query_scalar("SELECT deleted_at IS NULL FROM users WHERE id = $1")
+                .bind(user.user_id)
+                .fetch_optional(&state.pool)
+                .await?;
+            if active != Some(true) {
+                return Err(ApiError::Unauthorized);
+            }
+            Ok(user)
+        }
+    })
+}
+
+/// An authenticated caller with any token scope, `p2p` included. Only for
+/// what every token may do: identify itself (`GET /me`), rotate or revoke
+/// itself, and read the peer registry.
+#[derive(Debug, Clone)]
+pub struct AnyScopeUser(pub AuthUser);
+
+impl Deref for AnyScopeUser {
+    type Target = AuthUser;
+
+    fn deref(&self) -> &AuthUser {
+        &self.0
+    }
+}
+
+impl FromRequest for AnyScopeUser {
+    type Error = ApiError;
+    type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        let user = authenticate(req);
+        Box::pin(async move { Ok(Self(user.await?)) })
+    }
+}
+
+/// An authenticated caller allowed to change the peer registry: a session,
+/// or a token with `write` or `p2p` scope.
+#[derive(Debug, Clone)]
+pub struct PeerUser(pub AuthUser);
+
+impl Deref for PeerUser {
+    type Target = AuthUser;
+
+    fn deref(&self) -> &AuthUser {
+        &self.0
+    }
+}
+
+impl FromRequest for PeerUser {
+    type Error = ApiError;
+    type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        let user = authenticate(req);
+        Box::pin(async move {
+            let user = user.await?;
+            if user.has_scope(TokenScope::Read) {
+                return Err(ApiError::Forbidden);
+            }
+            Ok(Self(user))
         })
     }
 }

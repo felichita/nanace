@@ -7,6 +7,8 @@ use nanace_embed::{Embedder, FastEmbedder, HashingEmbedder};
 use nanace_server::auth::JwtKeys;
 use nanace_server::config::{Config, EmbedderKind};
 use nanace_server::oauth::GoogleOAuth;
+use nanace_server::p2p::P2pState;
+use nanace_server::ratelimit::RateLimiter;
 use nanace_server::upgrades::{self, Status};
 use nanace_server::vectors::VectorStore;
 use nanace_server::{AppState, LOG_COMPONENT, api, db, metrics};
@@ -113,7 +115,57 @@ async fn main() -> anyhow::Result<()> {
         frontend_url: config.frontend_url.clone(),
         secure_cookies: config.public_url.starts_with("https://"),
         trash_retention_days: config.trash_retention_days,
+        p2p: P2pState::new(
+            &config.jwt_secret,
+            config.p2p_presence_max_ttl_secs,
+            config.p2p_max_peers_per_user,
+        )
+        .with_node_secret(config.p2p_node_secret.clone())
+        .with_bootstrap(config.p2p_bootstrap.clone()),
+        rate_limiter: RateLimiter::default(),
     });
+
+    {
+        let pool = state.pool.clone();
+        actix_web::rt::spawn(async move {
+            loop {
+                match nanace_server::p2p::sweep_presence(&pool).await {
+                    Ok(0) => {}
+                    Ok(expired) => tracing::debug!(
+                        event = "p2p_presence_swept",
+                        component = LOG_COMPONENT,
+                        expired,
+                        "expired P2P presence removed"
+                    ),
+                    Err(err) => tracing::warn!(
+                        event = "p2p_presence_sweep_failed",
+                        component = LOG_COMPONENT,
+                        error = %format!("{err:#}"),
+                        "P2P presence sweep failed; retrying later"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+    {
+        let pool = state.pool.clone();
+        let days = config.p2p_exchange_retention_days;
+        actix_web::rt::spawn(async move {
+            loop {
+                if let Err(err) = nanace_server::p2p::sweep_exchanges(&pool, days).await {
+                    tracing::warn!(
+                        event = "p2p_exchange_sweep_failed",
+                        component = LOG_COMPONENT,
+                        error = %format!("{err:#}"),
+                        "P2P exchange retention failed; retrying later"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+    let internal_state = state.clone();
 
     if config.trash_retention_days > 0 {
         let pool = state.pool.clone();
@@ -156,16 +208,31 @@ async fn main() -> anyhow::Result<()> {
     })
     .bind(config.bind)?
     .run();
-    match config.metrics_bind {
-        Some(bind) => {
-            tracing::info!(event = "metrics_start", component = LOG_COMPONENT, bind = %bind, "serving metrics");
-            let metrics = HttpServer::new(|| App::new().route("/metrics", web::get().to(metrics::metrics_handler)))
-                .workers(1)
-                .bind(bind)?
-                .run();
-            tokio::try_join!(api, metrics)?;
-        }
-        None => api.await?,
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(api);
+    if let Some(bind) = config.metrics_bind {
+        tracing::info!(event = "metrics_start", component = LOG_COMPONENT, bind = %bind, "serving metrics");
+        let metrics = HttpServer::new(|| App::new().route("/metrics", web::get().to(metrics::metrics_handler)))
+            .workers(1)
+            .bind(bind)?
+            .run();
+        servers.spawn(metrics);
+    }
+    if let Some(bind) = config.internal_bind {
+        tracing::info!(event = "internal_start", component = LOG_COMPONENT, bind = %bind, "serving the P2P node API");
+        let internal = HttpServer::new(move || {
+            App::new()
+                .app_data(internal_state.clone())
+                .configure(api::configure_internal)
+        })
+        .workers(1)
+        .bind(bind)?
+        .run();
+        servers.spawn(internal);
+    }
+    // The first listener to stop, cleanly or not, stops the process.
+    if let Some(stopped) = servers.join_next().await {
+        stopped.context("server task failed")??;
     }
     Ok(())
 }

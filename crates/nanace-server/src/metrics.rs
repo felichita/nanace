@@ -7,6 +7,11 @@
 //!   path, so ids do not become label values.
 //! - `nanace_embedding_duration_seconds{kind}`: model time for `passage`
 //!   (saving pages, reindex) and `query` (search) embeddings.
+//! - `nanace_p2p_active_peers`: peers present in at least one team, as of the
+//!   last presence sweep. `nanace_p2p_peer_binds_total` and
+//!   `nanace_p2p_presence_starts_total` count new bindings and presences;
+//!   `nanace_p2p_policy_denials_total{reason}` counts presence a team policy
+//!   refused.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -17,13 +22,20 @@ use actix_web::middleware::Next;
 use actix_web::{Error, HttpResponse};
 use async_trait::async_trait;
 use nanace_embed::{EmbedError, Embedder};
-use prometheus::{Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+};
 
 struct Metrics {
     registry: Registry,
     requests: IntCounterVec,
     request_seconds: HistogramVec,
     embedding_seconds: HistogramVec,
+    p2p_active_peers: IntGauge,
+    p2p_peer_binds: IntCounter,
+    p2p_presence_starts: IntCounter,
+    p2p_policy_denials: IntCounterVec,
+    p2p_exchanges: IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -44,10 +56,31 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["kind"],
     )
     .expect("valid metric");
+    let p2p_active_peers =
+        IntGauge::new("nanace_p2p_active_peers", "Peers present in at least one team").expect("valid metric");
+    let p2p_peer_binds =
+        IntCounter::new("nanace_p2p_peer_binds_total", "Peer ids bound to a user").expect("valid metric");
+    let p2p_presence_starts =
+        IntCounter::new("nanace_p2p_presence_starts_total", "Team presences started").expect("valid metric");
+    let p2p_policy_denials = IntCounterVec::new(
+        Opts::new("nanace_p2p_policy_denials_total", "Presence refused by a team policy"),
+        &["reason"],
+    )
+    .expect("valid metric");
+    let p2p_exchanges = IntCounterVec::new(
+        Opts::new("nanace_p2p_exchanges_total", "P2P exchange reports by kind and status"),
+        &["kind", "status"],
+    )
+    .expect("valid metric");
     for collector in [
         Box::new(requests.clone()) as Box<dyn prometheus::core::Collector>,
         Box::new(request_seconds.clone()),
         Box::new(embedding_seconds.clone()),
+        Box::new(p2p_active_peers.clone()),
+        Box::new(p2p_peer_binds.clone()),
+        Box::new(p2p_presence_starts.clone()),
+        Box::new(p2p_policy_denials.clone()),
+        Box::new(p2p_exchanges.clone()),
     ] {
         registry.register(collector).expect("metric registered once");
     }
@@ -56,6 +89,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         requests,
         request_seconds,
         embedding_seconds,
+        p2p_active_peers,
+        p2p_peer_binds,
+        p2p_presence_starts,
+        p2p_policy_denials,
+        p2p_exchanges,
     }
 });
 
@@ -81,6 +119,28 @@ pub async fn track(
         .with_label_values(&[method.as_str(), route.as_str()])
         .observe(started.elapsed().as_secs_f64());
     Ok(response)
+}
+
+pub fn set_p2p_active_peers(peers: i64) {
+    METRICS.p2p_active_peers.set(peers);
+}
+
+pub fn p2p_peer_bound() {
+    METRICS.p2p_peer_binds.inc();
+}
+
+pub fn p2p_presence_started() {
+    METRICS.p2p_presence_starts.inc();
+}
+
+/// Both labels are fixed words from closed sets.
+pub fn p2p_exchange_reported(kind: &'static str, status: &'static str) {
+    METRICS.p2p_exchanges.with_label_values(&[kind, status]).inc();
+}
+
+/// `reason` is a fixed word, never caller input.
+pub fn p2p_policy_denied(reason: &'static str) {
+    METRICS.p2p_policy_denials.with_label_values(&[reason]).inc();
 }
 
 /// Prometheus text exposition of every metric.

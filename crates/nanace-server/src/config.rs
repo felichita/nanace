@@ -47,6 +47,20 @@ pub struct Config {
     pub metrics_bind: Option<SocketAddr>,
     /// Days a context stays in the trash before it is purged; 0 keeps it.
     pub trash_retention_days: u32,
+    /// Longest presence TTL a P2P peer may ask for, in seconds.
+    pub p2p_presence_max_ttl_secs: u32,
+    /// Unrevoked P2P peers one user may have bound.
+    pub p2p_max_peers_per_user: u32,
+    /// Days the P2P exchange journal is kept; a team policy can shorten it.
+    pub p2p_exchange_retention_days: u32,
+    /// Listener for the P2P network node's allow-list requests, never
+    /// exposed publicly. Set together with the node secret.
+    pub internal_bind: Option<SocketAddr>,
+    /// Shared secret of the P2P network node.
+    pub p2p_node_secret: Option<SecretString>,
+    /// Public address of the P2P network node, ending in `/p2p/<peer id>`,
+    /// handed to daemons.
+    pub p2p_bootstrap: Option<String>,
     pub database_url: SecretString,
     pub qdrant_url: String,
     pub jwt_secret: SecretString,
@@ -124,7 +138,44 @@ impl Config {
             }),
         };
 
+        let internal_bind: Option<SocketAddr> = get("NANACE_INTERNAL_BIND")
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.parse())
+            .transpose()
+            .context("NANACE_INTERNAL_BIND must be a socket address")?;
+        let p2p_node_secret = get("NANACE_P2P_NODE_SECRET")
+            .filter(|v| !v.is_empty())
+            .map(SecretString::from);
+        match (&internal_bind, &p2p_node_secret) {
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("NANACE_INTERNAL_BIND and NANACE_P2P_NODE_SECRET must be set together")
+            }
+            (Some(_), Some(secret)) if secret.expose_secret().len() < MIN_JWT_SECRET_BYTES => {
+                bail!("NANACE_P2P_NODE_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes")
+            }
+            _ => {}
+        }
+
         Ok(Self {
+            internal_bind,
+            p2p_node_secret,
+            p2p_bootstrap: get("NANACE_P2P_BOOTSTRAP")
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    if v.starts_with('/') && v.contains("/p2p/") {
+                        Ok(v)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "NANACE_P2P_BOOTSTRAP must be a multiaddr ending in /p2p/<node peer id>"
+                        ))
+                    }
+                })
+                .transpose()?,
+            p2p_exchange_retention_days: get("NANACE_P2P_EXCHANGE_RETENTION_DAYS")
+                .map(|v| v.trim().parse::<u32>().ok().filter(|d| (1..=365).contains(d)))
+                .unwrap_or(Some(30))
+                .context("NANACE_P2P_EXCHANGE_RETENTION_DAYS must be 1-365")?,
             bind: get("NANACE_BIND")
                 .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
                 .parse()
@@ -133,6 +184,14 @@ impl Config {
                 .map(|v| v.trim().parse::<u32>().ok().filter(|d| *d <= 3650))
                 .unwrap_or(Some(7))
                 .context("NANACE_TRASH_RETENTION_DAYS must be 0-3650 (0 keeps trash forever)")?,
+            p2p_presence_max_ttl_secs: get("NANACE_P2P_PRESENCE_MAX_TTL_SECS")
+                .map(|v| v.trim().parse::<u32>().ok().filter(|s| (30..=600).contains(s)))
+                .unwrap_or(Some(120))
+                .context("NANACE_P2P_PRESENCE_MAX_TTL_SECS must be 30-600")?,
+            p2p_max_peers_per_user: get("NANACE_P2P_MAX_PEERS_PER_USER")
+                .map(|v| v.trim().parse::<u32>().ok().filter(|n| (1..=1000).contains(n)))
+                .unwrap_or(Some(10))
+                .context("NANACE_P2P_MAX_PEERS_PER_USER must be 1-1000")?,
             metrics_bind: get("NANACE_METRICS_BIND")
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| v.parse())
@@ -208,6 +267,40 @@ mod tests {
         assert!(config(&[("NANACE_METRICS_BIND", "not-an-address")]).is_err());
         assert!(config(&[("NANACE_TRASH_RETENTION_DAYS", "-1")]).is_err());
         assert!(config(&[("NANACE_TRASH_RETENTION_DAYS", "9999")]).is_err());
+        assert!(config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "29")]).is_err());
+        assert!(config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "601")]).is_err());
+        assert!(config(&[("NANACE_P2P_MAX_PEERS_PER_USER", "0")]).is_err());
+        assert!(config(&[("NANACE_P2P_EXCHANGE_RETENTION_DAYS", "0")]).is_err());
+        assert!(config(&[("NANACE_P2P_BOOTSTRAP", "node.example.com:4001")]).is_err());
+        let with_node = config(&[(
+            "NANACE_P2P_BOOTSTRAP",
+            "/dns4/node.example.com/udp/4001/quic-v1/p2p/12D3KooWx",
+        )]);
+        assert!(with_node.expect("valid").p2p_bootstrap.is_some());
+        assert!(
+            config(&[("NANACE_INTERNAL_BIND", "127.0.0.1:9191")]).is_err(),
+            "needs the secret"
+        );
+        assert!(config(&[("NANACE_P2P_NODE_SECRET", "0123456789abcdef0123456789abcdef")]).is_err());
+        assert!(
+            config(&[
+                ("NANACE_INTERNAL_BIND", "127.0.0.1:9191"),
+                ("NANACE_P2P_NODE_SECRET", "short")
+            ])
+            .is_err()
+        );
+        let node = config(&[
+            ("NANACE_INTERNAL_BIND", "127.0.0.1:9191"),
+            ("NANACE_P2P_NODE_SECRET", "0123456789abcdef0123456789abcdef"),
+        ])
+        .expect("valid");
+        assert!(node.internal_bind.is_some() && node.p2p_node_secret.is_some());
+        assert!(
+            !format!("{node:?}").contains("0123456789abcdef"),
+            "secret must not be printed"
+        );
+        let p2p = config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "60")]).expect("valid");
+        assert_eq!((p2p.p2p_presence_max_ttl_secs, p2p.p2p_max_peers_per_user), (60, 10));
         assert_eq!(
             config(&[("NANACE_TRASH_RETENTION_DAYS", "0")])
                 .unwrap()
