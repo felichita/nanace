@@ -1,9 +1,29 @@
 name: CI
 
+# Runs only when something that is built or tested changed: a change to
+# documentation, the installer or other workflows does not start a build.
 on:
   push:
     branches: [main]
+    paths:
+      - crates/**
+      - apps/**
+      - Dockerfile
+      - Cargo.toml
+      - Cargo.lock
+      - rustfmt.toml
+      - deploy/postgres/init.sql
+      - .github/workflows/ci.yml
   pull_request:
+    paths:
+      - crates/**
+      - apps/**
+      - Dockerfile
+      - Cargo.toml
+      - Cargo.lock
+      - rustfmt.toml
+      - deploy/postgres/init.sql
+      - .github/workflows/ci.yml
 
 permissions:
   contents: read
