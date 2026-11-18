@@ -186,7 +186,9 @@ only for changed code, new evidence, or an explicit re-review request.
   tokens); read-only handlers take `AuthUser`. Both reject `p2p`-scoped
   tokens. Only peer-registry handlers, `GET /me` and a token rotating or
   revoking itself take `PeerUser` / `AnyScopeUser`; never use those for a
-  handler that reads or writes pages.
+  handler that reads or writes pages. The one page text a `p2p` token
+  reaches is the guidance of its team's `Policy: P2P` (`get_policy` with
+  `text=true`), which the daemon hands to agents; do not add another.
 - The team role `agent` edits only contexts it created and never deletes:
   create and update check `TeamRole::Agent` plus
   `contexts::require_title_access`; everything else that writes keeps
