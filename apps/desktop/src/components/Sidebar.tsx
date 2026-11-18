@@ -10,6 +10,7 @@ import {
   MoreHorizontal,
   Network,
   Plug,
+  Radio,
   Plus,
   Search,
   Settings2,
@@ -360,6 +361,7 @@ export function Sidebar({
         )}
         {writable && <Row icon={<Trash2 size={16} />} label="Trash" onClick={layout.openTrash} />}
         <Row icon={<Plug size={16} />} label="Connect to Claude" onClick={layout.connectClaude} />
+        <Row icon={<Radio size={16} />} label="Agents (P2P)" onClick={layout.openP2P} />
       </div>
     </aside>
   );

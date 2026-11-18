@@ -41,7 +41,7 @@ test-model: ## Real bge-small-en-v1.5 test; downloads the model on first run
 
 check: fmt-check lint test ## Fast local gate
 
-desktop-deps: ## npm packages and the bundled MCP server (Tauri sidecar)
+desktop-deps: ## npm packages and the bundled sidecars (MCP server, P2P daemon)
 	cd $(DESKTOP) && npm ci && npm run mcp
 
 desktop-dev: desktop-deps ## Run the desktop app against the API

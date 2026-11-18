@@ -28,7 +28,8 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/nanace-mcp"
+      "binaries/nanace-mcp",
+      "binaries/nanace-p2p"
     ],
     "license": "Apache-2.0",
     "copyright": "Copyright 2026 Fedor Nikolaev"

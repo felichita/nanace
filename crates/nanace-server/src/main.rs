@@ -120,7 +120,8 @@ async fn main() -> anyhow::Result<()> {
             config.p2p_presence_max_ttl_secs,
             config.p2p_max_peers_per_user,
         )
-        .with_node_secret(config.p2p_node_secret.clone()),
+        .with_node_secret(config.p2p_node_secret.clone())
+        .with_bootstrap(config.p2p_bootstrap.clone()),
         rate_limiter: RateLimiter::default(),
     });
 

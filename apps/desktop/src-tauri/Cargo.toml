@@ -12,6 +12,8 @@ tauri-build = { version = "2.7", features = [] }
 [dependencies]
 base64 = "0.23"
 getrandom = "0.4"
+# The daemon's local IPC client only: no daemon code, no libp2p.
+nanace-p2p = { path = "../../../crates/nanace-p2p", default-features = false }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,5 +21,5 @@ serde_json = "1"
 sha2 = "0.11"
 tauri = { version = "2.12", features = [] }
 tauri-plugin-opener = "2.7"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 url = "2.5"

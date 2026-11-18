@@ -2335,6 +2335,7 @@ dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
  "keyring",
+ "nanace-p2p",
  "reqwest",
  "serde",
  "serde_json",
@@ -2344,6 +2345,16 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "nanace-p2p"
+version = "0.1.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -4288,6 +4299,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

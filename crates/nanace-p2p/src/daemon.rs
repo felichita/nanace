@@ -195,8 +195,9 @@ struct State {
     rates: HashMap<(String, Uuid), (i64, u32)>,
     policies: HashMap<Uuid, (i64, Option<Arc<TeamPolicy>>)>,
     lookups: HashMap<String, (i64, Option<PeerInfo>)>,
-    /// A desktop app is attached and can show consent prompts.
-    supervisor: bool,
+    /// Desktop app sessions attached; with none, nobody can be asked for
+    /// consent.
+    supervisors: u32,
     last_heartbeat: i64,
     stopped: bool,
 }
@@ -402,7 +403,7 @@ impl Daemon {
                 rates: HashMap::new(),
                 policies: HashMap::new(),
                 lookups: HashMap::new(),
-                supervisor: false,
+                supervisors: 0,
                 last_heartbeat: 0,
                 stopped: false,
             }),
@@ -499,7 +500,7 @@ impl Daemon {
             .find(|t| t.team_id == team_id)
             .map_or(AcceptMode::Off, |t| t.accept_mode);
         // On a laptop nothing is accepted without the desktop app.
-        if state.stopped || (self.kind == ClientKind::Desktop && !state.supervisor) {
+        if state.stopped || (self.kind == ClientKind::Desktop && state.supervisors == 0) {
             return AcceptMode::Off;
         }
         policy.map_or(AcceptMode::Off, |p| p.effective_accept_mode(chosen))
@@ -1543,11 +1544,15 @@ impl Daemon {
 
     // ----- desktop --------------------------------------------------------
 
-    /// The desktop app attached or detached. Without it a laptop accepts
+    /// A desktop app session attached or detached. Without any, a laptop accepts
     /// nothing, so presence is announced again at once with the new mode.
     pub async fn set_supervisor(&self, attached: bool) {
         let mut state = self.state.lock().await;
-        state.supervisor = attached;
+        state.supervisors = if attached {
+            state.supervisors + 1
+        } else {
+            state.supervisors.saturating_sub(1)
+        };
         state.last_heartbeat = 0;
     }
 

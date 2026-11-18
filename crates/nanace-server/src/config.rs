@@ -58,6 +58,9 @@ pub struct Config {
     pub internal_bind: Option<SocketAddr>,
     /// Shared secret of the P2P network node.
     pub p2p_node_secret: Option<SecretString>,
+    /// Public address of the P2P network node, ending in `/p2p/<peer id>`,
+    /// handed to daemons.
+    pub p2p_bootstrap: Option<String>,
     pub database_url: SecretString,
     pub qdrant_url: String,
     pub jwt_secret: SecretString,
@@ -156,6 +159,19 @@ impl Config {
         Ok(Self {
             internal_bind,
             p2p_node_secret,
+            p2p_bootstrap: get("NANACE_P2P_BOOTSTRAP")
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    if v.starts_with('/') && v.contains("/p2p/") {
+                        Ok(v)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "NANACE_P2P_BOOTSTRAP must be a multiaddr ending in /p2p/<node peer id>"
+                        ))
+                    }
+                })
+                .transpose()?,
             p2p_exchange_retention_days: get("NANACE_P2P_EXCHANGE_RETENTION_DAYS")
                 .map(|v| v.trim().parse::<u32>().ok().filter(|d| (1..=365).contains(d)))
                 .unwrap_or(Some(30))
@@ -255,6 +271,12 @@ mod tests {
         assert!(config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "601")]).is_err());
         assert!(config(&[("NANACE_P2P_MAX_PEERS_PER_USER", "0")]).is_err());
         assert!(config(&[("NANACE_P2P_EXCHANGE_RETENTION_DAYS", "0")]).is_err());
+        assert!(config(&[("NANACE_P2P_BOOTSTRAP", "node.example.com:4001")]).is_err());
+        let with_node = config(&[(
+            "NANACE_P2P_BOOTSTRAP",
+            "/dns4/node.example.com/udp/4001/quic-v1/p2p/12D3KooWx",
+        )]);
+        assert!(with_node.expect("valid").p2p_bootstrap.is_some());
         assert!(
             config(&[("NANACE_INTERNAL_BIND", "127.0.0.1:9191")]).is_err(),
             "needs the secret"

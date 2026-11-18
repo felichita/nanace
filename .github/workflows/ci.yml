@@ -51,7 +51,7 @@ jobs:
         run: |
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:6335/readyz && exit 0; sleep 1; done
           exit 1
-      - run: cargo test -p nanace-server -p nanace-mcp --locked -- --ignored
+      - run: cargo test -p nanace-server -p nanace-mcp -p nanace-p2p --locked -- --ignored
 
   desktop:
     name: Desktop (tsc, vitest, Tauri clippy + tests)

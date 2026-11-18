@@ -4,6 +4,8 @@ import { Route, Switch, useLocation } from "wouter";
 
 import { CommandPalette } from "./components/CommandPalette";
 import { ConnectClaudeDialog } from "./components/ConnectClaudeDialog";
+import { P2PDialog } from "./components/P2PDialog";
+import { P2PPrompts } from "./components/P2PPrompts";
 import { GraphView } from "./components/GraphView";
 import { Home } from "./components/Home";
 import { ImportMemoryDialog } from "./components/ImportMemoryDialog";
@@ -18,6 +20,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import { api, canWrite, CLAUDE_EXPIRED_EVENT, session, SIGNED_OUT_EVENT, type SessionInfo, type Team } from "./lib/api";
 import { LayoutContext, type Layout } from "./lib/layout";
+import { p2p, P2P_EXPIRED_EVENT } from "./lib/p2p";
 import { WorkspaceProvider, type Workspace } from "./lib/workspace";
 
 const SIDEBAR_KEY = "nanace.sidebar";
@@ -66,6 +69,9 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
   const [importOpen, setImportOpen] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [p2pOpen, setP2pOpen] = useState(false);
+  // Whether the P2P daemon runs, so its prompts can be shown from anywhere.
+  const p2pState = useQuery({ queryKey: ["p2p-state"], queryFn: p2p.state, refetchInterval: 5000 });
   const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; action?: { label: string; run: () => void } } | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
@@ -182,6 +188,14 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
     return () => void unlisten.then((stop) => stop());
   }, [showToast]);
 
+  // The daemon stopped because its token could not be renewed.
+  useEffect(() => {
+    const unlisten = listen(P2P_EXPIRED_EVENT, () => {
+      showToast("P2P stopped: its access expired", { label: "Turn on", run: () => setP2pOpen(true) });
+    });
+    return () => void unlisten.then((stop) => stop());
+  }, [showToast]);
+
   const layout: Layout = {
     sidebarOpen: sidebar.open,
     openSidebar: () => setSidebar((s) => ({ ...s, open: true })),
@@ -190,6 +204,7 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
     trashPage,
     openTrash: () => setTrashOpen(true),
     connectClaude: () => setConnectOpen(true),
+    openP2P: () => setP2pOpen(true),
     deleteAccount: () => setDeleteAccountOpen(true),
     toast: showToast,
   };
@@ -235,6 +250,8 @@ function Shell({ ws, info, onSignOut }: { ws: Workspace; info: SessionInfo; onSi
       {importOpen && <ImportMemoryDialog onClose={() => setImportOpen(false)} />}
       {trashOpen && <TrashDialog onClose={() => setTrashOpen(false)} />}
       {connectOpen && <ConnectClaudeDialog serverUrl={info.server_url} onClose={() => setConnectOpen(false)} />}
+      {p2pOpen && <P2PDialog onClose={() => setP2pOpen(false)} />}
+      <P2PPrompts running={p2pState.data?.running ?? false} />
       {deleteAccountOpen && <DeleteAccountDialog onClose={() => setDeleteAccountOpen(false)} />}
       {toast && <Toast message={toast.message} action={toast.action} onClose={() => setToast(null)} />}
     </LayoutContext.Provider>

@@ -68,7 +68,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }} -p nanace-server -p nanace-mcp
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p nanace-server -p nanace-p2p
+      # On its own: built together with nanace-p2p, Cargo would give nanace-mcp
+      # that crate's daemon features and link libp2p into it.
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p nanace-mcp
       - name: Package
         shell: bash
         env:
@@ -78,7 +81,7 @@ jobs:
           ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/nanace-server$ext" "target/${{ matrix.target }}/release/nanace-mcp$ext" \
-            README.md .env.example "$name/"
+            "target/${{ matrix.target }}/release/nanace-p2p$ext" README.md .env.example "$name/"
           if [[ -n "$ext" ]]; then
             archive="$name.zip"; 7z a -bso0 "$archive" "$name"
           else
@@ -126,7 +129,7 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - run: npm ci
         working-directory: apps/desktop
-      # beforeBuildCommand builds the nanace-mcp sidecar for the target.
+      # beforeBuildCommand builds the nanace-mcp and nanace-p2p sidecars for the target.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ github.token }}

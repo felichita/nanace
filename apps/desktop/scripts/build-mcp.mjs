@@ -1,5 +1,6 @@
-// Builds nanace-mcp and places it where Tauri expects the sidecar:
-// src-tauri/binaries/nanace-mcp-<target triple>[.exe].
+// Builds the sidecars (nanace-mcp and the P2P daemon nanace-p2p) and places
+// them where Tauri expects them:
+// src-tauri/binaries/<name>-<target triple>[.exe].
 //
 // The Tauri CLI sets TAURI_ENV_TARGET_TRIPLE for its before* commands, so
 // `tauri build --target <triple>` gets a sidecar for that target.
@@ -14,12 +15,15 @@ const host = /^host: (\S+)$/m.exec(execFileSync("rustc", ["-vV"], { encoding: "u
 const target = process.env.TAURI_ENV_TARGET_TRIPLE || host;
 const ext = target.includes("windows") ? ".exe" : "";
 
-const args = ["build", "--release", "--locked", "-p", "nanace-mcp", "--manifest-path", join(root, "Cargo.toml")];
-if (target !== host) args.push("--target", target);
-execFileSync("cargo", args, { stdio: "inherit" });
-
-const built = join(root, "target", ...(target !== host ? [target] : []), "release", `nanace-mcp${ext}`);
 const dest = join(app, "src-tauri", "binaries");
 mkdirSync(dest, { recursive: true });
-copyFileSync(built, join(dest, `nanace-mcp-${target}${ext}`));
-console.log(`sidecar: nanace-mcp-${target}${ext}`);
+// Built one at a time: together, Cargo would give nanace-mcp the daemon
+// features of nanace-p2p and with them libp2p.
+for (const name of ["nanace-mcp", "nanace-p2p"]) {
+  const args = ["build", "--release", "--locked", "-p", name, "--manifest-path", join(root, "Cargo.toml")];
+  if (target !== host) args.push("--target", target);
+  execFileSync("cargo", args, { stdio: "inherit" });
+  const built = join(root, "target", ...(target !== host ? [target] : []), "release", `${name}${ext}`);
+  copyFileSync(built, join(dest, `${name}-${target}${ext}`));
+  console.log(`sidecar: ${name}-${target}${ext}`);
+}

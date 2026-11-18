@@ -41,7 +41,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             "/orgs/{org_id}/teams/{team_id}/p2p/exchanges",
             web::get().to(list_exchanges),
         )
-        .route("/p2p/policy-template", web::get().to(policy_template));
+        .route("/p2p/policy-template", web::get().to(policy_template))
+        .route("/p2p/config", web::get().to(p2p_config));
 }
 
 /// Lowest presence TTL a client may ask for.
@@ -834,6 +835,12 @@ async fn get_policy(
     }
     tx.commit().await?;
     Ok(HttpResponse::Ok().json(response))
+}
+
+/// What a daemon needs to join the network: the node to bootstrap from.
+/// `null` when this installation runs no P2P node.
+async fn p2p_config(state: web::Data<AppState>, _user: AnyScopeUser) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({ "bootstrap": state.p2p.bootstrap }))
 }
 
 /// A starting point for a team's `Policy: P2P` page, with strict defaults.

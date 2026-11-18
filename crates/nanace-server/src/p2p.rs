@@ -33,6 +33,8 @@ pub struct P2pState {
     pub max_peers_per_user: u32,
     /// Shared secret of the network node, when one is configured.
     pub node_secret: Option<SecretString>,
+    /// Address of the network node that daemons bootstrap from.
+    pub bootstrap: Option<String>,
 }
 
 pub struct Challenge {
@@ -50,7 +52,13 @@ impl P2pState {
             presence_max_ttl_secs,
             max_peers_per_user,
             node_secret: None,
+            bootstrap: None,
         }
+    }
+
+    pub fn with_bootstrap(mut self, bootstrap: Option<String>) -> Self {
+        self.bootstrap = bootstrap;
+        self
     }
 
     pub fn with_node_secret(mut self, secret: Option<SecretString>) -> Self {
