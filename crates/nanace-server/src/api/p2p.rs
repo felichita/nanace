@@ -5,9 +5,9 @@ use actix_web::{HttpResponse, web};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
-use nanace_core::TeamRole;
-use nanace_core::p2p::{self, AcceptMode, ClientKind};
+use nanace_core::p2p::{self, AcceptMode, AnswerHeader, AnswerStatus, ClientKind, RejectReason, RequestHeader};
 use nanace_core::policy::{self, P2pPolicy};
+use nanace_core::{OrgRole, TeamRole};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AnyScopeUser, AuthMethod, AuthUser, PeerUser};
 use crate::error::{ApiError, ApiResult};
-use crate::p2p::{bind_signature_is_valid, parse_policy_page};
+use crate::p2p::{bind_signature_is_valid, parse_policy_page, signature_is_valid};
 use crate::ratelimit::RateClass;
 use crate::{AppState, LOG_COMPONENT, access, db, metrics};
 
@@ -33,6 +33,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         )
         .route("/orgs/{org_id}/teams/{team_id}/peers", web::get().to(list_peers))
         .route("/orgs/{org_id}/teams/{team_id}/p2p/policy", web::get().to(get_policy))
+        .route(
+            "/orgs/{org_id}/teams/{team_id}/p2p/exchanges",
+            web::post().to(report_exchange),
+        )
+        .route(
+            "/orgs/{org_id}/teams/{team_id}/p2p/exchanges",
+            web::get().to(list_exchanges),
+        )
         .route("/p2p/policy-template", web::get().to(policy_template));
 }
 
@@ -834,4 +842,313 @@ async fn policy_template(_user: AuthUser) -> HttpResponse {
         "title": "Policy: P2P",
         "content": policy::TEMPLATE,
     }))
+}
+
+/// Which end of an exchange is reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportRole {
+    Sender,
+    Receiver,
+}
+
+/// How an exchange stands, when the report carries no signed answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportedStatus {
+    /// The receiver took the request; no answer yet.
+    Delivered,
+    /// Refused before it left, or by the receiver without a signed answer.
+    Rejected,
+    /// The deadline passed.
+    Expired,
+    /// It could not be delivered or processed.
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Consent {
+    Auto,
+    UserApproved,
+    UserDenied,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeReport {
+    role: ReportRole,
+    /// base64url of the request header bytes exactly as they were signed.
+    request_header: String,
+    /// base64url Ed25519 signature of the sender's peer key over them.
+    request_signature: String,
+    status: ReportedStatus,
+    reject_reason: Option<RejectReason>,
+    consent: Option<Consent>,
+    /// base64url of the signed answer header, once there is an answer.
+    answer_header: Option<String>,
+    answer_signature: Option<String>,
+}
+
+fn decode(field: &'static str, value: &str) -> ApiResult<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ApiError::BadRequest(format!("{field}: must be base64url")))
+}
+
+/// Records one side's view of an exchange. The request header is the
+/// sender's signed statement of who sent what kind of message to whom, so
+/// the row's facts come from that header, not from the reporter. Reporting
+/// again updates the status (delivered, then answered).
+async fn report_exchange(
+    state: web::Data<AppState>,
+    user: PeerUser,
+    path: web::Path<(Uuid, Uuid)>,
+    body: web::Json<ExchangeReport>,
+) -> ApiResult<HttpResponse> {
+    let (org_id, team_id) = path.into_inner();
+    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
+    state.rate_limiter.check(user.user_id, RateClass::P2pExchange)?;
+    let report = body.into_inner();
+    let invalid = |what: &str| ApiError::BadRequest(format!("exchange report: {what}"));
+
+    let header_bytes = decode("request_header", &report.request_header)?;
+    let header: RequestHeader =
+        serde_json::from_slice(&header_bytes).map_err(|_| invalid("request_header is not a request header"))?;
+    let sender_key = p2p::peer_id(&header.from.peer_id)?;
+    let receiver_key = p2p::peer_id(&header.to.peer_id)?;
+    p2p::agent_label(&header.from.agent_label)?;
+    p2p::agent_label(&header.to.agent_label)?;
+    p2p::trace_id(&header.trace_id)?;
+    if !signature_is_valid(
+        &sender_key,
+        &report.request_signature,
+        &p2p::request_signing_bytes(&header_bytes),
+    ) {
+        return Err(invalid("request_signature is not the sender's signature"));
+    }
+    if header.org_id != org_id || header.team_id != team_id {
+        return Err(invalid("the request belongs to another team"));
+    }
+    let reporter_is_party = match report.role {
+        ReportRole::Sender => header.from.user_id == user.user_id,
+        ReportRole::Receiver => header.to.user_id == user.user_id,
+    };
+    if !reporter_is_party {
+        return Err(invalid("you are not that side of the exchange"));
+    }
+    let sent_at = DateTime::<Utc>::from_timestamp(header.sent_at, 0).ok_or_else(|| invalid("sent_at"))?;
+    let request_hash = p2p::sha256_hex(&header_bytes);
+
+    // A signed answer decides the status; without one the reporter states it.
+    let answer = match (&report.answer_header, &report.answer_signature) {
+        (Some(answer), Some(signature)) => {
+            let bytes = decode("answer_header", answer)?;
+            let answer: AnswerHeader =
+                serde_json::from_slice(&bytes).map_err(|_| invalid("answer_header is not an answer header"))?;
+            if !signature_is_valid(&receiver_key, signature, &p2p::answer_signing_bytes(&bytes)) {
+                return Err(invalid("answer_signature is not the receiver's signature"));
+            }
+            if answer.request_id != header.request_id
+                || answer.request_hash != request_hash
+                || answer.answered_by.peer_id != header.to.peer_id
+            {
+                return Err(invalid("the answer belongs to another request"));
+            }
+            Some(answer)
+        }
+        (None, None) => None,
+        _ => return Err(invalid("answer_header and answer_signature go together")),
+    };
+    let (status, reason, bytes_in) = match &answer {
+        Some(answer) => (
+            match answer.status {
+                AnswerStatus::Answered => "answered",
+                AnswerStatus::Rejected => "rejected",
+                AnswerStatus::Expired => "expired",
+                AnswerStatus::Error => "failed",
+            },
+            answer.reason,
+            answer.body_bytes,
+        ),
+        None => (
+            match report.status {
+                ReportedStatus::Delivered => "delivered",
+                ReportedStatus::Rejected => "rejected",
+                ReportedStatus::Expired => "expired",
+                ReportedStatus::Failed => "failed",
+            },
+            report.reject_reason,
+            0,
+        ),
+    };
+    let consent = report.consent.map(|c| match c {
+        Consent::Auto => "auto",
+        Consent::UserApproved => "user_approved",
+        Consent::UserDenied => "user_denied",
+    });
+    let (role, bytes_out) = (
+        match report.role {
+            ReportRole::Sender => "sender",
+            ReportRole::Receiver => "receiver",
+        },
+        i32::try_from(header.body_bytes).map_err(|_| invalid("body_bytes"))?,
+    );
+
+    let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
+    // Both peers must be bound to the users the header names. Row security
+    // shows the caller its own peers and its teammates'.
+    let bound: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM p2p_peers WHERE (peer_id = $1 AND user_id = $2) OR (peer_id = $3 AND user_id = $4)",
+    )
+    .bind(&header.from.peer_id)
+    .bind(header.from.user_id)
+    .bind(&header.to.peer_id)
+    .bind(header.to.user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if bound != 2 {
+        return Err(invalid("a peer in the request is not bound to the user it names"));
+    }
+    sqlx::query(
+        "INSERT INTO p2p_exchanges (id, org_id, team_id, request_id, reported_by, reporter_user, trace_id, \
+             from_peer, from_agent, from_user, to_peer, to_agent, to_user, kind, status, reject_reason, consent, \
+             hop, bytes_out, bytes_in, request_hash, answer_verified, policy_version, sent_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
+                 $22, $23, $24) \
+         ON CONFLICT (request_id, reported_by) DO UPDATE SET status = EXCLUDED.status, \
+             reject_reason = EXCLUDED.reject_reason, consent = COALESCE(EXCLUDED.consent, p2p_exchanges.consent), \
+             bytes_in = EXCLUDED.bytes_in, answer_verified = EXCLUDED.answer_verified, updated_at = now()",
+    )
+    .bind(Uuid::new_v4())
+    .bind(org_id)
+    .bind(team_id)
+    .bind(header.request_id)
+    .bind(role)
+    .bind(user.user_id)
+    .bind(&header.trace_id)
+    .bind(&header.from.peer_id)
+    .bind(&header.from.agent_label)
+    .bind(header.from.user_id)
+    .bind(&header.to.peer_id)
+    .bind(&header.to.agent_label)
+    .bind(header.to.user_id)
+    .bind(header.kind.as_str())
+    .bind(status)
+    .bind(reason.map(RejectReason::as_str))
+    .bind(consent)
+    .bind(i32::try_from(header.hop).map_err(|_| invalid("hop"))?)
+    .bind(bytes_out)
+    .bind(i32::try_from(bytes_in).map_err(|_| invalid("answer body_bytes"))?)
+    .bind(&request_hash)
+    .bind(answer.is_some())
+    .bind(&header.policy_version)
+    .bind(sent_at)
+    .execute(&mut *tx)
+    .await?;
+    audit::record(
+        &mut *tx,
+        AuditEvent {
+            org_id: Some(org_id),
+            actor: user.user_id,
+            action: "p2p.exchange",
+            resource_type: "team",
+            resource_id: Some(team_id),
+            details: serde_json::json!({
+                "request_id": header.request_id,
+                "trace_id": header.trace_id,
+                "reported_by": role,
+                "kind": header.kind,
+                "status": status,
+                "reject_reason": reason,
+                "from_user": header.from.user_id,
+                "to_user": header.to.user_id,
+            }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    metrics::p2p_exchange_reported(header.kind.as_str(), status);
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangesQuery {
+    trace_id: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ExchangeRow {
+    request_id: Uuid,
+    reported_by: String,
+    trace_id: String,
+    from_peer: String,
+    from_agent: String,
+    from_user: Uuid,
+    from_email: String,
+    to_peer: String,
+    to_agent: String,
+    to_user: Uuid,
+    to_email: String,
+    kind: String,
+    status: String,
+    reject_reason: Option<String>,
+    consent: Option<String>,
+    hop: i32,
+    bytes_out: i32,
+    bytes_in: i32,
+    answer_verified: bool,
+    policy_version: String,
+    sent_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    /// A page of the team is tagged `trace-<trace id>`. Always false for an
+    /// org admin who is not in the team, who cannot see its pages.
+    has_summary: bool,
+}
+
+/// The team's exchange journal, newest first: metadata only. For team
+/// admins and org admins.
+async fn list_exchanges(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<(Uuid, Uuid)>,
+    query: web::Query<ExchangesQuery>,
+) -> ApiResult<HttpResponse> {
+    let (org_id, team_id) = path.into_inner();
+    match access::team_role(&state.pool, org_id, team_id, user.user_id).await? {
+        (OrgRole::Admin, _) | (_, Some(TeamRole::Admin)) => {}
+        (_, Some(_)) => return Err(ApiError::Forbidden),
+        (_, None) => return Err(ApiError::NotFound),
+    }
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    if !(1..=500).contains(&limit) || offset < 0 {
+        return Err(ApiError::BadRequest(
+            "limit must be 1-500 and offset non-negative".to_owned(),
+        ));
+    }
+    let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
+    let rows: Vec<ExchangeRow> = sqlx::query_as(
+        "SELECT e.request_id, e.reported_by, e.trace_id, e.from_peer, e.from_agent, e.from_user, \
+                fu.email AS from_email, e.to_peer, e.to_agent, e.to_user, tu.email AS to_email, e.kind, e.status, \
+                e.reject_reason, e.consent, e.hop, e.bytes_out, e.bytes_in, e.answer_verified, e.policy_version, \
+                e.sent_at, e.updated_at, \
+                EXISTS (SELECT 1 FROM contexts c WHERE c.team_id = e.team_id \
+                        AND ('trace-' || lower(e.trace_id)) = ANY(c.tags)) AS has_summary \
+         FROM p2p_exchanges e JOIN users fu ON fu.id = e.from_user JOIN users tu ON tu.id = e.to_user \
+         WHERE e.org_id = $1 AND e.team_id = $2 AND ($3::text IS NULL OR e.trace_id = $3) \
+         ORDER BY e.created_at DESC, e.id LIMIT $4 OFFSET $5",
+    )
+    .bind(org_id)
+    .bind(team_id)
+    .bind(query.trace_id.as_deref())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(HttpResponse::Ok().json(rows))
 }

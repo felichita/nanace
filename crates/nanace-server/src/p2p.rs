@@ -31,6 +31,8 @@ pub struct P2pState {
     pub presence_max_ttl_secs: u32,
     /// Unrevoked peers one user may have bound.
     pub max_peers_per_user: u32,
+    /// Shared secret of the network node, when one is configured.
+    pub node_secret: Option<SecretString>,
 }
 
 pub struct Challenge {
@@ -47,7 +49,13 @@ impl P2pState {
             challenge_key: mac.finalize().into_bytes().into(),
             presence_max_ttl_secs,
             max_peers_per_user,
+            node_secret: None,
         }
+    }
+
+    pub fn with_node_secret(mut self, secret: Option<SecretString>) -> Self {
+        self.node_secret = secret;
+        self
     }
 
     fn mac(&self, user_id: Uuid, nonce_and_expiry: &[u8]) -> Hmac<Sha256> {
@@ -100,18 +108,25 @@ pub fn bind_signature_is_valid(
     peer_id: &str,
     user_id: Uuid,
 ) -> bool {
-    let Ok(key) = VerifyingKey::from_bytes(public_key) else {
-        return false;
-    };
-    let Some(signature) = URL_SAFE_NO_PAD
-        .decode(signature)
-        .ok()
-        .and_then(|bytes| Signature::from_slice(&bytes).ok())
-    else {
-        return false;
-    };
-    key.verify_strict(&bind_message(challenge, peer_id, user_id), &signature)
-        .is_ok()
+    signature_is_valid(public_key, signature, &bind_message(challenge, peer_id, user_id))
+}
+
+/// Deletes exchange reports older than `retention_days`, or older than the
+/// shorter period a team's policy sets. Returns how many were deleted.
+pub async fn sweep_exchanges(pool: &PgPool, retention_days: u32) -> anyhow::Result<u64> {
+    let days = i32::try_from(retention_days)?;
+    let mut tx = db::p2p_system_tx(pool).await?;
+    let deleted = sqlx::query(
+        "DELETE FROM p2p_exchanges e WHERE e.created_at < now() - make_interval(days => LEAST($1, COALESCE( \
+             (SELECT (pp.parsed->'retention'->>'exchange_metadata_days')::integer FROM p2p_policies pp \
+              WHERE pp.team_id = e.team_id AND pp.valid), $1)))",
+    )
+    .bind(days)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 /// A `Policy: P2P` page as the server understands it.
@@ -143,6 +158,19 @@ pub fn parse_policy_page(content: &str) -> ParsedPolicy {
         version: sha256_hex(content),
         policy,
     }
+}
+
+/// True when `signature` (base64url) is the key's Ed25519 signature over
+/// `message`.
+pub fn signature_is_valid(public_key: &[u8; 32], signature: &str, message: &[u8]) -> bool {
+    let Ok(key) = VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    URL_SAFE_NO_PAD
+        .decode(signature)
+        .ok()
+        .and_then(|bytes| Signature::from_slice(&bytes).ok())
+        .is_some_and(|signature| key.verify_strict(message, &signature).is_ok())
 }
 
 /// Deletes presence that has expired, auditing each ended presence as

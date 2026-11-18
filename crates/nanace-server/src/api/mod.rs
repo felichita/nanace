@@ -5,6 +5,7 @@ mod complete_page;
 pub(crate) mod contexts;
 mod google;
 mod graph;
+mod internal;
 mod orgs;
 pub(crate) mod p2p;
 mod search;
@@ -45,6 +46,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 .configure(audit_logs::configure)
                 .configure(p2p::configure),
         );
+}
+
+/// Routes of the internal listener (`NANACE_INTERNAL_BIND`), which only the
+/// P2P network node reaches.
+pub fn configure_internal(cfg: &mut web::ServiceConfig) {
+    cfg.route("/livez", web::get().to(livez)).configure(internal::configure);
 }
 
 async fn livez() -> HttpResponse {

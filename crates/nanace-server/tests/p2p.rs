@@ -11,10 +11,13 @@ use actix_web::{App, test, web};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
-use nanace_core::p2p::{bind_message, peer_id_from_ed25519};
+use nanace_core::p2p::{
+    AnswerHeader, AnswerStatus, MessageKind, Party, RequestHeader, answer_signing_bytes, bind_message,
+    peer_id_from_ed25519, request_signing_bytes, sha256_hex,
+};
 use nanace_embed::HashingEmbedder;
 use nanace_server::auth::JwtKeys;
-use nanace_server::p2p::{P2pState, sweep_presence};
+use nanace_server::p2p::{P2pState, sweep_exchanges, sweep_presence};
 use nanace_server::ratelimit::RateLimiter;
 use nanace_server::vectors::VectorStore;
 use nanace_server::{AppState, api, db};
@@ -24,6 +27,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 const JWT_SECRET: &str = "test-secret-0123456789abcdef-0123456789";
+const NODE_SECRET: &str = "node-secret-0123456789abcdef-0123456789";
 
 async fn state() -> web::Data<AppState> {
     let db_url = std::env::var("NANACE_TEST_DATABASE_URL")
@@ -46,7 +50,7 @@ async fn state() -> web::Data<AppState> {
         frontend_url: "http://127.0.0.1/auth/complete".to_owned(),
         secure_cookies: false,
         trash_retention_days: 7,
-        p2p: P2pState::new(&secret, 120, 3),
+        p2p: P2pState::new(&secret, 120, 3).with_node_secret(Some(SecretString::from(NODE_SECRET.to_owned()))),
         rate_limiter: RateLimiter::default(),
     })
 }
@@ -1263,5 +1267,396 @@ async fn policy_page_turns_p2p_on_and_limits_it() {
     assert!(
         policy["errors"][0].as_str().unwrap().contains("save it again"),
         "{policy}"
+    );
+}
+
+fn b64(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// A request header and its signature by `key`, as a daemon would send it.
+fn signed_request(key: &SigningKey, header: &RequestHeader) -> (Vec<u8>, String) {
+    let bytes = serde_json::to_vec(header).unwrap();
+    let signature = b64(&key.sign(&request_signing_bytes(&bytes)).to_bytes());
+    (bytes, signature)
+}
+
+fn signed_answer(key: &SigningKey, header: &AnswerHeader) -> (Vec<u8>, String) {
+    let bytes = serde_json::to_vec(header).unwrap();
+    let signature = b64(&key.sign(&answer_signing_bytes(&bytes)).to_bytes());
+    (bytes, signature)
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn exchange_reports_are_verified_and_journaled() {
+    let state = state().await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let (alice, alice_id) = c.login("alice").await;
+    let (bob, bob_id) = c.login("bob").await;
+    let (carol, _) = c.login("carol").await;
+    let (oscar, oscar_id) = c.login("oscar").await;
+    let (outsider, _) = c.login("eve").await;
+    let (org, _) = c.org(&alice).await;
+    let dev = c.team(&alice, org, "dev").await;
+    let other = c.team(&alice, org, "other").await;
+    c.add(&alice, org, dev, &bob, "writer").await;
+    c.add(&alice, org, dev, &carol, "reader").await;
+    // Oscar is an org admin outside the team.
+    c.add(&alice, org, other, &oscar, "reader").await;
+    c.ok(
+        "PUT",
+        &format!("/api/v1/orgs/{org}/members/{oscar_id}"),
+        &alice,
+        Some(json!({ "role": "admin" })),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let (alice_key, bob_key) = (new_key(), new_key());
+    let alice_peer = c.bind(&alice, alice_id, &alice_key).await;
+    let bob_peer = c.bind(&bob, bob_id, &bob_key).await;
+
+    let now = chrono::Utc::now().timestamp();
+    let header = RequestHeader {
+        v: 1,
+        request_id: Uuid::new_v4(),
+        trace_id: "TASK-1".to_owned(),
+        org_id: org,
+        team_id: dev,
+        from: Party {
+            peer_id: alice_peer.clone(),
+            agent_label: "alice/cc".to_owned(),
+            user_id: alice_id,
+        },
+        to: Party {
+            peer_id: bob_peer.clone(),
+            agent_label: "bob/cc".to_owned(),
+            user_id: bob_id,
+        },
+        kind: MessageKind::Ask,
+        body_hash: sha256_hex(b"which services depend on sg-123?"),
+        body_bytes: 32,
+        refs: vec![],
+        hop: 0,
+        sent_at: now,
+        deadline: now + 3600,
+        policy_version: "v".to_owned(),
+    };
+    let (request, request_sig) = signed_request(&alice_key, &header);
+    let answer = AnswerHeader {
+        v: 1,
+        request_id: header.request_id,
+        request_hash: sha256_hex(&request),
+        status: AnswerStatus::Answered,
+        reason: None,
+        answered_by: header.to.clone(),
+        body_hash: sha256_hex(b"billing-api and ledger"),
+        body_bytes: 22,
+        refs: vec![],
+        sent_at: now + 5,
+    };
+    let (answer_bytes, answer_sig) = signed_answer(&bob_key, &answer);
+    let uri = format!("/api/v1/orgs/{org}/teams/{dev}/p2p/exchanges");
+    let report = |role: &str, request: &[u8], sig: &str| json!({ "role": role, "request_header": b64(request), "request_signature": sig, "status": "delivered" });
+    let with_answer = |role: &str, answer: &[u8], sig: &str| {
+        let mut body = report(role, &request, &request_sig);
+        body["answer_header"] = json!(b64(answer));
+        body["answer_signature"] = json!(sig);
+        body["consent"] = json!("user_approved");
+        body
+    };
+
+    // Reports that do not hold up are refused.
+    let other_key = new_key();
+    let forged = signed_request(&other_key, &header).1;
+    let mut tampered = header.clone();
+    tampered.kind = MessageKind::Notify;
+    let mut elsewhere = header.clone();
+    elsewhere.team_id = other;
+    let (elsewhere_bytes, elsewhere_sig) = signed_request(&alice_key, &elsewhere);
+    let mut misattributed = header.clone();
+    misattributed.from.user_id = bob_id;
+    misattributed.to.user_id = alice_id;
+    let (misattributed_bytes, misattributed_sig) = signed_request(&alice_key, &misattributed);
+    let mut foreign_answer = answer.clone();
+    foreign_answer.request_hash = sha256_hex(b"another request");
+    let (foreign_answer_bytes, foreign_answer_sig) = signed_answer(&bob_key, &foreign_answer);
+    for (who, body, why) in [
+        (&alice, report("sender", &request, &forged), "signed by another key"),
+        (
+            &alice,
+            report("sender", &serde_json::to_vec(&tampered).unwrap(), &request_sig),
+            "header changed after signing",
+        ),
+        (
+            &alice,
+            report("sender", &elsewhere_bytes, &elsewhere_sig),
+            "another team",
+        ),
+        (&bob, report("sender", &request, &request_sig), "not the sender"),
+        (&alice, report("receiver", &request, &request_sig), "not the receiver"),
+        (&carol, report("sender", &request, &request_sig), "not a party"),
+        (
+            &bob,
+            report("sender", &misattributed_bytes, &misattributed_sig),
+            "peer not bound to the named user",
+        ),
+        (
+            &bob,
+            with_answer("receiver", &answer_bytes, &signed_answer(&alice_key, &answer).1),
+            "answer signed by the sender",
+        ),
+        (
+            &bob,
+            with_answer("receiver", &foreign_answer_bytes, &foreign_answer_sig),
+            "answer to another request",
+        ),
+        (
+            &alice,
+            json!({ "role": "sender", "request_header": "!!", "request_signature": "", "status": "delivered" }),
+            "not base64",
+        ),
+    ] {
+        let (status, value) = c.call("POST", &uri, who, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {value}");
+    }
+    c.ok(
+        "POST",
+        &uri,
+        &outsider,
+        Some(report("sender", &request, &request_sig)),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // The sender reports delivery, the receiver the answer, and the sender
+    // then the answer too.
+    c.ok(
+        "POST",
+        &uri,
+        &alice,
+        Some(report("sender", &request, &request_sig)),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok(
+        "POST",
+        &uri,
+        &bob,
+        Some(with_answer("receiver", &answer_bytes, &answer_sig)),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let journal = c.ok("GET", &uri, &alice, None, StatusCode::OK).await;
+    let rows = journal.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let sender_row = rows.iter().find(|r| r["reported_by"] == "sender").unwrap();
+    assert_eq!(sender_row["status"], "delivered");
+    assert_eq!(sender_row["answer_verified"], false);
+    c.ok(
+        "POST",
+        &uri,
+        &alice,
+        Some(with_answer("sender", &answer_bytes, &answer_sig)),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let journal = c
+        .ok("GET", &format!("{uri}?trace_id=TASK-1"), &alice, None, StatusCode::OK)
+        .await;
+    let rows = journal.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "a second report updates the first");
+    for row in rows {
+        assert_eq!(row["status"], "answered", "{row}");
+        assert_eq!(row["answer_verified"], true);
+        assert_eq!(
+            (row["bytes_out"].clone(), row["bytes_in"].clone()),
+            (json!(32), json!(22))
+        );
+        assert_eq!(row["kind"], "ask");
+        assert_eq!(row["from_user"], alice_id.to_string());
+        assert_eq!(row["to_agent"], "bob/cc");
+        assert_eq!(row["has_summary"], false);
+    }
+    // No body, question or answer text is anywhere in the journal.
+    assert!(!journal.to_string().contains("sg-123") && !journal.to_string().contains("ledger"));
+    assert_eq!(
+        c.ok("GET", &format!("{uri}?trace_id=OTHER"), &alice, None, StatusCode::OK)
+            .await,
+        json!([])
+    );
+
+    // A page tagged with the trace marks the exchange as summarized.
+    c.ok(
+        "POST",
+        &format!("/api/v1/orgs/{org}/teams/{dev}/contexts"),
+        &bob,
+        Some(json!({ "title": "P2P: sg-123 dependants (TASK-1)", "content": "summary", "tags": ["trace-TASK-1"] })),
+        StatusCode::CREATED,
+    )
+    .await;
+    let journal = c.ok("GET", &uri, &alice, None, StatusCode::OK).await;
+    assert_eq!(journal[0]["has_summary"], true);
+
+    // Who reads the journal: team admins and org admins, nobody else.
+    c.ok("GET", &uri, &bob, None, StatusCode::FORBIDDEN).await;
+    c.ok("GET", &uri, &outsider, None, StatusCode::NOT_FOUND).await;
+    let for_org_admin = c.ok("GET", &uri, &oscar, None, StatusCode::OK).await;
+    assert_eq!(for_org_admin.as_array().unwrap().len(), 2);
+    assert_eq!(
+        for_org_admin[0]["has_summary"], false,
+        "an org admin outside the team sees no pages"
+    );
+
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE org_id = $1 AND action = 'p2p.exchange'")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 3);
+
+    // Below the API: Bob sees and changes only his own report.
+    let mut tx = db::scoped_tx(&pool, org, bob_id).await.unwrap();
+    let visible: Vec<String> = sqlx::query_scalar("SELECT reported_by FROM p2p_exchanges WHERE team_id = $1")
+        .bind(dev)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(visible, ["receiver"]);
+    for sql in [
+        "UPDATE p2p_exchanges SET status = 'failed' WHERE reported_by = 'sender' AND team_id = $1",
+        "DELETE FROM p2p_exchanges WHERE team_id = $1",
+    ] {
+        let changed = sqlx::query(sql)
+            .bind(dev)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "{sql}");
+    }
+    let rewritten = sqlx::query("UPDATE p2p_exchanges SET kind = 'notify' WHERE team_id = $1")
+        .bind(dev)
+        .execute(&mut *tx)
+        .await;
+    assert!(rewritten.is_err(), "a report cannot change what it reports");
+    drop(tx);
+    let unscoped: i64 = sqlx::query_scalar("SELECT count(*) FROM p2p_exchanges")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(unscoped, 0);
+
+    // Retention keeps recent reports and deletes old ones.
+    assert_eq!(sweep_exchanges(&pool, 30).await.unwrap(), 0);
+    let mut tx = db::scoped_tx(&pool, org, alice_id).await.unwrap();
+    sqlx::query(
+        "INSERT INTO p2p_exchanges (id, org_id, team_id, request_id, reported_by, reporter_user, trace_id, from_peer, \
+             from_agent, from_user, to_peer, to_agent, to_user, kind, status, hop, bytes_out, bytes_in, request_hash, \
+             answer_verified, policy_version, sent_at, created_at) \
+         VALUES ($1, $2, $3, $4, 'sender', $5, 'OLD', 'p', 'a', $5, 'q', 'b', $6, 'ask', 'expired', 0, 1, 0, 'h', \
+                 false, 'v', now(), now() - interval '40 days')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(org)
+    .bind(dev)
+    .bind(Uuid::new_v4())
+    .bind(alice_id)
+    .bind(bob_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        sweep_exchanges(&pool, 365).await.unwrap(),
+        1,
+        "the team policy keeps 30 days"
+    );
+    assert_eq!(
+        c.ok("GET", &uri, &alice, None, StatusCode::OK)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn network_node_learns_only_which_peers_may_connect() {
+    let state = state().await;
+    let c = Client {
+        app: test::init_service(App::new().app_data(state.clone()).configure(api::configure)).await,
+    };
+    let node = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure_internal)).await,
+    };
+    let (alice, alice_id) = c.login("alice").await;
+    let (org, _) = c.org(&alice).await;
+    let dev = c.team(&alice, org, "dev").await;
+    let quiet = c.bare_team(&alice, org, "quiet").await;
+    let present = c.bind(&alice, alice_id, &new_key()).await;
+    let absent = c.bind(&alice, alice_id, &new_key()).await;
+    assert_eq!(c.announce(&alice, org, dev, &present, "a").await.0, StatusCode::OK);
+    assert_eq!(
+        c.announce(&alice, org, quiet, &absent, "a").await.0,
+        StatusCode::CONFLICT,
+        "no policy in that team"
+    );
+
+    // The node authenticates with its secret; nothing else gets in, and the
+    // routes do not exist on the public listener.
+    for token in ["", "wrong", alice.as_str()] {
+        node.ok("GET", "/internal/p2p/allowed", token, None, StatusCode::UNAUTHORIZED)
+            .await;
+    }
+    c.ok("GET", "/internal/p2p/allowed", NODE_SECRET, None, StatusCode::NOT_FOUND)
+        .await;
+    node.ok("GET", "/api/v1/me", &alice, None, StatusCode::NOT_FOUND).await;
+
+    let allowed = node
+        .ok("GET", "/internal/p2p/allowed", NODE_SECRET, None, StatusCode::OK)
+        .await;
+    let peers: Vec<&str> = allowed["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert!(
+        peers.contains(&present.as_str()) && !peers.contains(&absent.as_str()),
+        "{peers:?}"
+    );
+    let allow = |peer: &str| format!("/internal/p2p/allow?peer_id={peer}");
+    assert_eq!(
+        node.ok("GET", &allow(&present), NODE_SECRET, None, StatusCode::OK)
+            .await["allowed"],
+        true
+    );
+    for peer in [absent.clone(), peer_of(&new_key())] {
+        assert_eq!(
+            node.ok("GET", &allow(&peer), NODE_SECRET, None, StatusCode::OK).await["allowed"],
+            false
+        );
+    }
+
+    // Revoking the peer takes it off the list at once.
+    c.ok(
+        "DELETE",
+        &format!("/api/v1/me/peers/{present}"),
+        &alice,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        node.ok("GET", &allow(&present), NODE_SECRET, None, StatusCode::OK)
+            .await["allowed"],
+        false
     );
 }

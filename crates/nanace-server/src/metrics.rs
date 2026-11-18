@@ -35,6 +35,7 @@ struct Metrics {
     p2p_peer_binds: IntCounter,
     p2p_presence_starts: IntCounter,
     p2p_policy_denials: IntCounterVec,
+    p2p_exchanges: IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -66,6 +67,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["reason"],
     )
     .expect("valid metric");
+    let p2p_exchanges = IntCounterVec::new(
+        Opts::new("nanace_p2p_exchanges_total", "P2P exchange reports by kind and status"),
+        &["kind", "status"],
+    )
+    .expect("valid metric");
     for collector in [
         Box::new(requests.clone()) as Box<dyn prometheus::core::Collector>,
         Box::new(request_seconds.clone()),
@@ -74,6 +80,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         Box::new(p2p_peer_binds.clone()),
         Box::new(p2p_presence_starts.clone()),
         Box::new(p2p_policy_denials.clone()),
+        Box::new(p2p_exchanges.clone()),
     ] {
         registry.register(collector).expect("metric registered once");
     }
@@ -86,6 +93,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         p2p_peer_binds,
         p2p_presence_starts,
         p2p_policy_denials,
+        p2p_exchanges,
     }
 });
 
@@ -123,6 +131,11 @@ pub fn p2p_peer_bound() {
 
 pub fn p2p_presence_started() {
     METRICS.p2p_presence_starts.inc();
+}
+
+/// Both labels are fixed words from closed sets.
+pub fn p2p_exchange_reported(kind: &'static str, status: &'static str) {
+    METRICS.p2p_exchanges.with_label_values(&[kind, status]).inc();
 }
 
 /// `reason` is a fixed word, never caller input.

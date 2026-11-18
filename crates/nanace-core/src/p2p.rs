@@ -106,6 +106,163 @@ pub fn bind_message(challenge: &str, peer_id: &str, user_id: Uuid) -> Vec<u8> {
     message
 }
 
+/// Domain separators of message signatures.
+const REQUEST_CONTEXT: &[u8] = b"nanace-p2p-request-v1\0";
+const ANSWER_CONTEXT: &[u8] = b"nanace-p2p-answer-v1\0";
+
+/// Short enough for the page tag `trace-<id>` (tags hold 50 characters).
+pub const MAX_TRACE_ID_BYTES: usize = 44;
+pub const MAX_REFS: usize = 16;
+
+/// One end of a message: an agent of a peer, and the user the peer is bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Party {
+    pub peer_id: String,
+    pub agent_label: String,
+    pub user_id: Uuid,
+}
+
+/// The signed part of a request: everything about a message except its
+/// text, which it pins by hash. The server can therefore check who sent what
+/// to whom without ever seeing a body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestHeader {
+    pub v: u32,
+    pub request_id: Uuid,
+    pub trace_id: String,
+    pub org_id: Uuid,
+    pub team_id: Uuid,
+    pub from: Party,
+    pub to: Party,
+    pub kind: MessageKind,
+    /// Hex sha256 of the body.
+    pub body_hash: String,
+    pub body_bytes: u32,
+    /// Pages of the team the message points to.
+    pub refs: Vec<Uuid>,
+    /// How many agents the conversation passed through before this message.
+    pub hop: u32,
+    /// Unix seconds.
+    pub sent_at: i64,
+    /// Unix seconds after which the request is void.
+    pub deadline: i64,
+    /// The sender's view of the team policy; the receiver applies its own.
+    pub policy_version: String,
+}
+
+/// How a request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerStatus {
+    Answered,
+    Rejected,
+    Expired,
+    Error,
+}
+
+impl AnswerStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Why a request was refused. A closed set: a refusal never carries text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectReason {
+    /// The team policy does not allow this call, or P2P is off.
+    Policy,
+    /// Too many requests from this peer.
+    Rate,
+    /// The message is larger than the policy allows.
+    Size,
+    /// The conversation passed through too many agents.
+    Hops,
+    /// The text matched a secret rule.
+    Pattern,
+    /// The user declined, or the receiver accepts nothing.
+    Consent,
+    /// Already seen, or sent outside the accepted time window.
+    Replay,
+    /// Malformed, wrongly signed or not addressed to this peer.
+    Invalid,
+    /// The addressed agent is not registered with this peer.
+    NoAgent,
+}
+
+impl RejectReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Rate => "rate",
+            Self::Size => "size",
+            Self::Hops => "hops",
+            Self::Pattern => "pattern",
+            Self::Consent => "consent",
+            Self::Replay => "replay",
+            Self::Invalid => "invalid",
+            Self::NoAgent => "no_agent",
+        }
+    }
+}
+
+/// The signed part of an answer, tied to its request by the hash of the
+/// request header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerHeader {
+    pub v: u32,
+    pub request_id: Uuid,
+    /// Hex sha256 of the request's header bytes.
+    pub request_hash: String,
+    pub status: AnswerStatus,
+    pub reason: Option<RejectReason>,
+    pub answered_by: Party,
+    pub body_hash: String,
+    pub body_bytes: u32,
+    pub refs: Vec<Uuid>,
+    pub sent_at: i64,
+}
+
+/// Hex sha256, as used for body and header hashes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The bytes signed for a request: a domain separator and the exact header
+/// bytes that travel, so no JSON canonicalization is involved.
+pub fn request_signing_bytes(header: &[u8]) -> Vec<u8> {
+    [REQUEST_CONTEXT, header].concat()
+}
+
+pub fn answer_signing_bytes(header: &[u8]) -> Vec<u8> {
+    [ANSWER_CONTEXT, header].concat()
+}
+
+/// Traces tie the messages of one task together; they also appear in page
+/// tags, so they stay within the tag alphabet.
+pub fn trace_id(value: &str) -> Result<(), ValidationError> {
+    let valid_chars = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if !value.is_empty() && value.len() <= MAX_TRACE_ID_BYTES && valid_chars {
+        Ok(())
+    } else {
+        Err(invalid(
+            "trace_id",
+            "must be 1-44 chars of a-z, A-Z, 0-9, '-', '_' or '.'",
+        ))
+    }
+}
+
 /// Labels name an agent inside a daemon, e.g. `alice/claude-code/7f3a`.
 pub fn agent_label(value: &str) -> Result<(), ValidationError> {
     let valid_chars = value
@@ -289,6 +446,27 @@ mod tests {
         let user = Uuid::nil();
         assert_ne!(bind_message("ab", "c", user), bind_message("a", "bc", user));
         assert!(bind_message("c", "p", user).starts_with(b"nanace-p2p-bind-v1\0"));
+    }
+
+    #[test]
+    fn signing_bytes_are_domain_separated() {
+        assert_ne!(request_signing_bytes(b"h"), answer_signing_bytes(b"h"));
+        assert!(request_signing_bytes(b"h").ends_with(b"h"));
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(trace_id("TASK-1.a_b").is_ok());
+        for bad in ["", "has space", "ж", &"a".repeat(45)] {
+            assert!(trace_id(bad).is_err(), "{bad}");
+        }
+        // Unknown fields in a signed header are refused, not ignored.
+        assert!(
+            serde_json::from_str::<Party>(
+                r#"{"peer_id":"p","agent_label":"a","user_id":"00000000-0000-0000-0000-000000000000","x":1}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

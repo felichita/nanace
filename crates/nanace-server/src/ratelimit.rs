@@ -21,6 +21,7 @@ pub enum RateClass {
     P2pBind,
     P2pPresence,
     P2pLookup,
+    P2pExchange,
 }
 
 impl RateClass {
@@ -30,6 +31,7 @@ impl RateClass {
             Self::P2pChallenge => 10.0,
             Self::P2pBind => 30.0,
             Self::P2pPresence | Self::P2pLookup => 120.0,
+            Self::P2pExchange => 240.0,
         }
     }
 }
