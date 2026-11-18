@@ -263,7 +263,8 @@ impl Net {
             clock: Arc::new(AtomicI64::new(NOW)),
             org: Uuid::new_v4(),
             team: Uuid::new_v4(),
-            root: std::env::temp_dir().join(format!("nanace-p2p-test-{}", Uuid::new_v4())),
+            // Short: a Unix socket path holds about a hundred bytes.
+            root: std::env::temp_dir().join(format!("np-{}", &Uuid::new_v4().simple().to_string()[..8])),
         };
         net.world.lock().unwrap().policies.insert(net.team, open_policy());
         net
@@ -1195,4 +1196,171 @@ async fn connections_to_peers_the_registry_drops_are_closed() {
         alice.daemon.send("alice", net.ask(&bob, "still there?")).await,
         Err(DaemonError::Registry(_))
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_ipc_separates_agents_from_the_desktop_app() {
+    use nanace_p2p::ipc::{IpcSecrets, listen};
+    use nanace_p2p::ipc_client::{IpcClient, IpcError};
+    use secrecy::SecretString;
+    use serde_json::json;
+
+    let net = Net::new();
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Ask)
+        .await;
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Ask)
+        .await;
+    // Bob's daemon starts detached; the IPC sessions below attach to it.
+    bob.daemon.unregister_agent("bob").await;
+    bob.daemon.set_supervisor(false).await;
+    let socket = bob.dir.join("s");
+    let secrets = Arc::new(IpcSecrets {
+        agent: SecretString::from("agent-secret".to_owned()),
+        supervisor: Some(SecretString::from("desktop-secret".to_owned())),
+    });
+    {
+        let (daemon, socket) = (Arc::clone(&bob.daemon), socket.clone());
+        tokio::spawn(async move { listen(daemon, secrets, &socket).await });
+    }
+    settle().await;
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // A wrong secret gets nothing, and an agent session must name its agent.
+    assert!(matches!(
+        IpcClient::connect(&socket, "guess", Some("bob"), &[]).await,
+        Err(IpcError::Rpc { code: -32000, .. })
+    ));
+    assert!(IpcClient::connect(&socket, "agent-secret", None, &[]).await.is_err());
+    assert!(matches!(
+        IpcClient::connect(&bob.dir.join("missing"), "agent-secret", Some("bob"), &[]).await,
+        Err(IpcError::Unreachable(_))
+    ));
+
+    let mut agent = IpcClient::connect(&socket, "agent-secret", Some("bob"), &["Infra".to_owned()])
+        .await
+        .unwrap();
+    let who = agent.call("whoami", json!({})).await.unwrap();
+    assert_eq!(who["peer_id"], bob.identity.peer_id.as_str());
+    assert_eq!(who["agents"], json!(["bob"]));
+    assert_eq!(
+        who["teams"][0]["effective_accept_mode"], "off",
+        "no desktop app attached yet"
+    );
+
+    // The desktop app attaches: now inbound is possible and prompts arrive.
+    let mut desktop = IpcClient::connect(&socket, "desktop-secret", None, &[]).await.unwrap();
+    let who = desktop.call("whoami", json!({})).await.unwrap();
+    assert_eq!(who["teams"][0]["effective_accept_mode"], "ask");
+    bob.daemon.tick().await;
+    let sent = alice.daemon.send("alice", net.ask(&bob, "which hosts?")).await.unwrap();
+    let notice = loop {
+        let notice = desktop.next_notice().await.unwrap();
+        if notice["event"] == "consent_request" {
+            break notice;
+        }
+    };
+    assert_eq!(notice["request"]["body"], "which hosts?");
+    assert_eq!(notice["request"]["from_email"], "alice@example.com");
+
+    // The agent cannot approve it, see what is pending, or change settings.
+    for (method, params) in [
+        (
+            "decide_consent",
+            json!({ "request_id": sent.request_id, "allow": true }),
+        ),
+        ("pending", json!({})),
+        (
+            "set_team",
+            json!({ "org_id": net.org, "team_id": net.team, "accept_mode": "team" }),
+        ),
+        ("stop_all", json!({})),
+    ] {
+        assert!(
+            matches!(
+                agent.call(method, params).await,
+                Err(IpcError::Rpc { code: -32001, .. })
+            ),
+            "{method}"
+        );
+    }
+    assert_eq!(agent.call("inbox", json!({})).await.unwrap(), json!([]));
+
+    desktop
+        .call(
+            "decide_consent",
+            json!({ "request_id": sent.request_id, "allow": true }),
+        )
+        .await
+        .unwrap();
+    let inbox = agent.call("inbox", json!({})).await.unwrap();
+    assert_eq!(inbox[0]["body"], "which hosts?");
+    agent
+        .call("reply", json!({ "request_id": sent.request_id, "body": "host-a" }))
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        alice.daemon.reply_of(sent.request_id).await.unwrap().answer.as_deref(),
+        Some("host-a")
+    );
+
+    // A refusal comes back with its reason, not as a generic failure.
+    let leak = agent
+        .call(
+            "ask",
+            json!({
+                "org_id": net.org, "team_id": net.team, "to_peer": alice.identity.peer_id, "to_agent": "alice",
+                "kind": "ask", "body": "token: 9f8e7d6c5b4a3f2e1d0c",
+            }),
+        )
+        .await;
+    assert!(
+        matches!(&leak, Err(IpcError::Rpc { code: -32002, reason: Some(reason), .. }) if reason == "pattern"),
+        "{leak:?}"
+    );
+    // `ask` with a wait returns the answer in one call.
+    alice
+        .daemon
+        .set_team(net.org, net.team, AcceptMode::Team)
+        .await
+        .unwrap();
+    net.policy(|p| p.max_accept_mode = AcceptMode::Team);
+    alice
+        .daemon
+        .set_status(
+            "alice",
+            AgentStatus {
+                step: "idle".to_owned(),
+                ..AgentStatus::default()
+            },
+        )
+        .await
+        .unwrap();
+    net.advance(31);
+    let answered = agent
+        .call(
+            "ask",
+            json!({
+                "org_id": net.org, "team_id": net.team, "to_peer": alice.identity.peer_id, "to_agent": "alice",
+                "kind": "status", "wait_secs": 5,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    assert!(answered["answer"].as_str().unwrap().contains("idle"));
+    assert!(agent.call("no_such_method", json!({})).await.is_err());
+
+    // Sessions end: the agent is unregistered, and without the desktop app
+    // the laptop accepts nothing again.
+    drop(agent);
+    drop(desktop);
+    settle().await;
+    let who = bob.daemon.whoami().await;
+    assert!(who.agents.is_empty());
+    assert_eq!(who.teams[0].effective_accept_mode, AcceptMode::Off);
 }

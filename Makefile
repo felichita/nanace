@@ -29,12 +29,12 @@ lint:
 test: ## Unit tests; no external services
 	cargo test --workspace
 
-test-integration: deps ## API, RLS and MCP tests against compose services
+test-integration: deps ## API, RLS, MCP and P2P tests against compose services
 	# qdrant-test keeps data in memory: start it empty and stop it afterwards
 	# (even when tests fail) so test collections do not hold RAM.
 	docker compose --profile test up -d --force-recreate qdrant-test
 	until curl -sf http://127.0.0.1:6335/readyz >/dev/null; do sleep 0.5; done
-	cargo test -p nanace-server -p nanace-mcp -- --ignored; status=$$?; docker compose --profile test stop qdrant-test; exit $$status
+	cargo test -p nanace-server -p nanace-mcp -p nanace-p2p -- --ignored; status=$$?; docker compose --profile test stop qdrant-test; exit $$status
 
 test-model: ## Real bge-small-en-v1.5 test; downloads the model on first run
 	cargo test -p nanace-embed -- --ignored

@@ -3366,6 +3366,7 @@ dependencies = [
 name = "nanace-p2p"
 version = "0.1.4"
 dependencies = [
+ "actix-web",
  "anyhow",
  "async-trait",
  "base64 0.23.1",
@@ -3375,11 +3376,14 @@ dependencies = [
  "getrandom 0.4.3",
  "libp2p",
  "nanace-core",
+ "nanace-embed",
+ "nanace-server",
  "regex",
  "reqwest 0.13.5",
  "secrecy",
  "serde",
  "serde_json",
+ "sqlx",
  "subtle",
  "thiserror 2.0.21",
  "tokio",

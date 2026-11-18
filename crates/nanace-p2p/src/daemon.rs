@@ -1281,6 +1281,12 @@ impl Daemon {
         Ok(())
     }
 
+    /// Whether the registry knows `peer_id` as a peer of one of our teams.
+    /// The network layer asks before it keeps a connection.
+    pub async fn vouches_for(&self, peer_id: &str) -> bool {
+        matches!(self.lookup(peer_id).await, Ok(Some(_)))
+    }
+
     // ----- periodic work --------------------------------------------------
 
     /// Retries deliveries, gives up what is past its deadline, reports to
@@ -1679,6 +1685,25 @@ impl Daemon {
             self.transport.disconnect(&connection.peer_id).await;
         }
         self.notify(Notice::Activity);
+    }
+
+    /// Withdraws every presence, on the way out.
+    pub async fn withdraw_all(&self) {
+        let (teams, agents) = {
+            let state = self.state.lock().await;
+            (
+                state.settings.teams.clone(),
+                state.agents.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for team in &teams {
+            for label in &agents {
+                let _ = self
+                    .registry
+                    .withdraw(team.org_id, team.team_id, &self.identity.peer_id, label)
+                    .await;
+            }
+        }
     }
 
     // ----- views ----------------------------------------------------------
