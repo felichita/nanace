@@ -3347,6 +3347,7 @@ dependencies = [
  "actix-web",
  "anyhow",
  "nanace-embed",
+ "nanace-p2p",
  "nanace-server",
  "reqwest 0.13.5",
  "rmcp",
