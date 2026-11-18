@@ -93,31 +93,39 @@ pub const PROTECTED_TITLE_PREFIXES: [&str; 2] = ["wiki", "policy"];
 /// Shown when a write to a protected page is refused.
 pub const PROTECTED_TITLE_MESSAGE: &str = "Policy: and Wiki: pages are edited only by the teamspace owner";
 
-/// Invisible format characters (Unicode category Cf), which could hide a
-/// protected prefix from a comparison while looking the same to a reader.
-/// SQL `nanace_is_protected_title` lists the same ranges.
-const FORMAT_CHARS: [(u32, u32); 21] = [
+/// Characters a reader does not see: format characters (Unicode Cf),
+/// variation selectors, the combining grapheme joiner, and fillers and
+/// blanks that render as nothing (Hangul fillers, the braille blank). They
+/// could hide a protected prefix from a comparison while the title looks the
+/// same. SQL `nanace_is_protected_title` lists the same ranges.
+const INVISIBLE_CHARS: [(u32, u32); 27] = [
     (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
     (0x0600, 0x0605),
     (0x061C, 0x061C),
     (0x06DD, 0x06DD),
     (0x070F, 0x070F),
     (0x0890, 0x0891),
     (0x08E2, 0x08E2),
-    (0x180E, 0x180E),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
     (0x200B, 0x200F),
     (0x202A, 0x202E),
     (0x2060, 0x2064),
     (0x2066, 0x206F),
+    (0x2800, 0x2800),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
     (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
     (0xFFF9, 0xFFFB),
     (0x110BD, 0x110BD),
     (0x110CD, 0x110CD),
     (0x13430, 0x1343F),
     (0x1BCA0, 0x1BCA3),
     (0x1D173, 0x1D17A),
-    (0xE0001, 0xE0001),
-    (0xE0020, 0xE007F),
+    (0xE0000, 0xE0FFF),
 ];
 
 /// White space as SQL `nanace_is_protected_title` lists it (Unicode
@@ -140,7 +148,7 @@ fn is_title_space(c: char) -> bool {
 }
 
 /// True when `title` names a protected page: after NFKC normalization and
-/// with invisible format characters removed, it starts with `wiki` or
+/// with invisible characters removed, it starts with `wiki` or
 /// `policy` in any ASCII case, optional white space and a colon. Only ASCII
 /// case is folded, so the result does not depend on a locale and matches the
 /// SQL function of the same name exactly.
@@ -149,7 +157,11 @@ pub fn is_protected_title(title: &str) -> bool {
 
     let normalized: String = title
         .nfkc()
-        .filter(|c| !FORMAT_CHARS.iter().any(|(lo, hi)| (*lo..=*hi).contains(&u32::from(*c))))
+        .filter(|c| {
+            !INVISIBLE_CHARS
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&u32::from(*c)))
+        })
         .collect();
     let rest = normalized.trim_start_matches(is_title_space);
     PROTECTED_TITLE_PREFIXES.iter().any(|prefix| {
@@ -187,7 +199,7 @@ pub fn resembles_protected_title(title: &str) -> bool {
 /// Titles and what [`is_protected_title`] and SQL `nanace_is_protected_title`
 /// must both answer for them.
 #[doc(hidden)]
-pub const PROTECTED_TITLE_CASES: [(&str, bool); 34] = [
+pub const PROTECTED_TITLE_CASES: [(&str, bool); 39] = [
     ("Wiki: Schema", true),
     ("Wiki: Index", true),
     ("Policy: P2P", true),
@@ -211,6 +223,12 @@ pub const PROTECTED_TITLE_CASES: [(&str, bool); 34] = [
     ("\u{202E}Policy\u{2060}: P2P", true),
     ("Wi\u{AD}ki: Schema", true),
     ("Wiki\u{E0041}: Schema", true),
+    // So are other characters that render as nothing.
+    ("Wi\u{34F}ki: Schema", true),
+    ("Wiki\u{FE0F}: Index", true),
+    ("W\u{180B}iki: Schema", true),
+    ("Wiki\u{3164}: Schema", true),
+    ("\u{2800}Wiki: Index", true),
     // Not protected.
     ("Wiki", false),
     ("Wikipedia: notes", false),

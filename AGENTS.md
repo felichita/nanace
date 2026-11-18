@@ -174,6 +174,10 @@ only for changed code, new evidence, or an explicit re-review request.
   not add a path that skips them or that executes anything on behalf of a
   message. Message text is never logged, reported to the server or put in
   an error. The built-in secret rules cannot be disabled by a policy.
+  Received requests are stored only within the caps at the top of
+  `daemon.rs`, and a record's text is cleared when its side of the exchange
+  ends; do not add a state that keeps text longer. Lookups caused by peers
+  the node or a daemon does not know stay behind a `Throttle`.
 - Only the supervisor role of the daemon's local socket answers consent
   prompts and changes settings; its secret is never written to disk.
 - JWTs and personal access tokens identify the user only. Never put roles or
@@ -182,7 +186,9 @@ only for changed code, new evidence, or an explicit re-review request.
   tokens); read-only handlers take `AuthUser`. Both reject `p2p`-scoped
   tokens. Only peer-registry handlers, `GET /me` and a token rotating or
   revoking itself take `PeerUser` / `AnyScopeUser`; never use those for a
-  handler that reads or writes pages.
+  handler that reads or writes pages. The one page text a `p2p` token
+  reaches is the guidance of its team's `Policy: P2P` (`get_policy` with
+  `text=true`), which the daemon hands to agents; do not add another.
 - The team role `agent` edits only contexts it created and never deletes:
   create and update check `TeamRole::Agent` plus
   `contexts::require_title_access`; everything else that writes keeps

@@ -5,6 +5,9 @@ version: 1
 enabled: true
 # The most permissive way a member may accept requests: off, ask, trusted or team.
 max_accept_mode: ask
+# true: members confirm every answer of their agent before it is sent. When
+# false, each member decides (the desktop app starts with it on).
+require_answer_review: false
 
 # Accounts that may run a peer without the desktop app (agents in containers).
 server_peers:

@@ -38,6 +38,8 @@ export interface P2pTeamView {
   accept_mode: AcceptMode;
   effective_accept_mode: AcceptMode;
   p2p_enabled: boolean;
+  /** The team policy makes the user confirm every answer. */
+  answer_review_required: boolean;
 }
 
 export interface WhoAmI {

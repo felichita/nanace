@@ -16,7 +16,7 @@ use nanace_core::p2p::{
 };
 use nanace_core::policy::{CallRule, P2pPolicy};
 use nanace_p2p::daemon::{AgentStatus, Daemon, DaemonError, InState, Notice, OutState, SendParams};
-use nanace_p2p::envelope::{Ack, Identity, Signed, Wire, open_request};
+use nanace_p2p::envelope::{Ack, Identity, Signed, Wire};
 use nanace_p2p::registry::{
     ExchangeReport, Me, PeerInfo, PolicyState, Presence, PresentPeer, Registry, RegistryError, RegistryResult,
     SharedTeam, TeamMembership,
@@ -297,6 +297,8 @@ impl Net {
         }
         node.daemon.register_agent(name, &[]).await.unwrap();
         node.daemon.set_supervisor(kind == ClientKind::Desktop).await;
+        // Answer review has its own test; elsewhere answers go straight out.
+        node.daemon.set_review_answers(false).await.unwrap();
         node.daemon.tick().await;
         node
     }
@@ -897,8 +899,9 @@ async fn nothing_secret_leaves_or_arrives() {
 async fn alice_request_hash(alice: &Node, request_id: Uuid) -> String {
     let path = alice.dir.join("spool").join("out").join(format!("{request_id}.json"));
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let signed: Signed = serde_json::from_value(record["request"].clone()).unwrap();
-    open_request(&signed).unwrap().hash
+    // Once delivered, the sender keeps the request's hash but not its text.
+    assert_eq!(record["request"]["body"], "");
+    record["hash"].as_str().unwrap().to_owned()
 }
 
 #[tokio::test]
@@ -1122,7 +1125,10 @@ async fn messages_and_settings_survive_a_restart_and_stop_all_stops() {
         .join("out")
         .join(format!("{}.json", sent.request_id));
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let signed: Signed = serde_json::from_value(record["request"].clone()).unwrap();
+    let mut signed: Signed = serde_json::from_value(record["request"].clone()).unwrap();
+    // Alice dropped the text once it was delivered; a replay carries it.
+    assert_eq!(signed.body, "");
+    signed.body = "before the restart".to_owned();
     assert_eq!(
         bob.daemon
             .handle_wire(&alice.identity.peer_id, Wire::Request(signed))
@@ -1196,6 +1202,303 @@ async fn connections_to_peers_the_registry_drops_are_closed() {
         alice.daemon.send("alice", net.ask(&bob, "still there?")).await,
         Err(DaemonError::Registry(_))
     ));
+}
+
+#[tokio::test]
+async fn one_sender_cannot_fill_the_queue_or_the_consent_prompts() {
+    let net = Net::new();
+    net.policy(|p| p.limits.rate_per_peer_per_min = 100);
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    // Bob is asked about every request: three of Alice's may wait at once.
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Ask)
+        .await;
+    let mut sent = Vec::new();
+    for n in 0..4 {
+        sent.push(
+            alice
+                .daemon
+                .send("alice", net.ask(&bob, &format!("question {n}")))
+                .await
+                .unwrap(),
+        );
+        settle().await;
+    }
+    assert_eq!(bob.daemon.pending().await.len(), 3);
+    assert_eq!(
+        alice.state_of(sent[3].request_id).await,
+        (OutState::Rejected, Some(RejectReason::Rate))
+    );
+    // Deciding one makes room for the next.
+    bob.daemon
+        .decide_consent(sent[0].request_id, false, None)
+        .await
+        .unwrap();
+    let again = alice.daemon.send("alice", net.ask(&bob, "question 4")).await.unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(again.request_id).await.0, OutState::Delivered);
+
+    // Carol accepts without asking: twenty unanswered requests of one user
+    // are kept, the next is refused.
+    let carol = net
+        .join("carol", Some(TeamRole::Writer), ClientKind::Server, AcceptMode::Team)
+        .await;
+    let mut last = None;
+    for n in 0..21 {
+        last = Some(
+            alice
+                .daemon
+                .send("alice", net.ask(&carol, &format!("task {n}")))
+                .await
+                .unwrap(),
+        );
+        settle().await;
+    }
+    assert_eq!(carol.daemon.inbox("carol").await.len(), 20);
+    assert_eq!(
+        alice.state_of(last.unwrap().request_id).await,
+        (OutState::Rejected, Some(RejectReason::Rate))
+    );
+    // Another user is not affected by Alice's backlog.
+    let dave = net
+        .join("dave", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let other = dave.daemon.send("dave", net.ask(&carol, "from dave")).await.unwrap();
+    settle().await;
+    assert_eq!(dave.state_of(other.request_id).await.0, OutState::Delivered);
+}
+
+/// A stored record of `node`, as it is on disk.
+fn spooled(node: &Node, kind: &str, request_id: Uuid) -> serde_json::Value {
+    let path = node.dir.join("spool").join(kind).join(format!("{request_id}.json"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn text_is_not_kept_once_an_exchange_is_over() {
+    let net = Net::new();
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let sent = alice
+        .daemon
+        .send("alice", net.ask(&bob, "which hosts are affected?"))
+        .await
+        .unwrap();
+    settle().await;
+    // Delivered: Alice no longer holds the question, Bob does until he answers.
+    assert_eq!(spooled(&alice, "out", sent.request_id)["request"]["body"], "");
+    assert_eq!(
+        spooled(&bob, "in", sent.request_id)["request"]["body"],
+        "which hosts are affected?"
+    );
+    bob.daemon
+        .reply("bob", sent.request_id, "host-a and host-b".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    let kept = spooled(&bob, "in", sent.request_id);
+    assert_eq!(
+        (&kept["request"]["body"], &kept["answer"]["body"]),
+        (&serde_json::json!(""), &serde_json::json!("")),
+        "the receiver keeps headers only"
+    );
+    assert!(bob.daemon.activity().await.incoming.iter().all(|i| i.body.is_empty()));
+
+    // Alice's agent reads the answer; a little later its text is gone too.
+    assert_eq!(
+        spooled(&alice, "out", sent.request_id)["answer"]["body"],
+        "host-a and host-b",
+        "kept until it is read"
+    );
+    let reply = alice.daemon.reply_of(sent.request_id).await.unwrap();
+    assert_eq!(reply.answer.as_deref(), Some("host-a and host-b"));
+    net.advance(300);
+    alice.daemon.tick().await;
+    assert_eq!(
+        alice.daemon.reply_of(sent.request_id).await.unwrap().answer.as_deref(),
+        Some("host-a and host-b"),
+        "still there for a second look"
+    );
+    net.advance(400);
+    alice.daemon.tick().await;
+    assert_eq!(spooled(&alice, "out", sent.request_id)["answer"]["body"], "");
+    let reply = alice.daemon.reply_of(sent.request_id).await.unwrap();
+    assert_eq!(
+        (reply.state, reply.answer, reply.answer_dropped),
+        (OutState::Answered, None, true)
+    );
+
+    // A notification is dropped as soon as the agent has it.
+    let mut note = net.ask(&bob, "summary written");
+    note.kind = MessageKind::Notify;
+    let note = alice.daemon.send("alice", note).await.unwrap();
+    settle().await;
+    assert_eq!(bob.daemon.inbox("bob").await[0].body, "summary written");
+    assert_eq!(spooled(&bob, "in", note.request_id)["request"]["body"], "");
+}
+
+#[tokio::test]
+async fn a_status_is_checked_like_any_other_text() {
+    let net = Net::new();
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    // A secret is refused when the agent records it.
+    let secret = AgentStatus {
+        step: "rotating keys".to_owned(),
+        findings: "password: Tr0ub4dor&3xyz".to_owned(),
+        busy: true,
+    };
+    assert_eq!(
+        refusal(bob.daemon.set_status("bob", secret).await),
+        RejectReason::Pattern
+    );
+    // The team's own patterns apply when the status is sent.
+    bob.daemon
+        .set_status(
+            "bob",
+            AgentStatus {
+                step: "working on ACME-4411".to_owned(),
+                findings: String::new(),
+                busy: true,
+            },
+        )
+        .await
+        .unwrap();
+    net.policy(|p| p.data.deny_outbound_patterns = vec![r"ACME-\d+".to_owned()]);
+    net.advance(31);
+    let mut status = net.ask(&bob, "");
+    status.kind = MessageKind::Status;
+    let sent = alice.daemon.send("alice", status).await.unwrap();
+    settle().await;
+    let reply = alice.daemon.reply_of(sent.request_id).await.unwrap();
+    assert_eq!(
+        (reply.state, reply.reason, reply.answer),
+        (OutState::Rejected, Some(RejectReason::Pattern), None)
+    );
+}
+
+#[tokio::test]
+async fn answers_and_addresses_are_checked_against_the_registry() {
+    let net = Net::new();
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    // Only a peer id is looked up: nothing else reaches the registry's URL.
+    for bad in ["../../orgs", "12D3KooW?x=1", ""] {
+        let mut params = net.ask(&bob, "hello");
+        params.to_peer = bad.to_owned();
+        assert!(
+            matches!(alice.daemon.send("alice", params).await, Err(DaemonError::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+
+    let sent = alice.daemon.send("alice", net.ask(&bob, "still there?")).await.unwrap();
+    settle().await;
+    let body = "yes".to_owned();
+    let answer = AnswerHeader {
+        v: 1,
+        request_id: sent.request_id,
+        request_hash: alice_request_hash(&alice, sent.request_id).await,
+        status: AnswerStatus::Answered,
+        reason: None,
+        answered_by: Party {
+            peer_id: bob.identity.peer_id.clone(),
+            agent_label: "bob".to_owned(),
+            user_id: bob.user,
+        },
+        body_hash: sha256_hex(body.as_bytes()),
+        body_bytes: u32::try_from(body.len()).unwrap(),
+        refs: vec![],
+        sent_at: NOW,
+    };
+    let wire = Wire::Answer(bob.identity.sign_answer(&answer, body));
+    // Bob's peer was revoked after the question was delivered: his answer,
+    // though correctly signed, is not taken.
+    net.world.lock().unwrap().peers.remove(&bob.identity.peer_id);
+    net.advance(31);
+    assert_eq!(
+        alice.daemon.handle_wire(&bob.identity.peer_id, wire).await,
+        Ack::Rejected(RejectReason::Invalid)
+    );
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Delivered);
+}
+
+#[tokio::test]
+async fn answers_wait_for_the_user_by_default_and_when_the_policy_requires_it() {
+    let net = Net::new();
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    // A daemon nobody configured holds answers for its user.
+    let stranger = Uuid::new_v4();
+    net.world
+        .lock()
+        .unwrap()
+        .emails
+        .insert(stranger, "fresh@example.com".to_owned());
+    let fresh = net
+        .start("fresh", Identity::from_secret([7u8; 32]), stranger, ClientKind::Desktop)
+        .await;
+    assert!(fresh.daemon.settings().await.review_answers);
+
+    // Bob turned it off: his answers go straight out.
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let sent = alice.daemon.send("alice", net.ask(&bob, "one")).await.unwrap();
+    settle().await;
+    bob.daemon
+        .reply("bob", sent.request_id, "first".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Answered);
+    assert!(!bob.daemon.whoami().await.teams[0].answer_review_required);
+
+    // The team owner requires review: Bob's setting no longer decides.
+    net.policy(|p| p.require_answer_review = true);
+    net.advance(31);
+    assert!(bob.daemon.whoami().await.teams[0].answer_review_required);
+    let sent = alice.daemon.send("alice", net.ask(&bob, "two")).await.unwrap();
+    settle().await;
+    bob.daemon
+        .reply("bob", sent.request_id, "second".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Delivered, "held");
+    assert_eq!(bob.daemon.pending().await[0].1.as_deref(), Some("second"));
+    bob.daemon.decide_review(sent.request_id, true).await.unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Answered);
+
+    // A peer without the desktop app has nobody to ask and answers itself.
+    let robo = net
+        .join("robo", Some(TeamRole::Agent), ClientKind::Server, AcceptMode::Team)
+        .await;
+    robo.daemon.set_review_answers(true).await.unwrap();
+    let sent = alice.daemon.send("alice", net.ask(&robo, "three")).await.unwrap();
+    settle().await;
+    robo.daemon
+        .reply("robo", sent.request_id, "third".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Answered);
 }
 
 #[cfg(unix)]

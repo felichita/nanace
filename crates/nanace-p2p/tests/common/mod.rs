@@ -203,6 +203,8 @@ pub async fn daemon(
     daemon.register_agent(name, &["infra".to_owned()]).await.unwrap();
     // The test plays the desktop app for a laptop daemon.
     daemon.set_supervisor(kind == ClientKind::Desktop).await;
+    // The stub agents answer on their own; nobody is there to confirm.
+    daemon.set_review_answers(false).await.unwrap();
     let ticks = {
         let daemon = Arc::clone(&daemon);
         actix_web::rt::spawn(async move {

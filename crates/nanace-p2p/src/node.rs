@@ -3,23 +3,32 @@
 //! the nanace API lists, holds no token, database access or message, and
 //! relays traffic that stays encrypted between the two daemons.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use libp2p::allow_block_list;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, autonat, identify, noise, ping, relay, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, autonat, connection_limits, identify, noise, ping, relay, tcp, yamux};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::net::IDENTIFY_PROTOCOL;
+use crate::throttle::{Throttle, source_of};
 
 /// How often the allow list is fetched. A revoked peer is disconnected
 /// within this time.
 const SYNC_INTERVAL: Duration = Duration::from_secs(10);
+/// After this many failed fetches in a row (half a minute) the last allow
+/// list is dropped and every peer is turned away.
+const MAX_FAILED_SYNCS: u32 = 3;
+/// How long a peer the server refused is not asked about again, how many
+/// such peers are remembered, and how many questions may be in flight.
+const REFUSED_FOR: Duration = Duration::from_secs(30);
+const MAX_REFUSED: usize = 4096;
+const MAX_ASKING: usize = 16;
 
 // In a module of its own so that the `allow` covers nothing but the derive's
 // output: `allow_block_list::Behaviour` emits `Infallible`, and compilers
@@ -29,10 +38,11 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 mod behaviour {
     use libp2p::allow_block_list::{self, AllowedPeers};
     use libp2p::swarm::NetworkBehaviour;
-    use libp2p::{autonat, identify, ping, relay};
+    use libp2p::{autonat, connection_limits, identify, ping, relay};
 
     #[derive(NetworkBehaviour)]
     pub(super) struct Behaviour {
+        pub(super) limits: connection_limits::Behaviour,
         pub(super) allowed: allow_block_list::Behaviour<AllowedPeers>,
         pub(super) relay: relay::Behaviour,
         pub(super) autonat: autonat::Behaviour,
@@ -49,6 +59,14 @@ pub struct Limits {
     pub max_circuits_per_peer: usize,
     pub max_circuit_secs: u64,
     pub max_circuit_bytes: u64,
+    /// Inbound connections still shaking hands.
+    pub max_pending_connections: u32,
+    pub max_connections: u32,
+    pub max_connections_per_peer: u32,
+    /// Questions to the server about peers missing from the allow list,
+    /// per minute: from one remote address and in all.
+    pub allow_lookups_per_source: u32,
+    pub allow_lookups: u32,
 }
 
 impl Default for Limits {
@@ -59,6 +77,11 @@ impl Default for Limits {
             max_circuits_per_peer: 16,
             max_circuit_secs: 600,
             max_circuit_bytes: 2 * 1024 * 1024,
+            max_pending_connections: 128,
+            max_connections: 4096,
+            max_connections_per_peer: 8,
+            allow_lookups_per_source: 6,
+            allow_lookups: 120,
         }
     }
 }
@@ -138,6 +161,12 @@ pub async fn run(config: NodeConfig) -> anyhow::Result<()> {
         .with_behaviour(|key| {
             let peer = key.public().to_peer_id();
             Behaviour {
+                limits: connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_pending_incoming(Some(limits.max_pending_connections))
+                        .with_max_established_incoming(Some(limits.max_connections))
+                        .with_max_established_per_peer(Some(limits.max_connections_per_peer)),
+                ),
                 allowed: allow_block_list::Behaviour::default(),
                 relay: relay::Behaviour::new(
                     peer,
@@ -179,12 +208,22 @@ pub async fn run(config: NodeConfig) -> anyhow::Result<()> {
     });
     let (answers, mut answered) = mpsc::channel::<(PeerId, bool)>(256);
     let mut asking: HashSet<PeerId> = HashSet::new();
+    // Peers the server said no about, so a retry does not ask again at once.
+    let mut refused: HashMap<PeerId, Instant> = HashMap::new();
+    let mut lookups = Throttle::new(
+        limits.allow_lookups_per_source,
+        limits.allow_lookups,
+        Duration::from_secs(60),
+    );
+    let mut failed_syncs = 0u32;
     let mut sync = tokio::time::interval(SYNC_INTERVAL);
     let (mut reservations, mut circuits) = (0u64, 0u64);
     loop {
         tokio::select! {
             _ = sync.tick() => match api.allowed().await {
                 Ok(allowed) => {
+                    failed_syncs = 0;
+                    refused.retain(|_, at| at.elapsed() < REFUSED_FOR);
                     let current: Vec<PeerId> = swarm.behaviour().allowed.allowed_peers().iter().copied().collect();
                     for peer in current {
                         if !allowed.contains(&peer) {
@@ -197,20 +236,47 @@ pub async fn run(config: NodeConfig) -> anyhow::Result<()> {
                         swarm.behaviour_mut().allowed.allow_peer(peer);
                     }
                 }
-                // Fail closed slowly: keep the last list and try again. A
-                // peer revoked meanwhile stays until the API answers.
-                Err(err) => tracing::warn!(event = "allow_list_failed", component = "nanace_p2p", error = %format!("{err:#}"), "could not fetch the allow list"),
+                // Keep the last list over a short outage, then fail closed:
+                // without the server nobody can be shown to be allowed, and a
+                // peer revoked meanwhile must not keep its relay access.
+                Err(err) => {
+                    failed_syncs += 1;
+                    tracing::warn!(event = "allow_list_failed", component = "nanace_p2p", failures = failed_syncs, error = %format!("{err:#}"), "could not fetch the allow list");
+                    if failed_syncs == MAX_FAILED_SYNCS {
+                        let current: Vec<PeerId> = swarm.behaviour().allowed.allowed_peers().iter().copied().collect();
+                        for peer in current {
+                            swarm.behaviour_mut().allowed.disallow_peer(peer);
+                        }
+                        tracing::error!(event = "allow_list_expired", component = "nanace_p2p", "the allow list is too old: every peer is turned away until the server answers");
+                    }
+                }
             },
             Some((peer, allowed)) = answered.recv() => {
                 asking.remove(&peer);
                 if allowed {
                     swarm.behaviour_mut().allowed.allow_peer(peer);
+                } else {
+                    if refused.len() >= MAX_REFUSED {
+                        refused.clear();
+                    }
+                    refused.insert(peer, Instant::now());
                 }
             }
             event = swarm.select_next_some() => match event {
                 // A peer not in the last snapshot: ask about it once, so a
                 // daemon that just announced itself gets in on its retry.
-                SwarmEvent::IncomingConnectionError { peer_id: Some(peer), .. } if asking.insert(peer) => {
+                // A new key costs a stranger nothing and each question is a
+                // database query on the server, so questions are bounded:
+                // per remote address, in all, in flight, and not repeated
+                // for a peer just refused.
+                SwarmEvent::IncomingConnectionError { peer_id: Some(peer), send_back_addr, .. }
+                    if failed_syncs < MAX_FAILED_SYNCS
+                        && asking.len() < MAX_ASKING
+                        && !asking.contains(&peer)
+                        && refused.get(&peer).is_none_or(|at| at.elapsed() >= REFUSED_FOR)
+                        && lookups.allow(source_of(&send_back_addr), Instant::now()) =>
+                {
+                    asking.insert(peer);
                     let (api, answers) = (std::sync::Arc::clone(&api), answers.clone());
                     tokio::spawn(async move {
                         let allowed = api.allow(peer).await.unwrap_or(false);

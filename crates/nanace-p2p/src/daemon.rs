@@ -40,6 +40,22 @@ const KEEP_FINISHED_SECS: i64 = 24 * 3600;
 const MAX_RETRY_DELAY_SECS: i64 = 60;
 /// The longest lifetime a policy can give a request.
 const MAX_REQUEST_TTL_SECS: i64 = 86_400;
+/// Received requests that are not finished yet: how many are kept in all,
+/// how many from one user, and how much text they may hold together. More
+/// are refused with `rate`, so teammates cannot fill the memory or the disk
+/// of this machine.
+const MAX_OPEN_INCOMING: usize = 200;
+const MAX_OPEN_INCOMING_PER_SENDER: usize = 20;
+const MAX_OPEN_INCOMING_BYTES: usize = 8 * 1024 * 1024;
+/// Requests that may wait for the user's decision at once, in all and from
+/// one user: nobody is asked the same thing by one sender dozens of times.
+const MAX_PENDING_CONSENT: usize = 30;
+const MAX_PENDING_CONSENT_PER_SENDER: usize = 3;
+/// Finished received requests (headers only) kept for the activity view;
+/// the oldest go first.
+const MAX_FINISHED_INCOMING: usize = 1000;
+/// An answer's text stays readable this long after the agent first read it.
+const KEEP_READ_ANSWER_SECS: i64 = 600;
 
 /// Why the daemon would not do what a local agent or the desktop asked.
 #[derive(Debug, thiserror::Error)]
@@ -79,13 +95,27 @@ pub struct TeamSettings {
 }
 
 /// What survives a restart besides the spool.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub teams: Vec<TeamSettings>,
-    /// Hold an agent's answer until the user confirms it (desktop only).
-    #[serde(default)]
+    /// Hold an agent's answer until the user confirms it (desktop only). On
+    /// unless the user turns it off; a team policy can require it.
+    #[serde(default = "review_by_default")]
     pub review_answers: bool,
+}
+
+fn review_by_default() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            teams: Vec::new(),
+            review_answers: review_by_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +148,12 @@ struct Outgoing {
     answer: Option<Signed>,
     /// Set when the answer broke a secret rule; its body was dropped.
     answer_blocked: Option<String>,
+    /// When the agent first read the answer; its text is dropped soon after.
+    #[serde(default)]
+    answer_read_at: Option<i64>,
+    /// The answer's text was read and has been removed since.
+    #[serde(default)]
+    answer_dropped: bool,
     /// Addresses the registry listed for the receiver when it was sent.
     addrs: Vec<String>,
     attempts: u32,
@@ -253,6 +289,8 @@ pub struct ReplyView {
     pub answer_refs: Vec<Uuid>,
     /// Name of the secret rule the answer broke, if it was dropped.
     pub answer_blocked: Option<String>,
+    /// The answer was read earlier and its text is no longer kept.
+    pub answer_dropped: bool,
     /// The team policy asks for a summary page after this kind of exchange.
     pub summary_required: bool,
     pub summary_title_prefix: Option<String>,
@@ -302,6 +340,8 @@ pub struct TeamView {
     pub effective_accept_mode: AcceptMode,
     pub p2p_enabled: bool,
     pub policy_version: Option<String>,
+    /// The team policy makes the user confirm every answer.
+    pub answer_review_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -547,6 +587,16 @@ impl Daemon {
                 "status: step is at most 500 bytes and findings 4000".to_owned(),
             ));
         }
+        // A status is handed to teammates without waking the agent, so it is
+        // checked like any outgoing text; the team's own patterns are applied
+        // when it is sent.
+        let text = format!("{}\n{}", status.step, status.findings);
+        if let Some(rule) = SecretScanner::new(&[]).ok().and_then(|scanner| scanner.find(&text)) {
+            return refused(
+                RejectReason::Pattern,
+                format!("the status looks like it contains a secret (rule `{rule}`); remove it"),
+            );
+        }
         let mut state = self.state.lock().await;
         let agent = state.agents.get_mut(label).ok_or(DaemonError::NotFound)?;
         agent.status = status;
@@ -570,6 +620,7 @@ impl Daemon {
         if params.kind != MessageKind::Status && params.body.trim().is_empty() {
             return Err(DaemonError::Invalid("body must not be empty".to_owned()));
         }
+        p2p::peer_id(&params.to_peer).map_err(|e| DaemonError::Invalid(e.to_string()))?;
         if params.to_peer == self.identity.peer_id {
             return Err(DaemonError::Invalid("a peer does not message itself".to_owned()));
         }
@@ -683,6 +734,8 @@ impl Daemon {
             reason: None,
             answer: None,
             answer_blocked: None,
+            answer_read_at: None,
+            answer_dropped: false,
             addrs,
             attempts: 0,
             next_try: now,
@@ -722,15 +775,18 @@ impl Daemon {
             return;
         };
         match outcome {
+            // Either way it is not sent again, so its text is not kept.
             Ok(Ack::Accepted) => {
                 record.state = OutState::Delivered;
                 record.report_due = true;
+                record.request.body.clear();
             }
             Ok(Ack::Rejected(reason)) => {
                 record.state = OutState::Rejected;
                 record.reason = Some(reason);
                 record.finished_at = Some(now);
                 record.report_due = true;
+                record.request.body.clear();
             }
             Err(_) => {
                 record.attempts += 1;
@@ -745,9 +801,16 @@ impl Daemon {
 
     /// A sent request and its answer, if any.
     pub async fn reply_of(&self, request_id: Uuid) -> DaemonResult<ReplyView> {
+        let now = self.now();
         let record = {
-            let state = self.state.lock().await;
-            state.out.get(&request_id).cloned().ok_or(DaemonError::NotFound)?
+            let mut state = self.state.lock().await;
+            let record = state.out.get_mut(&request_id).ok_or(DaemonError::NotFound)?;
+            // The agent has the answer now; its text is dropped a little later.
+            if record.answer.as_ref().is_some_and(|a| !a.body.is_empty()) && record.answer_read_at.is_none() {
+                record.answer_read_at = Some(now);
+                self.save_out(record);
+            }
+            record.clone()
         };
         Ok(self.reply_view(&record).await)
     }
@@ -780,6 +843,7 @@ impl Daemon {
             answer: answer.as_ref().filter(|_| answered).map(|(body, _)| body.clone()),
             answer_refs: answer.filter(|_| answered).map(|(_, refs)| refs).unwrap_or_default(),
             answer_blocked: record.answer_blocked.clone(),
+            answer_dropped: record.answer_dropped,
             summary_required: answered
                 && summaries
                     .as_ref()
@@ -898,6 +962,30 @@ impl Daemon {
             AcceptMode::Trusted if trusted => (InState::Inbox, Some(Consent::Auto)),
             AcceptMode::Ask | AcceptMode::Trusted => (InState::PendingConsent, None),
         };
+        // 7. Room for it: unfinished requests are bounded in number, per
+        //    sender and in bytes, and so are the questions put to the user.
+        let (mut open, mut open_sender, mut open_bytes) = (0usize, 0usize, signed.body.len());
+        let (mut asking, mut asking_sender) = (0usize, 0usize);
+        for other in state.inc.values().filter(|r| r.state != InState::Done) {
+            let same_sender = other.header.from.user_id == header.from.user_id;
+            open += 1;
+            open_sender += usize::from(same_sender);
+            open_bytes += other.request.body.len()
+                + other.answer.as_ref().map_or(0, |a| a.body.len())
+                + other.draft.as_ref().map_or(0, |(body, _)| body.len());
+            if other.state == InState::PendingConsent {
+                asking += 1;
+                asking_sender += usize::from(same_sender);
+            }
+        }
+        if open >= MAX_OPEN_INCOMING
+            || open_sender >= MAX_OPEN_INCOMING_PER_SENDER
+            || open_bytes > MAX_OPEN_INCOMING_BYTES
+            || (in_state == InState::PendingConsent
+                && (asking >= MAX_PENDING_CONSENT || asking_sender >= MAX_PENDING_CONSENT_PER_SENDER))
+        {
+            return Err(RejectReason::Rate);
+        }
         let record = Incoming {
             hash: opened.hash,
             from_email: sender.email,
@@ -938,15 +1026,40 @@ impl Daemon {
             if record.header.kind != MessageKind::Status {
                 return;
             }
-            state
-                .agents
-                .get(&record.header.to.agent_label)
-                .map(|a| a.status.clone())
-                .unwrap_or_default()
+            (
+                state
+                    .agents
+                    .get(&record.header.to.agent_label)
+                    .map(|a| a.status.clone())
+                    .unwrap_or_default(),
+                record.header.org_id,
+                record.header.team_id,
+            )
         };
+        let (status, org_id, team_id) = status;
         let body = serde_json::to_string(&status).unwrap_or_default();
-        self.finish(request_id, AnswerStatus::Answered, None, body, Vec::new())
-            .await;
+        // Checked like an answer the agent wrote: the team's patterns apply,
+        // and without a policy nothing is sent.
+        let refusal = match self.policy(org_id, team_id).await {
+            Ok(Some(team)) => team.scanner.find(&body).map(|_| RejectReason::Pattern),
+            _ => Some(RejectReason::Policy),
+        };
+        match refusal {
+            Some(reason) => {
+                self.finish(
+                    request_id,
+                    AnswerStatus::Rejected,
+                    Some(reason),
+                    String::new(),
+                    Vec::new(),
+                )
+                .await;
+            }
+            None => {
+                self.finish(request_id, AnswerStatus::Answered, None, body, Vec::new())
+                    .await;
+            }
+        }
     }
 
     /// The user's decision on a request that waited for consent. Desktop only.
@@ -1023,6 +1136,8 @@ impl Daemon {
             {
                 record.state = InState::Done;
                 record.finished_at = Some(now);
+                // Handed over; its text is not kept.
+                record.request.body.clear();
                 self.save_in(record);
             }
         }
@@ -1075,7 +1190,8 @@ impl Daemon {
         }
         let review = {
             let mut state = self.state.lock().await;
-            let review = self.kind == ClientKind::Desktop && state.settings.review_answers;
+            let review = self.kind == ClientKind::Desktop
+                && (state.settings.review_answers || team.policy.require_answer_review);
             let record = state
                 .inc
                 .get_mut(&request_id)
@@ -1143,6 +1259,7 @@ impl Daemon {
             if record.header.kind == MessageKind::Notify {
                 record.state = InState::Done;
                 record.finished_at = Some(now);
+                record.request.body.clear();
                 self.save_in(record);
                 return;
             }
@@ -1163,6 +1280,9 @@ impl Daemon {
                 sent_at: now,
             };
             record.answer = Some(self.identity.sign_answer(&header, body));
+            // Answered: the question's text is not needed again.
+            record.request.body.clear();
+            record.draft = None;
             record.state = InState::AnswerQueued;
             record.attempts = 0;
             record.next_try = now;
@@ -1195,11 +1315,15 @@ impl Daemon {
             return;
         };
         match outcome {
-            // Taken or refused, the sender has its outcome either way.
+            // Taken or refused, the sender has its outcome either way, and
+            // the answer's text is not kept here.
             Ok(_) => {
                 record.state = InState::Done;
                 record.finished_at = Some(now);
                 record.report_due = true;
+                if let Some(answer) = record.answer.as_mut() {
+                    answer.body.clear();
+                }
             }
             Err(_) => {
                 record.attempts += 1;
@@ -1245,6 +1369,15 @@ impl Daemon {
             )
         };
         let header = open_answer(&signed, &opened).ok_or(RejectReason::Invalid)?;
+        // The registry still vouches for the answering peer: bound to the
+        // user the request went to and present in the team. A revoked peer's
+        // answer is refused; on a registry failure it is sent again.
+        self.lookup(from_peer)
+            .await
+            .ok()
+            .flatten()
+            .filter(|info| info.user_id == opened.header.to.user_id && info.role_in(team_id).is_some())
+            .ok_or(RejectReason::Invalid)?;
         // The answer is scanned before a model sees it; a blocked answer is
         // recorded as answered with its text dropped.
         let blocked = match self.policy(org_id, team_id).await {
@@ -1273,6 +1406,7 @@ impl Daemon {
             None => signed,
         });
         record.answer_blocked = blocked;
+        record.request.body.clear();
         record.finished_at = Some(now);
         record.report_due = true;
         let record = record.clone();
@@ -1347,6 +1481,7 @@ impl Daemon {
                     record.state = OutState::Expired;
                     record.finished_at = Some(now);
                     record.report_due = true;
+                    record.request.body.clear();
                     expired_out.push(record.clone());
                 }
             }
@@ -1374,6 +1509,9 @@ impl Daemon {
                     record.state = InState::Done;
                     record.finished_at = Some(now);
                     record.report_due = true;
+                    if let Some(answer) = record.answer.as_mut() {
+                        answer.body.clear();
+                    }
                     self.save_in(record);
                 }
             }
@@ -1528,6 +1666,32 @@ impl Daemon {
             for id in old_in {
                 state.inc.remove(&id);
                 self.spool.remove("in", id);
+            }
+            // Finished requests are kept as headers; beyond the cap the
+            // oldest reported ones go early.
+            let mut finished: Vec<(i64, Uuid)> = state
+                .inc
+                .values()
+                .filter(|r| r.state == InState::Done && !r.report_due)
+                .filter_map(|r| Some((r.finished_at?, r.header.request_id)))
+                .collect();
+            if finished.len() > MAX_FINISHED_INCOMING {
+                finished.sort_unstable();
+                let extra = finished.len() - MAX_FINISHED_INCOMING;
+                for (_, id) in finished.into_iter().take(extra) {
+                    state.inc.remove(&id);
+                    self.spool.remove("in", id);
+                }
+            }
+            // An answer the agent has read does not stay on disk.
+            for record in state.out.values_mut() {
+                if record.answer_read_at.is_some_and(|at| now - at > KEEP_READ_ANSWER_SECS)
+                    && let Some(answer) = record.answer.as_mut().filter(|a| !a.body.is_empty())
+                {
+                    answer.body.clear();
+                    record.answer_dropped = true;
+                    self.save_out(record);
+                }
             }
             state
                 .seen
@@ -1738,6 +1902,7 @@ impl Daemon {
                 accept_mode: team.accept_mode,
                 effective_accept_mode: effective,
                 p2p_enabled: policy.is_some(),
+                answer_review_required: policy.as_ref().is_some_and(|p| p.policy.require_answer_review),
                 policy_version: policy.map(|p| p.version.clone()),
             });
         }

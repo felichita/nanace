@@ -239,6 +239,8 @@ export function P2PDialog({ onClose }: { onClose: () => void }) {
   const running = state.data?.running ?? false;
   const whoami = useQuery({ queryKey: ["p2p-whoami"], queryFn: p2p.whoami, enabled: running, refetchInterval: 5000 });
   const settings = useQuery({ queryKey: ["p2p-settings"], queryFn: p2p.settings, enabled: running });
+  // A team policy can make answer review mandatory; then it is not a choice.
+  const reviewRequired = whoami.data?.teams.some((t) => t.answer_review_required) ?? false;
   const policies = useQueries({
     queries: ws.myTeams.map((t) => ({
       queryKey: ["p2p-policy", ws.org.id, t.id],
@@ -356,14 +358,16 @@ export function P2PDialog({ onClose }: { onClose: () => void }) {
                 <input
                   type="checkbox"
                   className="mt-0.5"
-                  checked={settings.data?.review_answers ?? false}
-                  disabled={busy || !settings.data}
+                  checked={reviewRequired || (settings.data?.review_answers ?? true)}
+                  disabled={busy || !settings.data || reviewRequired}
                   onChange={(e) => void run(() => p2p.setReviewAnswers(e.target.checked))}
                 />
                 <span>
                   Show me each answer before it is sent
                   <span className="block text-xs text-ink-3">
-                    Your agent's answer waits until you confirm it. Secrets are blocked either way.
+                    {reviewRequired
+                      ? "Required by a team's policy: your agent's answer waits until you confirm it."
+                      : "Your agent's answer waits until you confirm it. Secrets are blocked either way."}
                   </span>
                 </span>
               </label>

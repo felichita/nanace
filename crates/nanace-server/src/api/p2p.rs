@@ -51,6 +51,8 @@ const MIN_PRESENCE_TTL_SECS: u32 = 15;
 const MAX_AGENTS_PER_PEER: i64 = 16;
 const DEFAULT_PEERS_LIMIT: i64 = 50;
 const MAX_PEERS_LIMIT: i64 = 200;
+/// Revoked peers remembered per user, newest first.
+const KEPT_REVOKED_PEERS: i64 = 50;
 
 async fn challenge(state: web::Data<AppState>, user: PeerUser) -> ApiResult<HttpResponse> {
     state.rate_limiter.check(user.user_id, RateClass::P2pChallenge)?;
@@ -146,6 +148,17 @@ async fn bind_peer(
     if active >= i64::from(state.p2p.max_peers_per_user) {
         return Err(ApiError::Conflict("too many bound peers; revoke one first".to_owned()));
     }
+    // Revoked peers stay, so a revoked key cannot be bound again, but not
+    // without end: beyond the newest ones the oldest are forgotten.
+    sqlx::query(
+        "DELETE FROM p2p_peers WHERE user_id = $1 AND revoked_at IS NOT NULL AND peer_id NOT IN ( \
+             SELECT peer_id FROM p2p_peers WHERE user_id = $1 AND revoked_at IS NOT NULL \
+             ORDER BY revoked_at DESC, peer_id LIMIT $2)",
+    )
+    .bind(user.user_id)
+    .bind(KEPT_REVOKED_PEERS)
+    .execute(&mut *tx)
+    .await?;
     let inserted: Result<PeerRow, sqlx::Error> = sqlx::query_as(
         "INSERT INTO p2p_peers (peer_id, user_id, public_key, client_kind, client_version) \
          VALUES ($1, $2, $3, $4, $5) \
@@ -183,6 +196,7 @@ async fn bind_peer(
 }
 
 async fn my_peers(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
+    state.rate_limiter.check(user.user_id, RateClass::P2pRead)?;
     let mut tx = db::user_tx(&state.pool, user.user_id).await?;
     let mine: Vec<PeerRow> = sqlx::query_as(
         "SELECT peer_id, client_kind, client_version, created_at, last_seen_at, revoked_at \
@@ -198,6 +212,7 @@ async fn my_peers(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<H
 /// Revokes one of the caller's peers for good and ends its presence
 /// everywhere. Someone else's peer is `404`, like one that does not exist.
 async fn revoke_peer(state: web::Data<AppState>, user: PeerUser, path: web::Path<String>) -> ApiResult<HttpResponse> {
+    state.rate_limiter.check(user.user_id, RateClass::P2pBind)?;
     let peer_id = path.into_inner();
     let mut tx = db::user_tx(&state.pool, user.user_id).await?;
     let revoked = sqlx::query(
@@ -272,16 +287,29 @@ async fn lookup_peer(
     let (user_id, email, public_key) = owner.ok_or(ApiError::NotFound)?;
     // Row security limits presence to the caller's teams; the join keeps the
     // teams whose policy enables P2P.
-    let shared: Vec<SharedTeam> = sqlx::query_as(
-        "SELECT DISTINCT pr.org_id, pr.team_id, m.role FROM p2p_presence pr \
+    let present: Vec<(Uuid, Uuid, String, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT DISTINCT pr.org_id, pr.team_id, m.role, me.role, pp.parsed FROM p2p_presence pr \
          JOIN team_members m ON m.team_id = pr.team_id AND m.user_id = pr.user_id \
+         JOIN team_members me ON me.team_id = pr.team_id AND me.user_id = $2 \
          JOIN p2p_policies pp ON pp.team_id = pr.team_id AND pp.valid AND (pp.parsed->>'enabled')::boolean \
          WHERE pr.peer_id = $1 AND pr.expires_at > now() ORDER BY pr.org_id, pr.team_id",
     )
     .bind(&peer_id)
+    .bind(user.user_id)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
+    // Like the peer list: a team counts only when its policy shows peers to
+    // the caller's role there. A policy this version cannot read shows none.
+    let shared: Vec<SharedTeam> = present
+        .into_iter()
+        .filter(|(_, _, _, my_role, policy)| {
+            my_role.parse::<TeamRole>().is_ok_and(|role| {
+                serde_json::from_value::<P2pPolicy>(policy.clone()).is_ok_and(|policy| policy.visible_to(role))
+            })
+        })
+        .map(|(org_id, team_id, role, _, _)| SharedTeam { org_id, team_id, role })
+        .collect();
     if shared.is_empty() {
         return Err(ApiError::NotFound);
     }
@@ -473,6 +501,7 @@ async fn delete_presence(
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id, peer_id, agent_label) = path.into_inner();
     access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
+    state.rate_limiter.check(user.user_id, RateClass::P2pPresence)?;
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     let removed = sqlx::query(
         "DELETE FROM p2p_presence WHERE team_id = $1 AND peer_id = $2 AND agent_label = $3 AND user_id = $4",
@@ -533,6 +562,7 @@ async fn list_peers(
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id) = path.into_inner();
     let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
+    state.rate_limiter.check(user.user_id, RateClass::P2pRead)?;
     let limit = query.limit.unwrap_or(DEFAULT_PEERS_LIMIT);
     if !(1..=MAX_PEERS_LIMIT).contains(&limit) {
         return Err(ApiError::BadRequest(format!("limit must be 1-{MAX_PEERS_LIMIT}")));
@@ -776,6 +806,7 @@ async fn get_policy(
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id) = path.into_inner();
     access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
+    state.rate_limiter.check(user.user_id, RateClass::P2pRead)?;
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     let stored = stored_policy(&mut tx, team_id).await?;
     let mut response = PolicyResponse {
@@ -1017,15 +1048,17 @@ async fn report_exchange(
     if bound != 2 {
         return Err(invalid("a peer in the request is not bound to the user it names"));
     }
-    sqlx::query(
+    let written = sqlx::query(
         "INSERT INTO p2p_exchanges (id, org_id, team_id, request_id, reported_by, reporter_user, trace_id, \
              from_peer, from_agent, from_user, to_peer, to_agent, to_user, kind, status, reject_reason, consent, \
              hop, bytes_out, bytes_in, request_hash, answer_verified, policy_version, sent_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
                  $22, $23, $24) \
-         ON CONFLICT (request_id, reported_by) DO UPDATE SET status = EXCLUDED.status, \
+         ON CONFLICT (request_id, reported_by, reporter_user) DO UPDATE SET status = EXCLUDED.status, \
              reject_reason = EXCLUDED.reject_reason, consent = COALESCE(EXCLUDED.consent, p2p_exchanges.consent), \
-             bytes_in = EXCLUDED.bytes_in, answer_verified = EXCLUDED.answer_verified, updated_at = now()",
+             bytes_in = EXCLUDED.bytes_in, answer_verified = EXCLUDED.answer_verified, updated_at = now() \
+         WHERE p2p_exchanges.request_hash = EXCLUDED.request_hash \
+           AND (EXCLUDED.answer_verified OR NOT p2p_exchanges.answer_verified)",
     )
     .bind(Uuid::new_v4())
     .bind(org_id)
@@ -1052,7 +1085,30 @@ async fn report_exchange(
     .bind(&header.policy_version)
     .bind(sent_at)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if written == 0 {
+        // The reporter already has a row for this request id that the report
+        // may not replace. The same request with nothing new (a late
+        // "delivered" after the signed answer) changes nothing; a different
+        // header under the same id is refused.
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT request_hash FROM p2p_exchanges WHERE request_id = $1 AND reported_by = $2 AND reporter_user = $3",
+        )
+        .bind(header.request_id)
+        .bind(role)
+        .bind(user.user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return if stored.as_deref() == Some(request_hash.as_str()) {
+            Ok(HttpResponse::NoContent().finish())
+        } else {
+            Err(ApiError::Conflict(
+                "exchange report: this request id was already reported with a different request".to_owned(),
+            ))
+        };
+    }
     audit::record(
         &mut *tx,
         AuditEvent {

@@ -1158,6 +1158,17 @@ async fn policy_page_turns_p2p_on_and_limits_it() {
         .await;
     c.ok("GET", &lookup, &bob, None, StatusCode::OK).await;
 
+    // A lookup shows a peer's owner only to the roles the policy shows peers
+    // to: knowing a peer id is not enough.
+    let admins_only = with_server.replace("visible_to: [writer, admin]", "visible_to: [admin]");
+    assert_ne!(admins_only, with_server);
+    c.save_policy(&alice, org, dev, Some(&page_id), &admins_only, StatusCode::OK)
+        .await;
+    c.ok("GET", &lookup, &bob, None, StatusCode::NOT_FOUND).await;
+    c.save_policy(&alice, org, dev, Some(&page_id), &with_server, StatusCode::OK)
+        .await;
+    c.ok("GET", &lookup, &bob, None, StatusCode::OK).await;
+
     // Renaming the page away, or trashing it, turns P2P off; bringing it
     // back turns it on again.
     let page_uri = format!("{base}/contexts/{page_id}");
@@ -1200,7 +1211,7 @@ async fn policy_page_turns_p2p_on_and_limits_it() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(changes.len(), 9, "{changes:?}");
+    assert_eq!(changes.len(), 11, "{changes:?}");
     assert_eq!(changes[0], (None, Some(first_version.clone())));
     assert_eq!(changes[1].0.as_deref(), Some(first_version.as_str()));
     assert!(
@@ -1489,6 +1500,37 @@ async fn exchange_reports_are_verified_and_journaled() {
         json!([])
     );
 
+    // A late "delivered" does not take the verified answer back, and the
+    // same request id cannot be reported again as a different request.
+    c.ok(
+        "POST",
+        &uri,
+        &alice,
+        Some(report("sender", &request, &request_sig)),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let mut rewritten = header.clone();
+    rewritten.kind = MessageKind::Notify;
+    rewritten.trace_id = "TASK-2".to_owned();
+    let (rewritten_bytes, rewritten_sig) = signed_request(&alice_key, &rewritten);
+    let (status, body) = c
+        .call(
+            "POST",
+            &uri,
+            &alice,
+            Some(report("sender", &rewritten_bytes, &rewritten_sig)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let journal = c.ok("GET", &uri, &alice, None, StatusCode::OK).await;
+    for row in journal.as_array().unwrap() {
+        assert_eq!(
+            (&row["status"], &row["answer_verified"], &row["kind"]),
+            (&json!("answered"), &json!(true), &json!("ask")),
+            "{row}"
+        );
+    }
     // A page tagged with the trace marks the exchange as summarized.
     c.ok(
         "POST",
@@ -1584,6 +1626,32 @@ async fn exchange_reports_are_verified_and_journaled() {
             .len(),
         2
     );
+
+    // Reporting a request id first does not get in the way of the member
+    // whose request it really is: each reporter has a row of their own.
+    let mut claimed = header.clone();
+    claimed.request_id = Uuid::new_v4();
+    let mut squat = claimed.clone();
+    squat.from = claimed.to.clone();
+    squat.to = claimed.from.clone();
+    let (squat_bytes, squat_sig) = signed_request(&bob_key, &squat);
+    c.ok(
+        "POST",
+        &uri,
+        &bob,
+        Some(report("sender", &squat_bytes, &squat_sig)),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let (claimed_bytes, claimed_sig) = signed_request(&alice_key, &claimed);
+    c.ok(
+        "POST",
+        &uri,
+        &alice,
+        Some(report("sender", &claimed_bytes, &claimed_sig)),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
 }
 
 #[actix_web::test]

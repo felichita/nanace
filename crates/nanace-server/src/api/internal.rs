@@ -7,8 +7,10 @@ use actix_web::{HttpRequest, HttpResponse, web};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::ratelimit::RateClass;
 use crate::{AppState, db};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -69,6 +71,12 @@ async fn allow_peer(
     query: web::Query<AllowQuery>,
 ) -> ApiResult<HttpResponse> {
     require_node(&state, &req)?;
+    // Each question is a database query that strangers connecting to the
+    // node can cause; the node bounds them too.
+    state.rate_limiter.check(Uuid::nil(), RateClass::P2pNodeAllow)?;
+    if nanace_core::p2p::peer_id(&query.peer_id).is_err() {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({ "allowed": false })));
+    }
     let allowed = !allowed(&state, Some(&query.peer_id)).await?.is_empty();
     Ok(HttpResponse::Ok().json(serde_json::json!({ "allowed": allowed })))
 }

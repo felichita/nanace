@@ -30,6 +30,11 @@ pub struct P2pPolicy {
     pub version: u32,
     pub enabled: bool,
     pub max_accept_mode: AcceptMode,
+    /// Members with the desktop app confirm every answer of their agent
+    /// before it is sent, whatever their own setting says. Peers without the
+    /// app (`server_peers`) have nobody to ask and are not affected.
+    #[serde(default)]
+    pub require_answer_review: bool,
     #[serde(default)]
     pub server_peers: ServerPeers,
     #[serde(default)]
@@ -96,6 +101,9 @@ pub struct Data {
     /// the built-in secret rules, never replacing them.
     #[serde(default)]
     pub deny_outbound_patterns: Vec<String>,
+    /// Reserved: only `same` is accepted, and nothing enforces it. A daemon
+    /// cannot tell which team a referenced page belongs to; the API decides
+    /// who may read it.
     #[serde(default = "same_team")]
     pub allow_refs_to_teams: Vec<RefScope>,
 }
@@ -383,6 +391,7 @@ mod tests {
             version: 1,
             enabled: true,
             max_accept_mode: AcceptMode::Ask,
+            require_answer_review: false,
             server_peers: ServerPeers::default(),
             discovery: Discovery::default(),
             calls: vec![CallRule {

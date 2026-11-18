@@ -711,8 +711,9 @@ async fn p2p_tools_exist_only_with_the_daemon_and_frame_peer_text() {
     ] {
         assert_eq!(hint(name), (Some(true), Some(false)), "{name}");
     }
-    assert_eq!(hint("p2p_status").0, Some(true));
-    for name in ["p2p_ask", "p2p_reply"] {
+    // Everything that sends to another machine is marked as not read-only,
+    // a status request included.
+    for name in ["p2p_ask", "p2p_reply", "p2p_status"] {
         assert_eq!(hint(name), (Some(false), Some(true)), "{name}");
     }
     let instructions = client
