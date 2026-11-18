@@ -2263,6 +2263,7 @@ dependencies = [
  "serde",
  "sha2 0.11.1",
  "thiserror",
+ "unicode-normalization",
  "uuid",
 ]
 

@@ -99,13 +99,57 @@ pub(crate) async fn embed_context(state: &AppState, title: &str, content: &str) 
         })
 }
 
-/// Team of a context the caller can read; `NotFound` otherwise.
-async fn readable_team_of(tx: &mut Transaction<'static, Postgres>, context_id: Uuid) -> ApiResult<Uuid> {
-    let team_id: Option<Uuid> = sqlx::query_scalar("SELECT team_id FROM contexts WHERE id = $1")
+/// Team and title of a context the caller can read; `NotFound` otherwise.
+async fn readable_context(tx: &mut Transaction<'static, Postgres>, context_id: Uuid) -> ApiResult<(Uuid, String)> {
+    let row: Option<(Uuid, String)> = sqlx::query_as("SELECT team_id, title FROM contexts WHERE id = $1")
         .bind(context_id)
         .fetch_optional(&mut **tx)
         .await?;
-    team_id.ok_or(ApiError::NotFound)
+    row.ok_or(ApiError::NotFound)
+}
+
+/// A write to a page, as far as its title matters.
+pub(crate) struct TitleWrite<'a> {
+    pub org_id: Uuid,
+    pub team_id: Uuid,
+    pub user_id: Uuid,
+    pub role: TeamRole,
+    /// `None` when the page is being created.
+    pub context_id: Option<Uuid>,
+    pub operation: &'static str,
+    /// The page's title before the write, if it exists.
+    pub current: Option<&'a str>,
+    /// The title the write gives the page, if it sets one.
+    pub new: Option<&'a str>,
+}
+
+/// `Policy:` and `Wiki:` pages are written only by an admin of their team:
+/// refuses the write otherwise, and audits the refusal. Row-level security
+/// enforces the same rule again for protected titles. A new title that only
+/// looks protected (letters of another script) is refused here as well, so a
+/// writer cannot plant a page that reads like the team's policy.
+pub(crate) async fn require_title_access(state: &AppState, write: TitleWrite<'_>) -> ApiResult<()> {
+    let protected = write.current.is_some_and(validate::is_protected_title)
+        || write
+            .new
+            .is_some_and(|t| validate::is_protected_title(t) || validate::resembles_protected_title(t));
+    if write.role == TeamRole::Admin || !protected {
+        return Ok(());
+    }
+    // Its own statement: the refused write is rolled back or never starts.
+    audit::record(
+        &state.pool,
+        AuditEvent {
+            org_id: Some(write.org_id),
+            actor: write.user_id,
+            action: "context.protected_denied",
+            resource_type: "context",
+            resource_id: write.context_id,
+            details: serde_json::json!({ "team_id": write.team_id, "operation": write.operation }),
+        },
+    )
+    .await?;
+    Err(ApiError::ProtectedPage)
 }
 
 /// Replaces the context's stored wiki links with those in `content`.
@@ -146,8 +190,22 @@ async fn create_context(
     body: web::Json<ContextInput>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id) = path.into_inner();
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
     let input = body.into_inner().validate()?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: None,
+            operation: "create",
+            current: None,
+            new: Some(&input.title),
+        },
+    )
+    .await?;
     let context_id = Uuid::new_v4();
 
     let chunks = embed_context(&state, &input.title, &input.content).await?;
@@ -281,8 +339,22 @@ async fn update_context(
     let input = body.into_inner().validate()?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let team_id = readable_team_of(&mut tx, context_id).await?;
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let (team_id, title) = readable_context(&mut tx, context_id).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: Some(context_id),
+            operation: "update",
+            current: Some(&title),
+            new: Some(&input.title),
+        },
+    )
+    .await?;
     // Serializes concurrent updates so PostgreSQL and Qdrant end up holding
     // the same version. Taken after the role check: under RLS, FOR UPDATE
     // also applies the UPDATE policy and would hide the row from readers.
@@ -359,8 +431,22 @@ async fn delete_context(
     access::require_org_member(&state.pool, org_id, user.user_id).await?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let team_id = readable_team_of(&mut tx, context_id).await?;
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let (team_id, title) = readable_context(&mut tx, context_id).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: Some(context_id),
+            operation: "delete",
+            current: Some(&title),
+            new: None,
+        },
+    )
+    .await?;
 
     // Moves the context to the trash; restoring it re-embeds the content.
     let trashed = sqlx::query(
@@ -446,7 +532,7 @@ async fn context_links(
     let teams = access::readable_teams(&state.pool, org_id, user.user_id).await?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    readable_team_of(&mut tx, context_id).await?;
+    readable_context(&mut tx, context_id).await?;
     let outgoing: Vec<LinkedContext> = sqlx::query_as(
         "SELECT DISTINCT c.id, c.team_id, c.title FROM context_links l \
          JOIN contexts c ON c.org_id = l.org_id AND lower(c.title) = l.target_key \

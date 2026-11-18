@@ -1,10 +1,12 @@
 use actix_web::{HttpResponse, web};
 use chrono::{DateTime, Utc};
-use nanace_core::embedding_input_hash;
+use nanace_core::{TeamRole, embedding_input_hash};
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::contexts::{ContextRow, embed_context, replace_links, vector_store_unavailable};
+use super::contexts::{
+    ContextRow, TitleWrite, embed_context, replace_links, require_title_access, vector_store_unavailable,
+};
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
@@ -71,6 +73,21 @@ async fn restore(
             .await?;
     tx.commit().await?;
     let (team_id, title, content) = row.ok_or(ApiError::NotFound)?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: Some(context_id),
+            operation: "restore",
+            current: Some(&title),
+            new: None,
+        },
+    )
+    .await?;
 
     let chunks = embed_context(&state, &title, &content).await?;
     let chunk_count = i32::try_from(chunks.len()).map_err(anyhow::Error::from)?;
@@ -126,11 +143,37 @@ async fn purge(state: web::Data<AppState>, user: WriteUser, path: web::Path<(Uui
     let (org_id, context_id) = path.into_inner();
     access::require_org_member(&state.pool, org_id, user.user_id).await?;
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let team_id: Option<Uuid> = sqlx::query_scalar("DELETE FROM context_trash WHERE id = $1 RETURNING team_id")
+    // Read first: a purge the policies refuse deletes no row, which would
+    // look like a page that is not there.
+    let row: Option<(Uuid, String)> = sqlx::query_as("SELECT team_id, title FROM context_trash WHERE id = $1")
         .bind(context_id)
         .fetch_optional(&mut *tx)
         .await?;
-    let team_id = team_id.ok_or(ApiError::NotFound)?;
+    let (team_id, title) = row.ok_or(ApiError::NotFound)?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    require_title_access(
+        &state,
+        TitleWrite {
+            org_id,
+            team_id,
+            user_id: user.user_id,
+            role,
+            context_id: Some(context_id),
+            operation: "purge",
+            current: Some(&title),
+            new: None,
+        },
+    )
+    .await?;
+    let purged = sqlx::query("DELETE FROM context_trash WHERE id = $1")
+        .bind(context_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    // Restored or purged concurrently.
+    if purged == 0 {
+        return Err(ApiError::NotFound);
+    }
     audit::record(
         &mut *tx,
         AuditEvent {

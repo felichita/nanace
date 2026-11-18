@@ -15,6 +15,10 @@ pub enum ApiError {
     Unauthorized,
     #[error("permission denied")]
     Forbidden,
+    /// A write to a `Policy:` or `Wiki:` page by someone who is not an admin
+    /// of its team.
+    #[error("{}", nanace_core::validate::PROTECTED_TITLE_MESSAGE)]
+    ProtectedPage,
     /// Also returned for resources the caller may not know exist, so that
     /// probing ids does not reveal other tenants' data.
     #[error("not found")]
@@ -57,7 +61,7 @@ impl ResponseError for ApiError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Forbidden | Self::ProtectedPage => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -71,6 +75,7 @@ impl ResponseError for ApiError {
             Self::BadRequest(_) => ("bad_request", self.to_string()),
             Self::Unauthorized => ("unauthorized", self.to_string()),
             Self::Forbidden => ("forbidden", self.to_string()),
+            Self::ProtectedPage => ("protected_page", self.to_string()),
             Self::NotFound => ("not_found", self.to_string()),
             Self::Conflict(_) => ("conflict", self.to_string()),
             Self::TooManyRequests { .. } => ("rate_limited", self.to_string()),

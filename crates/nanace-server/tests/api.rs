@@ -1925,3 +1925,367 @@ async fn search_snippets_never_show_stale_vector_text() {
     let snippet = hits[0]["snippet"].as_str().unwrap();
     assert!(!snippet.contains("hunter2") && snippet.contains("vault"), "{snippet}");
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn policy_and_wiki_pages_are_written_only_by_team_admins() {
+    let state = state(true).await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let (bob_email, carol_email, oscar_email) = (email("bob"), email("carol"), email("oscar"));
+    let alice = c.login(&email("alice")).await;
+    let bob = c.login(&bob_email).await;
+    let carol = c.login(&carol_email).await;
+    let oscar = c.login(&oscar_email).await;
+    let outsider = c.login(&email("eve")).await;
+    let org = c
+        .ok(
+            "POST",
+            "/api/v1/orgs",
+            &alice,
+            Some(json!({ "slug": unique("protected"), "name": "Protected" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let org_id: Uuid = org["id"].as_str().unwrap().parse().unwrap();
+    let base = format!("/api/v1/orgs/{org_id}");
+    let team = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "docs", "name": "Docs" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let team_id: Uuid = team["id"].as_str().unwrap().parse().unwrap();
+    let mut member_ids = Vec::new();
+    for (who, role) in [
+        (&bob_email, "writer"),
+        (&carol_email, "reader"),
+        (&oscar_email, "writer"),
+    ] {
+        let member = c
+            .ok(
+                "PUT",
+                &format!("{base}/teams/{team_id}/members"),
+                &alice,
+                Some(json!({ "email": who, "role": role })),
+                StatusCode::OK,
+            )
+            .await;
+        member_ids.push(member["user_id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+    let (bob_id, oscar_id) = (member_ids[0], member_ids[2]);
+    // Oscar is an org admin, but only a writer in this team.
+    c.ok(
+        "PUT",
+        &format!("{base}/members/{oscar_id}"),
+        &alice,
+        Some(json!({ "role": "admin" })),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let pages = format!("{base}/teams/{team_id}/contexts");
+    let create = |title: &str| json!({ "title": title, "content": "body" });
+    let id_of = |page: &Value| page["id"].as_str().unwrap().to_owned();
+    let wiki = id_of(
+        &c.ok(
+            "POST",
+            &pages,
+            &alice,
+            Some(create("Wiki: Schema")),
+            StatusCode::CREATED,
+        )
+        .await,
+    );
+    let policy = id_of(
+        &c.ok("POST", &pages, &alice, Some(create("Policy: P2P")), StatusCode::CREATED)
+            .await,
+    );
+    let notes = id_of(
+        &c.ok("POST", &pages, &bob, Some(create("Notes")), StatusCode::CREATED)
+            .await,
+    );
+
+    // The database function agrees with the Rust one on every shared case.
+    for (title, expected) in nanace_core::validate::PROTECTED_TITLE_CASES {
+        let protected: bool = sqlx::query_scalar("SELECT nanace_is_protected_title($1)")
+            .bind(title)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(protected, expected, "{title:?}");
+    }
+
+    // Writers, and org admins who are not team admins, cannot create a
+    // protected page, however the title is spelled.
+    for title in [
+        "Wiki: Other",
+        "wiki : other",
+        "POLICY:other",
+        "Ｗｉｋｉ： Other",
+        "W\u{200B}iki: Other",
+        "Wіki: Other",
+        "Роlісу: P2P",
+    ] {
+        for who in [&bob, &oscar] {
+            let (status, body) = c.call("POST", &pages, Some(who), Some(create(title))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{title:?}: {body}");
+            assert_eq!(body["error"], "protected_page", "{title:?}");
+        }
+    }
+
+    // Nor edit, rename out of or into a protected title, or delete one.
+    let wiki_uri = format!("{base}/contexts/{wiki}");
+    let notes_uri = format!("{base}/contexts/{notes}");
+    for who in [&bob, &oscar] {
+        for (uri, title) in [
+            (&wiki_uri, "Wiki: Schema"),
+            (&wiki_uri, "Schema"),
+            (&notes_uri, "Policy: Notes"),
+            (&notes_uri, " wiki :notes"),
+        ] {
+            let (status, body) = c
+                .call(
+                    "PUT",
+                    uri,
+                    Some(who),
+                    Some(json!({ "title": title, "content": "changed" })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri} -> {title:?}: {body}");
+            assert_eq!(body["error"], "protected_page");
+        }
+        let (status, body) = c.call("DELETE", &wiki_uri, Some(who), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "protected_page");
+    }
+    // Readers were refused before and still are; outsiders see nothing.
+    c.ok(
+        "PUT",
+        &wiki_uri,
+        &carol,
+        Some(json!({ "title": "Wiki: Schema", "content": "x" })),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    c.ok("DELETE", &wiki_uri, &outsider, None, StatusCode::NOT_FOUND).await;
+    // Everyone in the team still reads it, and writers keep their other pages.
+    let read = c.ok("GET", &wiki_uri, &carol, None, StatusCode::OK).await;
+    assert_eq!(read["content"], "body");
+    c.ok(
+        "PUT",
+        &notes_uri,
+        &bob,
+        Some(json!({ "title": "Notes v2", "content": "mine" })),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Below the API, as Bob: the same writes change nothing or fail.
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    for sql in [
+        "UPDATE contexts SET content = 'pwned', updated_by = $2 WHERE id = $1",
+        "UPDATE contexts SET title = 'Schema', updated_by = $2 WHERE id = $1",
+        "DELETE FROM contexts WHERE id = $1 AND $2 = $2",
+    ] {
+        let changed = sqlx::query(sql)
+            .bind(Uuid::parse_str(&wiki).unwrap())
+            .bind(bob_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "{sql}");
+    }
+    drop(tx);
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    let renamed = sqlx::query("UPDATE contexts SET title = 'Wiki: Hijack', updated_by = $2 WHERE id = $1")
+        .bind(Uuid::parse_str(&notes).unwrap())
+        .bind(bob_id)
+        .execute(&mut *tx)
+        .await;
+    assert!(renamed.is_err(), "RLS must reject renaming into a protected title");
+    drop(tx);
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    let inserted = sqlx::query(
+        "INSERT INTO contexts (id, org_id, team_id, title, content, embedding_hash, embedding_model, chunk_count, created_by, updated_by) \
+         VALUES ($1, $2, $3, ' policy : x', 'c', 'h', 'm', 0, $4, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(org_id)
+    .bind(team_id)
+    .bind(bob_id)
+    .execute(&mut *tx)
+    .await;
+    assert!(inserted.is_err(), "RLS must reject a protected page from a writer");
+    drop(tx);
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    let trashed = sqlx::query(
+        "INSERT INTO context_trash (id, org_id, team_id, title, content, tags, created_by, created_at, \
+                                    updated_by, updated_at, deleted_by) \
+         SELECT id, org_id, team_id, title, content, tags, created_by, created_at, updated_by, updated_at, $2 \
+         FROM contexts WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&wiki).unwrap())
+    .bind(bob_id)
+    .execute(&mut *tx)
+    .await;
+    assert!(trashed.is_err(), "RLS must reject trashing a protected page");
+    drop(tx);
+
+    // The team admin does all of it. Once the page is in the trash, writers
+    // see it there but cannot restore or purge it.
+    c.ok(
+        "PUT",
+        &wiki_uri,
+        &alice,
+        Some(json!({ "title": "Wiki: Schema", "content": "v2" })),
+        StatusCode::OK,
+    )
+    .await;
+    c.ok("DELETE", &wiki_uri, &alice, None, StatusCode::NO_CONTENT).await;
+    let trash = c.ok("GET", &format!("{base}/trash"), &bob, None, StatusCode::OK).await;
+    assert_eq!(trash[0]["title"], "Wiki: Schema");
+    let trash_uri = format!("{base}/trash/{wiki}");
+    for who in [&bob, &oscar] {
+        for (method, uri) in [("POST", format!("{trash_uri}/restore")), ("DELETE", trash_uri.clone())] {
+            let (status, body) = c.call(method, &uri, Some(who), None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {body}");
+            assert_eq!(body["error"], "protected_page");
+        }
+    }
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    let purged = sqlx::query("DELETE FROM context_trash WHERE id = $1")
+        .bind(Uuid::parse_str(&wiki).unwrap())
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(purged, 0);
+    drop(tx);
+    let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
+    let restored = sqlx::query(
+        "INSERT INTO contexts (id, org_id, team_id, title, content, tags, embedding_hash, embedding_model, \
+                               chunk_count, created_by, created_at, updated_by) \
+         SELECT id, org_id, team_id, title, content, tags, 'h', 'm', 0, created_by, created_at, $2 \
+         FROM context_trash WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&wiki).unwrap())
+    .bind(bob_id)
+    .execute(&mut *tx)
+    .await;
+    assert!(restored.is_err(), "RLS must reject restoring a protected page");
+    drop(tx);
+    c.ok("POST", &format!("{trash_uri}/restore"), &alice, None, StatusCode::OK)
+        .await;
+    // Renaming out of a protected title makes it an ordinary page again.
+    c.ok(
+        "PUT",
+        &wiki_uri,
+        &alice,
+        Some(json!({ "title": "Schema notes", "content": "v3" })),
+        StatusCode::OK,
+    )
+    .await;
+    c.ok(
+        "PUT",
+        &wiki_uri,
+        &bob,
+        Some(json!({ "title": "Schema notes", "content": "v4" })),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Every refusal was audited: 7 titles and 5 writes for each of two users,
+    // then 2 trash actions each.
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE org_id = $1 AND action = 'context.protected_denied'")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(denied, 2 * (7 + 5 + 2));
+
+    // An org admin gets the right by becoming a team admin, which is audited.
+    c.ok(
+        "PUT",
+        &format!("{base}/teams/{team_id}/members"),
+        &oscar,
+        Some(json!({ "email": oscar_email, "role": "admin" })),
+        StatusCode::OK,
+    )
+    .await;
+    c.ok(
+        "PUT",
+        &format!("{base}/contexts/{policy}"),
+        &oscar,
+        Some(json!({ "title": "Policy: P2P", "content": "by oscar" })),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Trash retention purges protected pages as a team admin, and one it
+    // cannot purge does not stop the rest.
+    let solo = c
+        .ok(
+            "POST",
+            &format!("{base}/teams"),
+            &alice,
+            Some(json!({ "slug": "solo", "name": "Solo" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let solo_id = solo["id"].as_str().unwrap();
+    let solo_pages = format!("{base}/teams/{solo_id}/contexts");
+    for uri in [&pages, &solo_pages] {
+        for title in ["Wiki: Old", "Plain old"] {
+            let page = id_of(
+                &c.ok("POST", uri, &alice, Some(create(title)), StatusCode::CREATED)
+                    .await,
+            );
+            c.ok(
+                "DELETE",
+                &format!("{base}/contexts/{page}"),
+                &alice,
+                None,
+                StatusCode::NO_CONTENT,
+            )
+            .await;
+        }
+    }
+    // The second team loses its only admin: Alice becomes a writer there.
+    let alice_email = c.ok("GET", "/api/v1/me", &alice, None, StatusCode::OK).await["email"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    c.ok(
+        "PUT",
+        &format!("{base}/teams/{solo_id}/members"),
+        &alice,
+        Some(json!({ "email": alice_email, "role": "writer" })),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        nanace_server::retention::purge_expired(&pool, 0, Some(org_id))
+            .await
+            .unwrap(),
+        3,
+        "both pages of the team with an admin, and the plain page of the team without one"
+    );
+    let left = c
+        .ok("GET", &format!("{base}/trash"), &alice, None, StatusCode::OK)
+        .await;
+    let titles: Vec<&str> = left
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["Wiki: Old"]);
+}
