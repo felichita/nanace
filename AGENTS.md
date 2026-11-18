@@ -161,7 +161,14 @@ only for changed code, new evidence, or an explicit re-review request.
 - JWTs and personal access tokens identify the user only. Never put roles or
   team ids in tokens; permissions are read from PostgreSQL per request.
 - Handlers that change state take `WriteUser` (rejects `read`-scoped
-  tokens); read-only handlers take `AuthUser`. Token management requires
+  tokens); read-only handlers take `AuthUser`. Both reject `p2p`-scoped
+  tokens. Only peer-registry handlers, `GET /me` and a token rotating or
+  revoking itself take `PeerUser` / `AnyScopeUser`; never use those for a
+  handler that reads or writes pages.
+- The team role `agent` edits only contexts it created and never deletes:
+  create and update check `TeamRole::Agent` plus
+  `contexts::require_title_access`; everything else that writes keeps
+  requiring `TeamRole::Writer`. Token management requires
   `AuthUser::require_session`.
 - Store only hashes of tokens and login codes; never log or return a secret
   after creation. Session tokens never go in URLs.

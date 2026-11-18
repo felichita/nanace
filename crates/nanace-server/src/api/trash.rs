@@ -85,6 +85,7 @@ async fn restore(
             operation: "restore",
             current: Some(&title),
             new: None,
+            created_by: None,
         },
     )
     .await?;
@@ -162,6 +163,7 @@ async fn purge(state: web::Data<AppState>, user: WriteUser, path: web::Path<(Uui
             operation: "purge",
             current: Some(&title),
             new: None,
+            created_by: None,
         },
     )
     .await?;

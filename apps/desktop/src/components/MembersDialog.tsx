@@ -8,9 +8,11 @@ import { Button, Dialog, IconButton, Input, Spinner, TeamIcon } from "./ui";
 import { AuditLog, GeneralSettings } from "./WorkspaceSettings";
 
 const ROLES: { value: TeamRole; label: string }[] = [
-  { value: "reader", label: "Can view" },
-  { value: "writer", label: "Can edit" },
-  { value: "admin", label: "Full access" },
+  { value: "reader", label: "Reader" },
+  // For service accounts: creates pages and edits only its own.
+  { value: "agent", label: "Agent" },
+  { value: "writer", label: "Editor" },
+  { value: "admin", label: "Owner" },
 ];
 
 function RoleSelect({ value, onChange, disabled }: { value: TeamRole; onChange: (r: TeamRole) => void; disabled?: boolean }) {

@@ -780,3 +780,134 @@ async fn challenges_are_rate_limited() {
     c.ok("POST", "/api/v1/me/peers/challenge", &bob, None, StatusCode::OK)
         .await;
 }
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn p2p_scoped_token_reaches_only_the_registry() {
+    let state = state().await;
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let (alice, alice_id) = c.login("alice").await;
+    let (org, _) = c.org(&alice).await;
+    let dev = c.team(&alice, org, "dev").await;
+    let page = c
+        .ok(
+            "POST",
+            &format!("/api/v1/orgs/{org}/teams/{dev}/contexts"),
+            &alice,
+            Some(json!({ "title": "Secret", "content": "dev only" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let token = c
+        .ok(
+            "POST",
+            "/api/v1/me/tokens",
+            &alice,
+            Some(json!({ "name": "nanace p2p", "scope": "p2p" })),
+            StatusCode::CREATED,
+        )
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The daemon's whole job works with it.
+    let me = c.ok("GET", "/api/v1/me", &token, None, StatusCode::OK).await;
+    assert_eq!(me["user_id"], alice_id.to_string());
+    let peer = c.bind(&token, alice_id, &new_key()).await;
+    assert_eq!(c.announce(&token, org, dev, &peer, "daemon").await.0, StatusCode::OK);
+    let peers = c
+        .ok(
+            "GET",
+            &format!("/api/v1/orgs/{org}/teams/{dev}/peers"),
+            &token,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(peers[0]["peer_id"], peer);
+    c.ok(
+        "GET",
+        &format!("/api/v1/me/peers/lookup/{peer}"),
+        &token,
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    c.ok("GET", "/api/v1/me/peers", &token, None, StatusCode::OK).await;
+
+    // Nothing else does: no pages, search, graph, trash, members or tokens.
+    let base = format!("/api/v1/orgs/{org}");
+    let page_uri = format!("{base}/contexts/{}", page["id"].as_str().unwrap());
+    for (method, uri, body) in [
+        ("GET", page_uri.clone(), None),
+        ("GET", format!("{page_uri}/links"), None),
+        (
+            "PUT",
+            page_uri.clone(),
+            Some(json!({ "title": "Secret", "content": "x" })),
+        ),
+        ("DELETE", page_uri, None),
+        ("GET", format!("{base}/teams/{dev}/contexts"), None),
+        (
+            "POST",
+            format!("{base}/teams/{dev}/contexts"),
+            Some(json!({ "title": "t", "content": "c" })),
+        ),
+        ("POST", format!("{base}/search"), Some(json!({ "query": "secret" }))),
+        ("GET", format!("{base}/graph"), None),
+        ("GET", format!("{base}/trash"), None),
+        ("GET", format!("{base}/teams"), None),
+        ("GET", format!("{base}/teams/{dev}/members"), None),
+        ("GET", format!("{base}/members"), None),
+        ("GET", format!("{base}/audit-logs"), None),
+        ("GET", "/api/v1/me/tokens".to_owned(), None),
+        (
+            "POST",
+            "/api/v1/me/tokens".to_owned(),
+            Some(json!({ "name": "more", "scope": "write" })),
+        ),
+        (
+            "POST",
+            "/api/v1/orgs".to_owned(),
+            Some(json!({ "slug": "nope-nope", "name": "x" })),
+        ),
+        ("DELETE", "/api/v1/me".to_owned(), None),
+    ] {
+        let (status, value) = c.call(method, &uri, &token, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {value}");
+    }
+
+    // It rotates and revokes itself like any token, keeping its scope.
+    let rotated = c
+        .ok(
+            "POST",
+            "/api/v1/me/tokens/current/rotate",
+            &token,
+            None,
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(rotated["scope"], "p2p");
+    let next = rotated["token"].as_str().unwrap();
+    c.ok("GET", "/api/v1/me", next, None, StatusCode::OK).await;
+    c.ok(
+        "GET",
+        &format!("{base}/teams/{dev}/contexts"),
+        next,
+        None,
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    c.ok(
+        "DELETE",
+        "/api/v1/me/tokens/current",
+        next,
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    c.ok("GET", "/api/v1/me", next, None, StatusCode::UNAUTHORIZED).await;
+}

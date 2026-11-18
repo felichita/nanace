@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
-use crate::auth::{AuthMethod, AuthUser, PAT_PREFIX, TokenScope};
+use crate::auth::{AnyScopeUser, AuthMethod, AuthUser, PAT_PREFIX, TokenScope};
 use crate::error::{ApiError, ApiResult};
 use crate::secret::{random_token, sha256_hex};
 use crate::{AppState, db};
@@ -133,7 +133,7 @@ async fn revoke_token(state: web::Data<AppState>, user: AuthUser, path: web::Pat
 
 /// Revokes the token that authenticates this request (sign-out for clients
 /// such as the desktop app). Any scope may revoke itself.
-async fn revoke_current_token(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+async fn revoke_current_token(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let AuthMethod::Token { id, .. } = user.method else {
         return Err(ApiError::BadRequest(
             "request is not authenticated with a token".to_owned(),
@@ -150,7 +150,7 @@ const ROTATION_GRACE_HOURS: i32 = 24;
 /// same name, scope and lifetime. Lets clients rotate credentials without an
 /// interactive session; the rotation chain still ends one year after the
 /// first token was issued, and a token can be rotated only once.
-async fn rotate_current_token(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+async fn rotate_current_token(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let AuthMethod::Token { id, .. } = user.method else {
         return Err(ApiError::BadRequest(
             "request is not authenticated with a token".to_owned(),

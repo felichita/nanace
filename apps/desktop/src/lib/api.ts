@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-export type TeamRole = "reader" | "writer" | "admin";
+export type TeamRole = "reader" | "agent" | "writer" | "admin";
 export type OrgRole = "member" | "admin";
 
 export interface SessionInfo {

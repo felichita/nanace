@@ -5,7 +5,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
-use crate::auth::AuthUser;
+use crate::auth::AnyScopeUser;
 use crate::error::{ApiError, ApiResult};
 use crate::oauth::pkce_challenge;
 use crate::secret::sha256_hex;
@@ -134,7 +134,7 @@ struct MembershipRow {
     team_role: Option<String>,
 }
 
-async fn me(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+async fn me(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let memberships: Vec<MembershipRow> = sqlx::query_as(
         "SELECT o.id AS org_id, o.slug AS org_slug, o.name AS org_name, om.role AS org_role, \
                 t.id AS team_id, t.slug AS team_slug, tm.role AS team_role \

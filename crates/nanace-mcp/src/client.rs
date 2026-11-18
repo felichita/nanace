@@ -30,6 +30,11 @@ pub enum ApiError {
          Tell the user instead of retrying or saving under a similar title."
     )]
     ProtectedPage,
+    #[error(
+        "Your role in that team is `agent`, which edits only pages it created. \
+         Create a page of your own or tell the user what should be added to this one."
+    )]
+    NotAuthor,
     #[error("not found (or not visible to you)")]
     NotFound,
     #[error("invalid request: {0}")]
@@ -260,6 +265,7 @@ impl ApiClient {
             return Err(match status {
                 StatusCode::UNAUTHORIZED => ApiError::Unauthorized,
                 StatusCode::FORBIDDEN if code == "protected_page" => ApiError::ProtectedPage,
+                StatusCode::FORBIDDEN if code == "not_author" => ApiError::NotAuthor,
                 StatusCode::FORBIDDEN => ApiError::Forbidden,
                 StatusCode::NOT_FOUND => ApiError::NotFound,
                 StatusCode::BAD_REQUEST => ApiError::BadRequest(message),

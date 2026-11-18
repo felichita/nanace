@@ -91,7 +91,7 @@ Talks to PostgreSQL and Qdrant.
 | `login_codes` | One-time codes handed to the browser after Google sign-in |
 | `org_members` | Org membership with `member` / `admin` role |
 | `teams` | dev, QA, devops, analytics, ... within an org |
-| `team_members` | Team role: `reader` / `writer` / `admin`; `source` = `manual` or `google_sync` |
+| `team_members` | Team role: `reader` / `agent` / `writer` / `admin`; `source` = `manual` or `google_sync` |
 | `contexts` | Title, full markdown, tags, author, embedding bookkeeping |
 | `audit_logs` | Who changed or read what, and when |
 | `p2p_peers` | Which libp2p peer id belongs to which user; revoked ids stay as tombstones |
@@ -183,6 +183,8 @@ Handlers that touch `contexts` run inside `db::scoped_tx`, which sets
 
 - `SELECT`: `org_id` matches the scope and the user is a member of the row's team.
 - `INSERT` / `UPDATE` / `DELETE`: same, and the user's team role is `writer` or `admin`.
+- Role `agent`: may `INSERT` its own rows and `UPDATE` rows it created; it
+  has no `DELETE` and no access to the trash.
 - Protected titles: when the row's title is protected (below), the role must
   be `admin`.
 
@@ -203,9 +205,18 @@ Everyone else in the team reads it.
 
 | Team role | Shown in the app as | Ordinary pages | `Policy:` / `Wiki:` pages |
 |---|---|---|---|
-| `admin` | Full access | Write | Write |
-| `writer` | Can edit | Write | Read |
-| `reader` | Can view | Read | Read |
+| `admin` | Owner | Write, trash, restore, purge | Write |
+| `writer` | Editor | Write, trash, restore, purge | Read |
+| `agent` | Agent | Create; edit only pages it created; no trash | Read |
+| `reader` | Reader | Read | Read |
+
+**Role `agent`** is for service accounts that only agents use (ordinary
+users with their own email). An edit to a page someone else created is
+refused with `403` and the code `not_author`, and audited as
+`context.agent_denied`. People with write access edit an agent's pages as any
+other. "Pages it created" is compared by user: agents that share one account
+can edit each other's pages, and the audit log shows that one account for all
+of them.
 
 - **Org admins** get no exception. An org admin who needs to edit such a page
   makes themselves a team admin first, which is audited as `team.member.put`.
@@ -293,6 +304,10 @@ The desktop app adds two parameters to the login request:
   are stored. Shown once at creation.
 - Scope `read` (GET requests and search) or `write` (everything the user's
   roles allow). Mutating handlers take `WriteUser`, which rejects read tokens.
+- Scope `p2p` is for the P2P daemon. It reaches the peer registry
+  (`/me/peers*`, presence, team peers), `GET /me`, and rotating or revoking
+  itself, and nothing else: `AuthUser` rejects it, so every other handler
+  answers `403`. A token file taken from a laptop cannot read or change pages.
 - Expire after 1–365 days (default 90); revocation is immediate. At most 50
   active tokens per user.
 - Creating and revoking tokens by id requires an interactive session, so a
@@ -631,8 +646,8 @@ Claude Desktop / Claude Code
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |
 | `GET/PUT` | `/api/v1/orgs/{org}/teams/{team}/members` | Team member or org admin / team admin or org admin |
 | `DELETE` | `/api/v1/orgs/{org}/teams/{team}/members/{user}` | Team admin or org admin |
-| `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader / team writer (team admin for `Policy:` and `Wiki:` titles) |
-| `GET/PUT/DELETE` | `/api/v1/orgs/{org}/contexts/{id}` | Team reader / team writer / team writer (team admin for `Policy:` and `Wiki:` pages) |
+| `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader / team agent or writer (team admin for `Policy:` and `Wiki:` titles) |
+| `GET/PUT/DELETE` | `/api/v1/orgs/{org}/contexts/{id}` | Team reader / team writer, or the agent that created the page / team writer (team admin for `Policy:` and `Wiki:` pages) |
 | `GET` | `/api/v1/orgs/{org}/contexts/{id}/links` | Team reader; outgoing, backlinks, related |
 | `GET` | `/api/v1/orgs/{org}/graph` | Org member; readable contexts, link and similarity edges |
 | `GET` | `/api/v1/orgs/{org}/trash` | Team writer; trashed pages of writable teams |

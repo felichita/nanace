@@ -99,12 +99,17 @@ pub(crate) async fn embed_context(state: &AppState, title: &str, content: &str) 
         })
 }
 
-/// Team and title of a context the caller can read; `NotFound` otherwise.
-async fn readable_context(tx: &mut Transaction<'static, Postgres>, context_id: Uuid) -> ApiResult<(Uuid, String)> {
-    let row: Option<(Uuid, String)> = sqlx::query_as("SELECT team_id, title FROM contexts WHERE id = $1")
-        .bind(context_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+/// Team, title and author of a context the caller can read; `NotFound`
+/// otherwise.
+async fn readable_context(
+    tx: &mut Transaction<'static, Postgres>,
+    context_id: Uuid,
+) -> ApiResult<(Uuid, String, Uuid)> {
+    let row: Option<(Uuid, String, Uuid)> =
+        sqlx::query_as("SELECT team_id, title, created_by FROM contexts WHERE id = $1")
+            .bind(context_id)
+            .fetch_optional(&mut **tx)
+            .await?;
     row.ok_or(ApiError::NotFound)
 }
 
@@ -121,10 +126,14 @@ pub(crate) struct TitleWrite<'a> {
     pub current: Option<&'a str>,
     /// The title the write gives the page, if it sets one.
     pub new: Option<&'a str>,
+    /// Who created the page, if it exists.
+    pub created_by: Option<Uuid>,
 }
 
-/// `Policy:` and `Wiki:` pages are written only by an admin of their team:
-/// refuses the write otherwise, and audits the refusal. Row-level security
+/// Page-level write rules on top of the team role. `Policy:` and `Wiki:`
+/// pages are written only by an admin of their team, and a team `agent` edits
+/// only the pages it created: refuses the write otherwise, and audits the
+/// refusal. Row-level security
 /// enforces the same rule again for protected titles. A new title that only
 /// looks protected (letters of another script) is refused here as well, so a
 /// writer cannot plant a page that reads like the team's policy.
@@ -136,7 +145,9 @@ pub(crate) async fn require_title_access(state: &AppState, write: TitleWrite<'_>
             validate::is_protected_title(new)
                 || (write.current != Some(new) && validate::resembles_protected_title(new))
         });
-    if write.role == TeamRole::Admin || !protected {
+    // A team `agent` edits only the pages it created.
+    let not_author = write.role == TeamRole::Agent && write.created_by.is_some_and(|author| author != write.user_id);
+    if !not_author && (write.role == TeamRole::Admin || !protected) {
         return Ok(());
     }
     // Its own statement: the refused write is rolled back or never starts.
@@ -145,14 +156,22 @@ pub(crate) async fn require_title_access(state: &AppState, write: TitleWrite<'_>
         AuditEvent {
             org_id: Some(write.org_id),
             actor: write.user_id,
-            action: "context.protected_denied",
+            action: if not_author {
+                "context.agent_denied"
+            } else {
+                "context.protected_denied"
+            },
             resource_type: "context",
             resource_id: write.context_id,
             details: serde_json::json!({ "team_id": write.team_id, "operation": write.operation }),
         },
     )
     .await?;
-    Err(ApiError::ProtectedPage)
+    Err(if not_author {
+        ApiError::NotAuthor
+    } else {
+        ApiError::ProtectedPage
+    })
 }
 
 /// Replaces the context's stored wiki links with those in `content`.
@@ -193,7 +212,7 @@ async fn create_context(
     body: web::Json<ContextInput>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id) = path.into_inner();
-    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Agent).await?;
     let input = body.into_inner().validate()?;
     require_title_access(
         &state,
@@ -206,6 +225,7 @@ async fn create_context(
             operation: "create",
             current: None,
             new: Some(&input.title),
+            created_by: None,
         },
     )
     .await?;
@@ -342,8 +362,8 @@ async fn update_context(
     let input = body.into_inner().validate()?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let (team_id, title) = readable_context(&mut tx, context_id).await?;
-    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
+    let (team_id, title, created_by) = readable_context(&mut tx, context_id).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Agent).await?;
     require_title_access(
         &state,
         TitleWrite {
@@ -355,6 +375,7 @@ async fn update_context(
             operation: "update",
             current: Some(&title),
             new: Some(&input.title),
+            created_by: Some(created_by),
         },
     )
     .await?;
@@ -434,7 +455,7 @@ async fn delete_context(
     access::require_org_member(&state.pool, org_id, user.user_id).await?;
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let (team_id, title) = readable_context(&mut tx, context_id).await?;
+    let (team_id, title, created_by) = readable_context(&mut tx, context_id).await?;
     let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Writer).await?;
     require_title_access(
         &state,
@@ -447,6 +468,7 @@ async fn delete_context(
             operation: "delete",
             current: Some(&title),
             new: None,
+            created_by: Some(created_by),
         },
     )
     .await?;

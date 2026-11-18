@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
-use crate::auth::{AuthMethod, AuthUser, WriteUser};
+use crate::auth::{AnyScopeUser, AuthMethod, PeerUser};
 use crate::error::{ApiError, ApiResult};
 use crate::p2p::bind_signature_is_valid;
 use crate::ratelimit::RateClass;
@@ -39,7 +39,7 @@ const MAX_AGENTS_PER_PEER: i64 = 16;
 const DEFAULT_PEERS_LIMIT: i64 = 50;
 const MAX_PEERS_LIMIT: i64 = 200;
 
-async fn challenge(state: web::Data<AppState>, user: WriteUser) -> ApiResult<HttpResponse> {
+async fn challenge(state: web::Data<AppState>, user: PeerUser) -> ApiResult<HttpResponse> {
     state.rate_limiter.check(user.user_id, RateClass::P2pChallenge)?;
     let issued = state.p2p.issue_challenge(user.user_id)?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -74,7 +74,7 @@ struct PeerRow {
 /// key. Binding the same peer again only refreshes its client fields.
 async fn bind_peer(
     state: web::Data<AppState>,
-    user: WriteUser,
+    user: PeerUser,
     body: web::Json<BindRequest>,
 ) -> ApiResult<HttpResponse> {
     state.rate_limiter.check(user.user_id, RateClass::P2pBind)?;
@@ -169,7 +169,7 @@ async fn bind_peer(
     Ok(HttpResponse::Created().json(row))
 }
 
-async fn my_peers(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpResponse> {
+async fn my_peers(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let mut tx = db::user_tx(&state.pool, user.user_id).await?;
     let rows: Vec<PeerRow> = sqlx::query_as(
         "SELECT peer_id, client_kind, client_version, created_at, last_seen_at, revoked_at \
@@ -184,7 +184,7 @@ async fn my_peers(state: web::Data<AppState>, user: AuthUser) -> ApiResult<HttpR
 
 /// Revokes one of the caller's peers for good and ends its presence
 /// everywhere. Someone else's peer is `404`, like one that does not exist.
-async fn revoke_peer(state: web::Data<AppState>, user: WriteUser, path: web::Path<String>) -> ApiResult<HttpResponse> {
+async fn revoke_peer(state: web::Data<AppState>, user: PeerUser, path: web::Path<String>) -> ApiResult<HttpResponse> {
     let peer_id = path.into_inner();
     let mut tx = db::user_tx(&state.pool, user.user_id).await?;
     let revoked = sqlx::query(
@@ -241,7 +241,11 @@ struct PeerLookup {
 
 /// Who a peer is, for a caller that shares a team with it where the peer is
 /// present right now. Everything else is `404`, so peer ids cannot be probed.
-async fn lookup_peer(state: web::Data<AppState>, user: AuthUser, path: web::Path<String>) -> ApiResult<HttpResponse> {
+async fn lookup_peer(
+    state: web::Data<AppState>,
+    user: AnyScopeUser,
+    path: web::Path<String>,
+) -> ApiResult<HttpResponse> {
     state.rate_limiter.check(user.user_id, RateClass::P2pLookup)?;
     let peer_id = path.into_inner();
     let mut tx = db::user_tx(&state.pool, user.user_id).await?;
@@ -293,7 +297,7 @@ struct PresenceRequest {
 /// as a heartbeat; only the start of a presence is audited.
 async fn put_presence(
     state: web::Data<AppState>,
-    user: WriteUser,
+    user: PeerUser,
     path: web::Path<(Uuid, Uuid)>,
     body: web::Json<PresenceRequest>,
 ) -> ApiResult<HttpResponse> {
@@ -413,7 +417,7 @@ async fn put_presence(
 /// Ends one of the caller's presences in a team.
 async fn delete_presence(
     state: web::Data<AppState>,
-    user: WriteUser,
+    user: PeerUser,
     path: web::Path<(Uuid, Uuid, String, String)>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id, peer_id, agent_label) = path.into_inner();
@@ -472,7 +476,7 @@ struct PresentPeer {
 /// capability. Visible to every member of the team.
 async fn list_peers(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: AnyScopeUser,
     path: web::Path<(Uuid, Uuid)>,
     query: web::Query<PeersQuery>,
 ) -> ApiResult<HttpResponse> {
