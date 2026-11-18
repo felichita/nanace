@@ -7,6 +7,8 @@ use nanace_embed::{Embedder, FastEmbedder, HashingEmbedder};
 use nanace_server::auth::JwtKeys;
 use nanace_server::config::{Config, EmbedderKind};
 use nanace_server::oauth::GoogleOAuth;
+use nanace_server::p2p::P2pState;
+use nanace_server::ratelimit::RateLimiter;
 use nanace_server::upgrades::{self, Status};
 use nanace_server::vectors::VectorStore;
 use nanace_server::{AppState, LOG_COMPONENT, api, db, metrics};
@@ -113,7 +115,37 @@ async fn main() -> anyhow::Result<()> {
         frontend_url: config.frontend_url.clone(),
         secure_cookies: config.public_url.starts_with("https://"),
         trash_retention_days: config.trash_retention_days,
+        p2p: P2pState::new(
+            &config.jwt_secret,
+            config.p2p_presence_max_ttl_secs,
+            config.p2p_max_peers_per_user,
+        ),
+        rate_limiter: RateLimiter::default(),
     });
+
+    {
+        let pool = state.pool.clone();
+        actix_web::rt::spawn(async move {
+            loop {
+                match nanace_server::p2p::sweep_presence(&pool).await {
+                    Ok(0) => {}
+                    Ok(expired) => tracing::debug!(
+                        event = "p2p_presence_swept",
+                        component = LOG_COMPONENT,
+                        expired,
+                        "expired P2P presence removed"
+                    ),
+                    Err(err) => tracing::warn!(
+                        event = "p2p_presence_sweep_failed",
+                        component = LOG_COMPONENT,
+                        error = %format!("{err:#}"),
+                        "P2P presence sweep failed; retrying later"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
 
     if config.trash_retention_days > 0 {
         let pool = state.pool.clone();

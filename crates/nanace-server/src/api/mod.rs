@@ -6,6 +6,7 @@ pub(crate) mod contexts;
 mod google;
 mod graph;
 mod orgs;
+mod p2p;
 mod search;
 mod teams;
 mod tokens;
@@ -41,7 +42,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 .configure(trash::configure)
                 .configure(search::configure)
                 .configure(graph::configure)
-                .configure(audit_logs::configure),
+                .configure(audit_logs::configure)
+                .configure(p2p::configure),
         );
 }
 

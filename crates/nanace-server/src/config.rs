@@ -47,6 +47,10 @@ pub struct Config {
     pub metrics_bind: Option<SocketAddr>,
     /// Days a context stays in the trash before it is purged; 0 keeps it.
     pub trash_retention_days: u32,
+    /// Longest presence TTL a P2P peer may ask for, in seconds.
+    pub p2p_presence_max_ttl_secs: u32,
+    /// Unrevoked P2P peers one user may have bound.
+    pub p2p_max_peers_per_user: u32,
     pub database_url: SecretString,
     pub qdrant_url: String,
     pub jwt_secret: SecretString,
@@ -133,6 +137,14 @@ impl Config {
                 .map(|v| v.trim().parse::<u32>().ok().filter(|d| *d <= 3650))
                 .unwrap_or(Some(7))
                 .context("NANACE_TRASH_RETENTION_DAYS must be 0-3650 (0 keeps trash forever)")?,
+            p2p_presence_max_ttl_secs: get("NANACE_P2P_PRESENCE_MAX_TTL_SECS")
+                .map(|v| v.trim().parse::<u32>().ok().filter(|s| (30..=600).contains(s)))
+                .unwrap_or(Some(120))
+                .context("NANACE_P2P_PRESENCE_MAX_TTL_SECS must be 30-600")?,
+            p2p_max_peers_per_user: get("NANACE_P2P_MAX_PEERS_PER_USER")
+                .map(|v| v.trim().parse::<u32>().ok().filter(|n| (1..=1000).contains(n)))
+                .unwrap_or(Some(10))
+                .context("NANACE_P2P_MAX_PEERS_PER_USER must be 1-1000")?,
             metrics_bind: get("NANACE_METRICS_BIND")
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| v.parse())
@@ -208,6 +220,11 @@ mod tests {
         assert!(config(&[("NANACE_METRICS_BIND", "not-an-address")]).is_err());
         assert!(config(&[("NANACE_TRASH_RETENTION_DAYS", "-1")]).is_err());
         assert!(config(&[("NANACE_TRASH_RETENTION_DAYS", "9999")]).is_err());
+        assert!(config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "29")]).is_err());
+        assert!(config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "601")]).is_err());
+        assert!(config(&[("NANACE_P2P_MAX_PEERS_PER_USER", "0")]).is_err());
+        let p2p = config(&[("NANACE_P2P_PRESENCE_MAX_TTL_SECS", "60")]).expect("valid");
+        assert_eq!((p2p.p2p_presence_max_ttl_secs, p2p.p2p_max_peers_per_user), (60, 10));
         assert_eq!(
             config(&[("NANACE_TRASH_RETENTION_DAYS", "0")])
                 .unwrap()

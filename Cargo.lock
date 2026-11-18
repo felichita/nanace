@@ -427,6 +427,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2250,6 +2259,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 name = "nanace-core"
 version = "0.1.4"
 dependencies = [
+ "bs58",
  "serde",
  "sha2 0.11.1",
  "thiserror",
@@ -2299,6 +2309,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
+ "ed25519-dalek",
  "futures-util",
  "getrandom 0.4.3",
  "hmac 0.13.0",

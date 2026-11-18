@@ -94,6 +94,8 @@ Talks to PostgreSQL and Qdrant.
 | `team_members` | Team role: `reader` / `writer` / `admin`; `source` = `manual` or `google_sync` |
 | `contexts` | Title, full markdown, tags, author, embedding bookkeeping |
 | `audit_logs` | Who changed or read what, and when |
+| `p2p_peers` | Which libp2p peer id belongs to which user; revoked ids stay as tombstones |
+| `p2p_presence` | Which peers and agents are present in a team right now; rows expire |
 
 Roles are a closed set enforced by `CHECK` constraints and the
 `nanace_core::TeamRole` / `OrgRole` enums, not a separate table.
@@ -317,6 +319,78 @@ organization:
   PostgreSQL runs without row security.
 - **What stays:** an `org.delete` entry with no org.
 
+### P2P registry [built]
+
+Agents on different machines will talk to each other over libp2p
+(`nanace-p2p`, **[planned]**; design in `docs/adr/0001-p2p.md`). The server
+is their registry: it knows which peer belongs to which user and which peers
+are present in a team. Message bodies never pass through the server.
+
+**Binding a peer.** A peer id is an Ed25519 key. To bind one, the client
+proves it holds the key:
+
+```text
+POST /api/v1/me/peers/challenge  -> { challenge, expires_at }   (valid 60 s)
+signature = Ed25519("nanace-p2p-bind-v1\0" + challenge + "\0" + peer_id + "\0" + user_id + "\0")
+POST /api/v1/me/peers { peer_id, challenge, signature, client_kind, client_version }
+```
+
+- The challenge is stateless: a nonce and expiry authenticated with an HMAC
+  key derived from `NANACE_JWT_SECRET`, bound to the caller. It can be
+  answered more than once within its minute; binding is idempotent.
+- A peer id bound to another user is `409`. Without the proof, a user could
+  bind someone else's peer id first and lock its owner out.
+- Revoking (`DELETE /me/peers/{peer_id}`) is final: the row stays as a
+  tombstone, the id cannot be bound again, and its presence ends at once.
+- A user may have `NANACE_P2P_MAX_PEERS_PER_USER` unrevoked peers (default 10).
+
+**Presence.** `PUT …/teams/{team}/presence` announces one agent of a peer in
+a team and is repeated as a heartbeat.
+
+- `ttl_secs` is at most `NANACE_P2P_PRESENCE_MAX_TTL_SECS` (default 120).
+- Any team member can be present, readers included.
+- Addresses are checked: dialable `ip4`/`ip6`/`dns` over `tcp` or `quic-v1`;
+  loopback, link-local, unspecified and multicast are rejected.
+- Capabilities are labels a peer gives itself. They are used for search only
+  and grant nothing.
+- Only the start of a presence is audited (`p2p.presence_put`), not each
+  heartbeat. Its end is audited as `p2p.presence_delete` or
+  `p2p.presence_expire`.
+
+**What ends a presence:**
+
+| Event | How |
+|---|---|
+| The TTL passes | Reads filter on `expires_at`; a task deletes expired rows every minute |
+| The user leaves or is removed from the team or org | Foreign key to `team_members` |
+| The peer is revoked | Same transaction as the revocation |
+| The token that announced it is revoked (its whole rotation chain) | Same transaction as the revocation |
+| The account is deleted | Peers are deleted explicitly, because the user row stays |
+| The organization is deleted | Foreign-key cascade |
+
+**Lookup.** `GET /me/peers/lookup/{peer_id}` returns the owner and public key
+of a peer that is present in a team the caller shares with it, and `404`
+otherwise. A daemon will use it to decide whom to connect to and to check who
+signed a message.
+
+**Row-level security.** Both tables use `FORCE ROW LEVEL SECURITY` with
+policies for `nanace_tenant` only, in three scopes:
+
+- **Org and user** (`db::scoped_tx`): presence of the caller's teams in that
+  org. A user writes presence only for their own, unrevoked peers.
+- **User only** (`db::user_tx`): the caller's own peers, and peers and
+  presence of users who share a team with the caller in any org.
+- **System** (`db::p2p_system_tx`): the server's own maintenance. It may read
+  both tables and delete presence that has already expired, nothing else.
+  It is never used on behalf of a request's caller.
+
+**Rate limits.** Challenges, binds, presence and lookups are limited per user
+with an in-memory token bucket (`429` with `Retry-After`). Each replica
+counts on its own, so this bounds abuse and is not a quota.
+
+**Metrics:** `nanace_p2p_active_peers`, `nanace_p2p_peer_binds_total`,
+`nanace_p2p_presence_starts_total`.
+
 ### Google Workspace group sync [planned]
 
 ```text
@@ -512,6 +586,13 @@ Claude Desktop / Claude Code
 | `DELETE` | `/api/v1/orgs/{org}/trash/{id}` | Team writer; permanent |
 | `POST` | `/api/v1/orgs/{org}/search` | Org member; results limited to readable teams |
 | `GET` | `/api/v1/orgs/{org}/audit-logs` | Org admin |
+| `POST` | `/api/v1/me/peers/challenge` | Authenticated, write; challenge for binding a P2P peer |
+| `GET/POST` | `/api/v1/me/peers` | Authenticated / write, with proof of the peer key |
+| `DELETE` | `/api/v1/me/peers/{peer_id}` | The peer's owner, write; final |
+| `GET` | `/api/v1/me/peers/lookup/{peer_id}` | Authenticated; only peers present in a shared team |
+| `PUT` | `/api/v1/orgs/{org}/teams/{team}/presence` | Team member, write; announce or extend presence |
+| `DELETE` | `/api/v1/orgs/{org}/teams/{team}/presence/{peer_id}/{agent_label}` | The presence's owner, write |
+| `GET` | `/api/v1/orgs/{org}/teams/{team}/peers` | Team member; `?capability=`, `?limit=` |
 | `GET` | `/livez` | Anyone; liveness, touches no dependencies |
 | `GET` | `/readyz`, `/healthz` | Anyone; readiness, checks PostgreSQL and Qdrant |
 

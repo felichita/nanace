@@ -10,6 +10,8 @@ pub mod db;
 pub mod error;
 pub mod metrics;
 pub mod oauth;
+pub mod p2p;
+pub mod ratelimit;
 pub mod reindex;
 pub mod retention;
 pub mod secret;
@@ -23,6 +25,8 @@ use sqlx::PgPool;
 
 use crate::auth::JwtKeys;
 use crate::oauth::GoogleOAuth;
+use crate::p2p::P2pState;
+use crate::ratelimit::RateLimiter;
 use crate::vectors::VectorStore;
 
 pub const LOG_COMPONENT: &str = "nanace_server";
@@ -44,4 +48,6 @@ pub struct AppState {
     pub secure_cookies: bool,
     /// Days a context stays in the trash before it is purged; 0 keeps it.
     pub trash_retention_days: u32,
+    pub p2p: P2pState,
+    pub rate_limiter: RateLimiter,
 }

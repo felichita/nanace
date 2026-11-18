@@ -42,6 +42,12 @@ async fn state(dev_login: bool) -> web::Data<AppState> {
         frontend_url: "http://127.0.0.1/auth/complete".to_owned(),
         secure_cookies: false,
         trash_retention_days: 7,
+        p2p: nanace_server::p2p::P2pState::new(
+            &SecretString::from("test-secret-0123456789abcdef-0123456789".to_owned()),
+            120,
+            10,
+        ),
+        rate_limiter: nanace_server::ratelimit::RateLimiter::default(),
     })
 }
 

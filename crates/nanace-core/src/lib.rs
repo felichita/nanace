@@ -2,6 +2,7 @@
 
 pub mod chunk;
 pub mod links;
+pub mod p2p;
 pub mod role;
 pub mod validate;
 

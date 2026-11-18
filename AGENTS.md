@@ -131,8 +131,13 @@ only for changed code, new evidence, or an explicit re-review request.
 - Every query that reads or writes `contexts` runs inside `db::scoped_tx`. Do
   not grant `BYPASSRLS`, connect the app as a superuser, or add policies for
   roles other than `nanace_tenant`.
-- Return `404` (not `403`) for org, team, or context ids the caller cannot
-  read, so ids cannot be probed.
+- Every query on `p2p_peers` or `p2p_presence` runs inside `db::scoped_tx`,
+  `db::user_tx` (the caller's own peers and lookups across their teams) or
+  `db::p2p_system_tx`. The system scope is for the server's own maintenance
+  only: never open it for a request's caller, and do not widen what its
+  policies allow beyond reading these tables and deleting expired presence.
+- Return `404` (not `403`) for org, team, context, or peer ids the caller
+  cannot read, so ids cannot be probed.
 - Org admins manage membership but get no implicit access to team content.
 - Qdrant searches always filter on `org_id` and on team ids derived from
   PostgreSQL, and every hit is re-checked in PostgreSQL before it is returned.
