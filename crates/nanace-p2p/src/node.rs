@@ -8,8 +8,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use libp2p::allow_block_list::{self, AllowedPeers};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::allow_block_list;
+use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, autonat, identify, noise, ping, relay, tcp, yamux};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -21,14 +21,26 @@ use crate::net::IDENTIFY_PROTOCOL;
 /// within this time.
 const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    allowed: allow_block_list::Behaviour<AllowedPeers>,
-    relay: relay::Behaviour,
-    autonat: autonat::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+// In a module of its own so that the `allow` covers nothing but the derive's
+// output: `allow_block_list::Behaviour` emits `Infallible`, and compilers
+// from 1.100 on report the generated code that forwards its events as
+// unreachable.
+#[allow(unreachable_code)]
+mod behaviour {
+    use libp2p::allow_block_list::{self, AllowedPeers};
+    use libp2p::swarm::NetworkBehaviour;
+    use libp2p::{autonat, identify, ping, relay};
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct Behaviour {
+        pub(super) allowed: allow_block_list::Behaviour<AllowedPeers>,
+        pub(super) relay: relay::Behaviour,
+        pub(super) autonat: autonat::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
 }
+use behaviour::{Behaviour, BehaviourEvent};
 
 /// Relay limits, sized for text between agents.
 pub struct Limits {

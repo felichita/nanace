@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt;
-use libp2p::allow_block_list::{self, AllowedPeers};
+use libp2p::allow_block_list;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, dcutr, identify, noise, ping, relay, tcp, yamux};
+use libp2p::swarm::SwarmEvent;
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, dcutr, identify, noise, ping, tcp, yamux};
 use nanace_core::p2p::{MessageKind, RejectReason};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
@@ -38,17 +38,31 @@ const BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5);
 
 type Messages = request_response::json::Behaviour<Wire, Ack>;
 
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    allowed: allow_block_list::Behaviour<AllowedPeers>,
-    relay: relay::client::Behaviour,
-    dcutr: dcutr::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    ask: Messages,
-    status: Messages,
-    notify: Messages,
+// In a module of its own so that the `allow` covers nothing but the derive's
+// output: `allow_block_list::Behaviour` emits `Infallible`, and compilers
+// from 1.100 on report the generated code that forwards its events as
+// unreachable.
+#[allow(unreachable_code)]
+mod behaviour {
+    use libp2p::allow_block_list::{self, AllowedPeers};
+    use libp2p::swarm::NetworkBehaviour;
+    use libp2p::{dcutr, identify, ping, relay};
+
+    use super::Messages;
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct Behaviour {
+        pub(super) allowed: allow_block_list::Behaviour<AllowedPeers>,
+        pub(super) relay: relay::client::Behaviour,
+        pub(super) dcutr: dcutr::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+        pub(super) ask: Messages,
+        pub(super) status: Messages,
+        pub(super) notify: Messages,
+    }
 }
+use behaviour::{Behaviour, BehaviourEvent};
 
 fn messages(protocol: &'static str) -> Messages {
     Messages::new(
