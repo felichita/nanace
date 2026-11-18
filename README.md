@@ -280,7 +280,10 @@ docker pull ghcr.io/felichita/nanace-server:latest   # or :0.1.2, :0.1
 ```
 
 The image runs `nanace-server` as a non-root user on port 8080 and has the
-embedding model baked in, so it starts without internet access. It does not
+embedding model baked in, so it starts without internet access. It also has
+`nanace-p2p`: run the P2P network node from the same image as a second
+container with the entrypoint `nanace-p2p` and the command `node` (key on a
+volume at `/var/lib/nanace-p2p`, port 4001 TCP and UDP). It does not
 contain `nanace-mcp`: Claude runs that on each user's machine (it ships with
 the desktop app and the release archives) and points it at the server. Configure it with the same environment variables as
 `.env.example` (`DATABASE_URL`, `QDRANT_URL`, `NANACE_JWT_SECRET`,
@@ -296,6 +299,19 @@ stack (API server, PostgreSQL, Qdrant) with Docker Compose:
 make up      # docker compose --profile app up -d --build; settings from .env
 make logs    # follow the server logs
 make down    # stop it (data volumes are kept)
+```
+
+With the P2P network node as well:
+
+```bash
+echo "NANACE_P2P_NODE_SECRET=$(openssl rand -base64 48)" >> .env
+# the node's peer id (creates its key on the first run)
+docker compose --profile p2p run --rm --no-deps p2p-node peer-id
+# add to .env, with the address agents reach this machine at:
+#   NANACE_P2P_BOOTSTRAP=/dns4/p2p.example.com/udp/4001/quic-v1/p2p/<peer id>
+#   NANACE_P2P_EXTERNAL_ADDRS=/dns4/p2p.example.com/udp/4001/quic-v1,/dns4/p2p.example.com/tcp/4001
+#   NANACE_HOST_BIND=0.0.0.0     # the node must be reachable from outside (this also publishes the API port)
+make up-p2p
 ```
 
 The server listens on `127.0.0.1:8080`; set `NANACE_HOST_BIND=0.0.0.0` to

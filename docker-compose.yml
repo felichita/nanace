@@ -3,6 +3,8 @@
 # `docker compose --profile app up -d --build` (or `make up`) runs it from the
 # Dockerfile against the same databases. Ports bind to loopback unless
 # NANACE_HOST_BIND says otherwise (e.g. 0.0.0.0 to share on the LAN).
+# The P2P network node is in the `p2p` profile (`make up-p2p`); it needs
+# NANACE_P2P_NODE_SECRET in .env, see the README.
 name: nanace
 
 services:
@@ -56,10 +58,40 @@ services:
       NANACE_DEV_LOGIN: ${NANACE_COMPOSE_DEV_LOGIN:-false}
       NANACE_LOG_FORMAT: ${NANACE_LOG_FORMAT:-text}
       NANACE_METRICS_BIND: 0.0.0.0:9090
+      # The P2P node's allow list, on when the node secret is set. Not
+      # published: only containers of this stack reach it.
+      NANACE_INTERNAL_BIND: ${NANACE_P2P_NODE_SECRET:+0.0.0.0:9191}
     ports:
       - "${NANACE_HOST_BIND:-127.0.0.1}:${NANACE_PORT:-8080}:8080"
       # Prometheus metrics, loopback only.
       - "127.0.0.1:${NANACE_METRICS_PORT:-9090}:9090"
+
+  # The relay that agents behind NAT reach each other through. Same image as
+  # the server, other binary.
+  p2p-node:
+    profiles: [p2p]
+    build: .
+    image: nanace-server:local
+    restart: unless-stopped
+    depends_on:
+      - server
+    entrypoint: ["nanace-p2p"]
+    command: ["node"]
+    environment:
+      NANACE_P2P_KEY_FILE: /var/lib/nanace-p2p/node.key
+      NANACE_P2P_LISTEN: /ip4/0.0.0.0/udp/4001/quic-v1,/ip4/0.0.0.0/tcp/4001
+      # Addresses agents reach this node at, e.g. /dns4/p2p.example.com/udp/4001/quic-v1
+      NANACE_P2P_EXTERNAL_ADDRS: ${NANACE_P2P_EXTERNAL_ADDRS:-}
+      NANACE_INTERNAL_URL: http://server:9191
+      NANACE_P2P_NODE_SECRET_FILE: /run/secrets/p2p-node-secret
+      NANACE_LOG_FORMAT: ${NANACE_LOG_FORMAT:-text}
+    secrets:
+      - p2p-node-secret
+    ports:
+      - "${NANACE_HOST_BIND:-127.0.0.1}:${NANACE_P2P_PORT:-4001}:4001/tcp"
+      - "${NANACE_HOST_BIND:-127.0.0.1}:${NANACE_P2P_PORT:-4001}:4001/udp"
+    volumes:
+      - p2p-node-data:/var/lib/nanace-p2p
 
   # Integration tests only: in-memory storage, emptied on every restart.
   qdrant-test:
@@ -71,6 +103,11 @@ services:
     tmpfs:
       - /qdrant/storage
 
+secrets:
+  p2p-node-secret:
+    environment: NANACE_P2P_NODE_SECRET
+
 volumes:
   postgres-data:
   qdrant-data:
+  p2p-node-data:

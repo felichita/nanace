@@ -1,4 +1,4 @@
-.PHONY: deps deps-down up down logs fmt fmt-check lint test test-integration test-model check run desktop-deps desktop-dev desktop-build desktop-check
+.PHONY: deps deps-down up up-p2p down logs fmt fmt-check lint test test-integration test-model check run desktop-deps desktop-dev desktop-build desktop-check
 
 DESKTOP := apps/desktop
 
@@ -11,8 +11,11 @@ deps-down: ## Stop dependencies (keeps volumes)
 up: ## Build and run the API server in Docker with PostgreSQL and Qdrant
 	docker compose --profile app up -d --build --wait
 
+up-p2p: ## The same plus the P2P network node (needs NANACE_P2P_NODE_SECRET in .env)
+	docker compose --profile app --profile p2p up -d --build --wait
+
 down: ## Stop the Docker stack (keeps volumes)
-	docker compose --profile app down
+	docker compose --profile app --profile p2p down
 
 logs: ## Follow the API server logs
 	docker compose logs -f server

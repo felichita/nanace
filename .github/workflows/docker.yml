@@ -1,6 +1,6 @@
 name: Docker
 
-# Builds the backend image (nanace-server, embedding model included) for linux/amd64 and linux/arm64 on native runners. Pull requests
+# Builds the backend image (nanace-server and nanace-p2p, embedding model included) for linux/amd64 and linux/arm64 on native runners. Pull requests
 # only build; v* tags publish to GitHub Container Registry:
 #   ghcr.io/<owner>/nanace-server:<version>, :<major>.<minor>, :latest
 
