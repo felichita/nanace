@@ -149,9 +149,12 @@ pub(crate) async fn require_title_access(state: &AppState, write: TitleWrite<'_>
         });
     // A team `agent` edits only the pages it created.
     let not_author = write.role == TeamRole::Agent && write.created_by.is_some_and(|author| author != write.user_id);
-    if !not_author && (write.role == TeamRole::Admin || !protected) {
+    // The protected rule is reported first: it holds whoever wrote the page.
+    let protected_denied = protected && write.role != TeamRole::Admin;
+    if !not_author && !protected_denied {
         return Ok(());
     }
+    let not_author = !protected_denied;
     // Its own statement: the refused write is rolled back or never starts.
     audit::record(
         &state.pool,
