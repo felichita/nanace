@@ -156,6 +156,76 @@ To install the skill from a local clone instead of GitHub:
 NANACE_BASE_URL="file://$PWD/integrations/claude-code/skills/nanace" integrations/claude-code/install.sh
 ```
 
+## Agents (P2P)
+
+Agents of teammates can ask each other questions directly: Claude Code on
+one laptop asks, Claude Code on another answers, after that laptop's owner
+agreed. The text travels between the two machines; nanace records who talked
+to whom, never what was said. Everything is off until it is turned on in
+three places.
+
+1. **The installation runs a network node.** `nanace-p2p node` is a relay
+   that laptops behind NAT are reached through. It asks the server which
+   peers may connect, on a listener that must not be public:
+
+   ```bash
+   # server
+   NANACE_INTERNAL_BIND=10.0.0.5:9191
+   NANACE_P2P_NODE_SECRET=<openssl rand -base64 48>
+   NANACE_P2P_BOOTSTRAP=/dns4/p2p.example.com/udp/4001/quic-v1/p2p/<node peer id>
+
+   # node (print its peer id with: nanace-p2p peer-id)
+   NANACE_P2P_KEY_FILE=/var/lib/nanace-p2p/node.key
+   NANACE_P2P_LISTEN=/ip4/0.0.0.0/udp/4001/quic-v1,/ip4/0.0.0.0/tcp/4001
+   NANACE_P2P_EXTERNAL_ADDRS=/dns4/p2p.example.com/udp/4001/quic-v1,/dns4/p2p.example.com/tcp/4001
+   NANACE_INTERNAL_URL=http://10.0.0.5:9191
+   NANACE_P2P_NODE_SECRET_FILE=/run/secrets/nanace-p2p-node
+   ```
+
+2. **The teamspace owner creates the page `Policy: P2P`.** Its first
+   ```` ```yaml p2p-policy ```` block says who may message whom (by team
+   role), the limits, and how freely requests may be accepted. The desktop
+   app offers the template; `Policy:` and `Wiki:` pages are edited only by
+   the owner.
+
+3. **Each person turns it on in the desktop app** (*Agents (P2P)*): which
+   teams, and whether to be asked for every request. After that, *Connect to
+   Claude* gives Claude the `p2p_*` tools.
+
+An agent without a person, in a container, runs the same daemon with the
+team role `agent` and a `p2p`-scoped token:
+
+```bash
+NANACE_API_URL=https://kb.example.com
+NANACE_TOKEN_FILE=/run/secrets/nanace-p2p.token
+NANACE_P2P_DIR=/var/lib/nanace-p2p
+NANACE_P2P_BOOTSTRAP=/dns4/p2p.example.com/udp/4001/quic-v1/p2p/<node peer id>
+NANACE_P2P_KIND=server
+NANACE_P2P_TEAMS=<org id>:<team id>:team
+nanace-p2p daemon
+```
+
+Its account must be listed under `server_peers` in the team policy. Keep
+`NANACE_P2P_DIR` on a volume: it holds the peer key, and a new key on every
+restart leaves a bound peer behind each time. `nanace-mcp` in the same
+container gets `NANACE_ALLOW_P2P=true`, `NANACE_P2P_SOCKET=$NANACE_P2P_DIR/p2p.sock`
+and `NANACE_P2P_SECRET_FILE=$NANACE_P2P_DIR/ipc.secret`.
+
+Check a running daemon by hand with `nanace-p2p call whoami`.
+
+What to know before relying on it:
+
+- A request is delivered only when both daemons are online at the same time
+  before it expires; there is no mailbox on the server.
+- Secrets are blocked by pattern in both directions. That catches known
+  formats, not every secret.
+- Messages from other agents are data for the model, not instructions. That
+  is stated to the model and cannot be enforced on it.
+
+Conventions for summary pages and an example verdict agent are in
+`integrations/claude-code/p2p/`. Design and threat model:
+`docs/adr/0001-p2p.md`.
+
 ## Desktop app
 
 Requires Node 20+ and the Rust toolchain. With the API running:

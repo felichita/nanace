@@ -292,6 +292,9 @@ async fn create_context(
 struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    /// Only pages carrying this tag (compared after the usual tag
+    /// normalization, so case does not matter).
+    tag: Option<String>,
 }
 
 async fn list_contexts(
@@ -310,15 +313,22 @@ async fn list_contexts(
         ));
     }
 
+    let tag = match &query.tag {
+        Some(tag) => validate::tags(std::slice::from_ref(tag))?.pop(),
+        None => None,
+    };
+
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     let rows: Vec<ContextSummary> = sqlx::query_as(
         "SELECT id, team_id, title, tags, updated_by, updated_at FROM contexts \
-         WHERE org_id = $1 AND team_id = $2 ORDER BY updated_at DESC, id LIMIT $3 OFFSET $4",
+         WHERE org_id = $1 AND team_id = $2 AND ($5::text IS NULL OR tags @> ARRAY[$5::text]) \
+         ORDER BY updated_at DESC, id LIMIT $3 OFFSET $4",
     )
     .bind(org_id)
     .bind(team_id)
     .bind(limit)
     .bind(offset)
+    .bind(tag)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

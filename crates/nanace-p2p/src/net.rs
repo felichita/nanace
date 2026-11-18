@@ -73,6 +73,8 @@ enum Command {
     Vouched(PeerId, bool),
     /// The daemon's acknowledgement of an inbound message.
     Acked(MessageKind, ResponseChannel<Ack>, Ack),
+    /// Close every connection and end the task.
+    Shutdown,
 }
 
 /// Handle to the swarm task; this is the daemon's [`Transport`].
@@ -157,6 +159,12 @@ impl Net {
         Ok(Arc::new(Self { commands }))
     }
 
+    /// Leaves the network: every connection closes and nothing more is sent
+    /// or received through this handle.
+    pub async fn shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown).await;
+    }
+
     /// Gives inbound messages somewhere to go.
     pub async fn attach(&self, daemon: Arc<Daemon>) {
         let _ = self.commands.send(Command::Attach(daemon)).await;
@@ -238,8 +246,8 @@ async fn run(
         tokio::select! {
             event = state.swarm.select_next_some() => state.on_event(event),
             command = inbox.recv() => match command {
+                Some(Command::Shutdown) | None => break,
                 Some(command) => state.on_command(command),
-                None => break,
             },
             _ = bootstrap_tick.tick() => state.keep_bootstrap(),
         }
@@ -328,6 +336,8 @@ impl Loop {
                     self.swarm.behaviour_mut().allowed.allow_peer(peer);
                 }
             }
+            // Handled by the loop itself.
+            Command::Shutdown => {}
             Command::Acked(kind, channel, ack) => {
                 // The other side may have gone; it will ask again.
                 let _ = self.messages(kind).send_response(channel, ack);

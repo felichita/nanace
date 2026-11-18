@@ -212,12 +212,17 @@ impl ApiClient {
         team_id: Uuid,
         limit: u32,
         offset: u32,
+        tag: Option<&str>,
     ) -> Result<Vec<ContextSummary>, ApiError> {
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(tag) = tag {
+            query.push(("tag", tag.to_owned()));
+        }
         self.request(
             Method::GET,
             &format!("/api/v1/orgs/{org_id}/teams/{team_id}/contexts"),
             None,
-            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+            &query,
         )
         .await
     }

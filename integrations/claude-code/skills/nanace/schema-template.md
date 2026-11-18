@@ -13,6 +13,8 @@
 | `Service:` | One application/service, from the team's angle | `Service: billing-api` | `service` |
 | `Ref:` | Short stable reference (aliases, config layout, how-to) | `Ref: Shell aliases` | `ref` |
 | `Source:` | Provenance/catalog of a raw source batch (PR lists, exports). Not edited after creation except for corrections | `Source: PRs 2026-08..10` | `source` |
+| `P2P:` | Summary of one exchange between agents: who asked whom, the answer in short, the pages it rests on. Title ends with the trace id | `P2P: sg-123 dependants (TASK-1)` | `p2p` + `trace-<trace id>` |
+| `Verdict:` | The verdict agent's judgement of a task, from the written record | `Verdict: PROJECT-2345` | `verdict` + status |
 
 Rules:
 - The `<KEY>:` format is what `/nanace <key>` looks for (title must **start with the key**), so never rename a task page to another format.

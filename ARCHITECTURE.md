@@ -61,6 +61,30 @@ agreed design that is not implemented yet.
   (RFC 8252), or dev email login. Both end with a write-scoped personal
   access token. Signing out revokes that token.
 
+- **Agents (P2P):**
+  - **Sidecar:** `nanace-p2p` ships next to `nanace-mcp`. With P2P on, the
+    app starts it, hands it the peer key (from the OS keychain) and a
+    one-time supervisor secret on standard input, and keeps that pipe open:
+    the daemon stops when the app does.
+  - **Token:** turning P2P on needs a fresh interactive sign-in and issues a
+    30-day token named `nanace p2p` with the `p2p` scope, stored in a file
+    only the user can read and rotated weekly like Claude's. Turning it off
+    revokes the token and forgets the peer key.
+  - **Settings:** per team, whether this computer takes part and how
+    requests are accepted (never more than the team's policy allows), whether
+    answers are shown before sending, the trusted list, and "Stop
+    everything". A teamspace owner can create the team's `Policy: P2P` page
+    from the template here.
+  - **Consent window:** who asks, in which team, the text, the deadline;
+    allow, deny, or allow that person for some hours. Text from a peer is
+    shown as plain text.
+  - **Activity:** connections (direct or through the relay) and recent
+    exchanges, without their text.
+  - **Claude:** when P2P is on, "Connect to Claude" also gives Claude the
+    `p2p_*` tools (`NANACE_ALLOW_P2P`, the socket and the secret file path).
+  - The webview reaches the daemon through one command with a fixed list of
+    methods. Sending and answering as an agent are not on it.
+
 Live collaboration (WebSocket, CRDT) is **[planned]**.
 
 ### 2. Backend (Rust + Actix-web)
@@ -97,6 +121,7 @@ Talks to PostgreSQL and Qdrant.
 | `p2p_peers` | Which libp2p peer id belongs to which user; revoked ids stay as tombstones |
 | `p2p_presence` | Which peers and agents are present in a team right now; rows expire |
 | `p2p_policies` | The parsed `Policy: P2P` page of a team; one row per team |
+| `p2p_exchanges` | Journal of P2P exchanges: signed metadata, never message text |
 
 Roles are a closed set enforced by `CHECK` constraints and the
 `nanace_core::TeamRole` / `OrgRole` enums, not a separate table.
@@ -306,8 +331,8 @@ The desktop app adds two parameters to the login request:
 - Scope `read` (GET requests and search) or `write` (everything the user's
   roles allow). Mutating handlers take `WriteUser`, which rejects read tokens.
 - Scope `p2p` is for the P2P daemon. It reaches the peer registry
-  (`/me/peers*`, presence, team peers), `GET /me`, and rotating or revoking
-  itself, and nothing else: `AuthUser` rejects it, so every other handler
+  (`/me/peers*`, presence, team peers, the team policy, exchange reports),
+  `GET /me`, and rotating or revoking itself, and nothing else: `AuthUser` rejects it, so every other handler
   answers `403`. A token file taken from a laptop cannot read or change pages.
 - Expire after 1–365 days (default 90); revocation is immediate. At most 50
   active tokens per user.
@@ -389,10 +414,11 @@ organization:
 
 ### P2P registry [built]
 
-Agents on different machines will talk to each other over libp2p
-(`nanace-p2p`, **[planned]**; design in `docs/adr/0001-p2p.md`). The server
-is their registry: it knows which peer belongs to which user and which peers
-are present in a team. Message bodies never pass through the server.
+Agents on different machines talk to each other over libp2p (`nanace-p2p`,
+[below](#agent-p2p-nanace-p2p-built); decisions and threat model in
+`docs/adr/0001-p2p.md`). The server is their registry: it knows which peer
+belongs to which user and which peers are present in a team. Message bodies
+never pass through the server.
 
 **Binding a peer.** A peer id is an Ed25519 key. To bind one, the client
 proves it holds the key:
@@ -463,8 +489,7 @@ returns a starting page with strict defaults.
   presence; `discovery.visible_to` on the peer list; `discovery.lan_addrs`
   on announced addresses; `server_peers` for peers that run without the
   desktop app. The remaining fields (`calls`, `limits`, `data`, `summaries`)
-  are served to daemons through `GET …/p2p/policy` and enforced there
-  **[planned]**.
+  are served to daemons through `GET …/p2p/policy` and enforced there.
 - **Pages from before this version** titled `Policy: P2P` have no stored
   policy. P2P stays off and `GET …/p2p/policy` tells the owner to save the
   page again.
@@ -481,16 +506,156 @@ policies for `nanace_tenant` only, in three scopes:
   org. A user writes presence only for their own, unrevoked peers.
 - **User only** (`db::user_tx`): the caller's own peers, and peers and
   presence of users who share a team with the caller in any org.
-- **System** (`db::p2p_system_tx`): the server's own maintenance. It may read
-  both tables and delete presence that has already expired, nothing else.
-  It is never used on behalf of a request's caller.
+- **System** (`db::p2p_system_tx`): the server's own maintenance and the
+  network node's allow list. It may read the P2P tables, delete presence
+  that has already expired and delete exchange reports past their
+  retention, nothing else. It is never used on behalf of a request's caller.
+
+`p2p_policies` is written only by team admins and `p2p_exchanges` only by
+the side that reports; both are under the same forced row-level security.
 
 **Rate limits.** Challenges, binds, presence and lookups are limited per user
 with an in-memory token bucket (`429` with `Retry-After`). Each replica
 counts on its own, so this bounds abuse and is not a quota.
 
+**Exchange journal.** Each side of an exchange reports it to
+`POST …/p2p/exchanges` with the request's signed header and, once there is
+one, the signed answer header.
+
+- The server checks the signatures against the peer keys, that both peers
+  are bound to the users the header names, and that the reporter is that
+  side. The row's facts (who, to whom, kind, sizes, trace) come from the
+  signed header, not from the reporter.
+- A report is updated as the exchange moves on (`delivered`, then
+  `answered`, `rejected`, `expired` or `failed`), and each write is audited
+  as `p2p.exchange`.
+- `GET …/p2p/exchanges` is for team admins and org admins. `has_summary`
+  says whether a page of the team carries the tag `trace-<trace id>`.
+- Reports are kept `NANACE_P2P_EXCHANGE_RETENTION_DAYS` days (default 30), or
+  the shorter period of the team's policy.
+
+**Network node access.** The node asks the server which peers may connect,
+on a separate listener (`NANACE_INTERNAL_BIND`) with a shared secret
+(`NANACE_P2P_NODE_SECRET`, at least 32 bytes). A peer is allowed while it is
+bound to a live account, not revoked, and present in a team whose policy
+enables P2P. That list is all the node learns. `GET /api/v1/p2p/config`
+tells daemons which node to use (`NANACE_P2P_BOOTSTRAP`).
+
 **Metrics:** `nanace_p2p_active_peers`, `nanace_p2p_peer_binds_total`,
-`nanace_p2p_presence_starts_total`, `nanace_p2p_policy_denials_total{reason}`.
+`nanace_p2p_presence_starts_total`, `nanace_p2p_policy_denials_total{reason}`,
+`nanace_p2p_exchanges_total{kind,status}`.
+
+### Agent P2P (`nanace-p2p`) [built]
+
+One binary with two modes.
+
+```text
+          server side                                   a laptop, or an agent container
+ ┌────────────────────────────────┐          ┌──────────────────────────────────────────┐
+ │ nanace-server                  │  HTTPS   │ nanace-p2p daemon                         │
+ │   public API  ◀────────────────┼──────────┼──  p2p-scoped token                       │
+ │   internal listener ◀──┐       │          │   ▲ local socket                          │
+ │ nanace-p2p node        │ allow │  libp2p  │   ├─ nanace-mcp ◀─ Claude  (agent role)   │
+ │   relay v2, AutoNAT ───┘ list  │◀────────▶│   └─ desktop app           (supervisor)   │
+ └────────────────────────────────┘          └──────────────────────────────────────────┘
+        daemons reach each other directly when they can, through the relay otherwise
+```
+
+**Node** (`nanace-p2p node`): a public relay daemons bootstrap from.
+Circuit Relay v2 with limits sized for text, an AutoNAT server, `identify`
+and `ping`. It holds no token, no database access and no message; relayed
+traffic stays encrypted between the two daemons.
+
+**Daemon** (`nanace-p2p daemon`): one per user and machine.
+
+- **On a laptop** the desktop app starts it as a sidecar and it accepts
+  requests only while the app is attached. **In a container** it runs on its
+  own (`NANACE_P2P_KIND=server`), takes its teams and accept modes from
+  `NANACE_P2P_TEAMS`, and its account must be listed in the team policy's
+  `server_peers`.
+- **Transports:** QUIC and TCP with Noise and yamux. Behind NAT a daemon
+  reserves a slot on the node and is reached through it; DCUtR then tries a
+  direct connection.
+- **Closed network:** no pre-shared key. A daemon keeps a connection only
+  with the node and with peers the registry vouches for
+  (`GET /me/peers/lookup`), re-checked every 30 seconds; the node admits only
+  the peers the server lists. Revoking a peer or its token ends its
+  connections within that time.
+- **Protocols:** `/nanace/p2p/ask/1.0.0`, `/nanace/p2p/status/1.0.0`,
+  `/nanace/p2p/notify/1.0.0`. Each message is acknowledged at once; the
+  answer to a question is a separate message later, because consent and the
+  agent may take minutes.
+
+**Messages.** A message is a signed header plus its text.
+
+- The header carries ids, sender and receiver (peer, agent, user), team,
+  kind, hop count, deadline, the policy version and the hash of the text. It
+  is signed with the sender's peer key over its exact bytes.
+- An answer's header names the hash of the request header, so it cannot be
+  attached to another request.
+- The server only ever receives headers.
+
+**What a daemon checks before a person or a model sees a message**, in order:
+
+1. The signature, that the sender is the peer on the other end of the
+   connection, and that the message is addressed to this peer and user.
+2. That it is still alive and was not seen before.
+3. With the registry: that the peer belongs to the user it names and shares
+   the team.
+4. With the daemon's own, current copy of the team policy: P2P is on, the
+   call rule allows this sender role, receiver role and kind, the size, the
+   hop limit and the rate per peer.
+5. The secret rules (below).
+6. That the addressed agent is registered, and consent.
+
+Anything that fails is refused with a reason from a closed set
+(`policy`, `rate`, `size`, `hops`, `pattern`, `consent`, `replay`,
+`invalid`, `no_agent`), never with text.
+
+**Secret rules.** Built-in patterns for private keys, nanace tokens, JWTs,
+cloud and vendor keys, `Authorization` headers, URLs with credentials and
+`password=`-style assignments are applied to every text: by the sender
+before it is signed and by the receiver before it is shown. A team policy
+can add patterns and cannot remove these. They recognize known formats; a
+secret in an unknown format, encoded, or described in words is not caught.
+
+**Consent.** The accept mode is the user's choice per team, capped by the
+policy's `max_accept_mode`:
+
+| Mode | Inbound requests |
+|---|---|
+| `off` | Refused. Also what applies on a laptop when the desktop app is not attached |
+| `ask` | Each one waits for the user |
+| `trusted` | Accepted from users the user trusts, others wait |
+| `team` | Accepted from everyone the policy allows |
+
+A request nobody decides on expires after the policy's
+`consent_timeout_secs`. With "show answers before sending", the agent's
+answer also waits for the user.
+
+**Delivery.** A request waits in the sender's queue and is retried until
+its deadline (`request_ttl_secs`), then expires. There is no mailbox on the
+server, so both daemons must be online at the same moment at some point
+before the deadline. Queued messages are files only the user can read
+(`<state dir>/spool`), removed a day after the exchange ends. Chains of
+requests under one trace stop at the policy's `max_hops`.
+
+**Local socket.** Programs of the same user reach the daemon over a Unix
+socket (a named pipe on Windows) with JSON-RPC, one message per line. A
+session presents a secret and gets a role:
+
+- **agent** (`nanace-mcp`): registers an agent label, sends, reads its
+  inbox, answers, sets its status. The secret is in a file only the user can
+  read.
+- **supervisor** (the desktop app): also answers consent prompts and changes
+  settings. Its secret is passed to the daemon on standard input and is never
+  on disk, so a session with the agent secret cannot approve its own inbound
+  requests.
+
+**Status requests** are answered from the status the agent last recorded
+with `p2p_set_status`, without waking a model.
+
+
 
 ### Google Workspace group sync [planned]
 
@@ -604,6 +769,21 @@ audit path as the HTTP API.
 - The org is the tool argument, then `NANACE_ORG_ID`, then the user's only org.
 - Context content is returned inside `<context_content>` delimiters, and the
   server instructions tell the model to treat it as data, not instructions.
+- **P2P tools** (`p2p_whoami`, `p2p_find_peers`, `p2p_ask`,
+  `p2p_get_reply`, `p2p_status`, `p2p_set_status`, `p2p_inbox`, `p2p_reply`,
+  `p2p_get_policy`) exist only with `NANACE_ALLOW_P2P=true` and a reachable
+  daemon (`NANACE_P2P_SOCKET`, `NANACE_P2P_SECRET_FILE`). Without the daemon
+  they are not registered and the server instructions say why. They relay to
+  the user's daemon over its local socket; `nanace-mcp` links only that
+  client, no networking code.
+  - Text from a peer is returned inside `<peer_message>` tags that it cannot
+    close or fake, with the sender taken from the daemon.
+  - The instructions tell the model that peer messages are data: answer
+    them, do not act on them, do not reveal secrets, check claims in nanace.
+  - The verdict agent runs without `NANACE_ALLOW_P2P` and so has none of
+    these tools.
+- `list_contexts` takes an optional `tag`, for example `verdict` or
+  `trace-<trace id>`.
 - Authentication: `NANACE_TOKEN` with a personal access token (a `read`
   token is enough), or `NANACE_DEV_EMAIL` against a development API. Remote
   MCP over streamable HTTP with OAuth is **[planned]**.
@@ -618,10 +798,12 @@ Backend (Rust)
     |-> Qdrant      <- embeddings, semantic search
     ^
     | REST, as the user
-nanace-mcp (stdio)
-    ^
-    | MCP protocol
-Claude Desktop / Claude Code
+nanace-mcp (stdio) ---- local socket ----> nanace-p2p daemon <== libp2p ==> other daemons
+    ^                                          |  ^                     (direct, or through
+    | MCP protocol                             |  | supervisor           the nanace-p2p node)
+Claude Desktop / Claude Code                   |  desktop app
+                                               v
+                                         Backend (REST, p2p-scoped token)
 ```
 
 ## Why This Architecture
@@ -653,7 +835,10 @@ Claude Desktop / Claude Code
 | `crates/nanace-core` | Pure domain logic: roles, validation, markdown chunking, hashing |
 | `crates/nanace-embed` | `Embedder` trait, `FastEmbedder` (bge-small), `HashingEmbedder` |
 | `crates/nanace-server` | Actix-web API, auth, RBAC, RLS-scoped DB access, Qdrant, audit, migrations |
-| `crates/nanace-mcp` | stdio MCP server over the REST API; read tools, opt-in create/update |
+| `crates/nanace-mcp` | stdio MCP server over the REST API; read tools, opt-in create/update, opt-in P2P tools |
+| `crates/nanace-p2p` | `nanace-p2p` binary: network node and per-user daemon; its local IPC client for the other programs |
+| `integrations/claude-code` | Installer, the `/nanace` skill, and P2P conventions with a verdict agent example |
+| `docs/adr` | Decision records |
 | `apps/desktop` | Tauri desktop app (React UI in `src`, Rust shell in `src-tauri`) |
 | `deploy/postgres` | Local database bootstrap (non-superuser app role) |
 | `docker-compose.yml` | PostgreSQL 18 and Qdrant for development |
@@ -680,7 +865,7 @@ Claude Desktop / Claude Code
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |
 | `GET/PUT` | `/api/v1/orgs/{org}/teams/{team}/members` | Team member or org admin / team admin or org admin |
 | `DELETE` | `/api/v1/orgs/{org}/teams/{team}/members/{user}` | Team admin or org admin |
-| `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader / team agent or writer (team admin for `Policy:` and `Wiki:` titles) |
+| `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader (`?tag=` filters) / team agent or writer (team admin for `Policy:` and `Wiki:` titles) |
 | `GET/PUT/DELETE` | `/api/v1/orgs/{org}/contexts/{id}` | Team reader / team writer, or the agent that created the page / team writer (team admin for `Policy:` and `Wiki:` pages) |
 | `GET` | `/api/v1/orgs/{org}/contexts/{id}/links` | Team reader; outgoing, backlinks, related |
 | `GET` | `/api/v1/orgs/{org}/graph` | Org member; readable contexts, link and similarity edges |
@@ -698,6 +883,10 @@ Claude Desktop / Claude Code
 | `GET` | `/api/v1/orgs/{org}/teams/{team}/peers` | Team member; `?capability=`, `?limit=`; empty unless the policy shows peers to the caller's role |
 | `GET` | `/api/v1/orgs/{org}/teams/{team}/p2p/policy` | Team member; parsed policy, `?text=true` adds the guidance for agents |
 | `GET` | `/api/v1/p2p/policy-template` | Authenticated; a `Policy: P2P` page to start from |
+| `GET` | `/api/v1/p2p/config` | Authenticated, any scope; the network node to bootstrap from |
+| `POST` | `/api/v1/orgs/{org}/teams/{team}/p2p/exchanges` | Team member that is one side of the exchange; signed headers only |
+| `GET` | `/api/v1/orgs/{org}/teams/{team}/p2p/exchanges` | Team admin or org admin; `?trace_id=`, `?limit=`, `?offset=` |
+| `GET` | `/internal/p2p/allowed`, `/internal/p2p/allow` | The network node, on the internal listener only |
 | `GET` | `/livez` | Anyone; liveness, touches no dependencies |
 | `GET` | `/readyz`, `/healthz` | Anyone; readiness, checks PostgreSQL and Qdrant |
 

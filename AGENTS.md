@@ -5,8 +5,9 @@ This file holds repository-wide rules. Use the nearest subdirectory
 
 nanace is a multi-tenant markdown knowledge base: Rust (Actix-web) backend,
 PostgreSQL for metadata, RBAC and canonical content, Qdrant for semantic
-search, local `bge-small-en-v1.5` embeddings, and a stdio MCP server
-(`nanace-mcp`) that gives Claude read access through the REST API.
+search, local `bge-small-en-v1.5` embeddings, a stdio MCP server
+(`nanace-mcp`) that gives Claude read access through the REST API, and
+`nanace-p2p`, through which agents of a team message each other.
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for the design, data model, flows, and
 which parts are built or planned.
 
@@ -46,7 +47,7 @@ rules. A skill cannot expand the user's requested scope or grant authorization.
 ```bash
 make deps               # start PostgreSQL + Qdrant (docker compose)
 make check              # fmt check + clippy -D warnings + unit tests
-make test-integration   # API, RLS and MCP tests (nanace_test DB + qdrant-test)
+make test-integration   # API, RLS, MCP and P2P tests (nanace_test DB + qdrant-test)
 make test-model         # real bge-small model test (downloads ~130 MB once)
 make run                # run the API with .env (copy from .env.example)
 make desktop-check      # desktop app: tsc, vitest, Tauri clippy + tests
@@ -133,9 +134,11 @@ only for changed code, new evidence, or an explicit re-review request.
   roles other than `nanace_tenant`.
 - Every query on `p2p_peers` or `p2p_presence` runs inside `db::scoped_tx`,
   `db::user_tx` (the caller's own peers and lookups across their teams) or
-  `db::p2p_system_tx`. The system scope is for the server's own maintenance
-  only: never open it for a request's caller, and do not widen what its
-  policies allow beyond reading these tables and deleting expired presence.
+  `db::p2p_system_tx`; the same goes for `p2p_policies` and
+  `p2p_exchanges`. The system scope is for the server's own maintenance and
+  the node's allow list only: never open it for a request's caller, and do
+  not widen what its policies allow beyond reading the P2P tables, deleting
+  expired presence and deleting exchange reports past retention.
 - Return `404` (not `403`) for org, team, context, or peer ids the caller
   cannot read, so ids cannot be probed.
 - Org admins manage membership but get no implicit access to team content.
@@ -152,12 +155,27 @@ only for changed code, new evidence, or an explicit re-review request.
   across collections.
 - Every state change, and every content read, writes an `audit_logs` row in the
   same transaction as the change.
-- `nanace-mcp` talks only to the REST API as the configured user; it never
-  gets database or Qdrant credentials. Write tools (`create_context`,
+- `nanace-mcp` talks only to the REST API as the configured user and, for
+  the `p2p_*` tools, to that user's `nanace-p2p` daemon over its local
+  socket; it never gets database or Qdrant credentials, the peer key or the
+  daemon's token, and it links no networking code (`nanace-p2p` with
+  `default-features = false`). The `p2p_*` tools are registered only with
+  `NANACE_ALLOW_P2P=true` and a reachable daemon. Text from a peer is
+  returned through `p2p::peer_message`, never raw. Write tools (`create_context`,
   `update_context`) are registered only with `NANACE_ALLOW_WRITES=true` and
   need a write-scoped token; there is no delete tool. Tools never take tenant
   scope from context content.
   stdout is the MCP channel: log to stderr only.
+- `nanace-p2p`: the node has no database, token or message and learns only
+  the allow list from the internal listener; never expose that listener
+  publicly or serve anything else on it. A daemon takes identity, team
+  roles and policy from the registry, never from a peer. Every check in
+  `Daemon::receive_request` runs before a message is stored or shown; do
+  not add a path that skips them or that executes anything on behalf of a
+  message. Message text is never logged, reported to the server or put in
+  an error. The built-in secret rules cannot be disabled by a policy.
+- Only the supervisor role of the daemon's local socket answers consent
+  prompts and changes settings; its secret is never written to disk.
 - JWTs and personal access tokens identify the user only. Never put roles or
   team ids in tokens; permissions are read from PostgreSQL per request.
 - Handlers that change state take `WriteUser` (rejects `read`-scoped
@@ -172,6 +190,12 @@ only for changed code, new evidence, or an explicit re-review request.
   `AuthUser::require_session`.
 - Store only hashes of tokens and login codes; never log or return a secret
   after creation. Session tokens never go in URLs.
+- The desktop app runs `nanace-p2p` as a sidecar it spawns from Rust (no
+  shell permission for the webview). The webview reaches the daemon only
+  through `p2p_call` and the method list in `p2p.rs::WEBVIEW_METHODS`;
+  never add agent-side methods (`ask`, `reply`, `inbox`) to it. The peer key
+  lives in the OS keychain and the daemon's `p2p`-scoped token in a 0600
+  file; neither reaches the webview.
 - The desktop webview never sees tokens: API calls go through the Tauri
   `api` command, which only reaches `<server>/api/v1/`. Do not add Tauri
   permissions or commands that expose HTTP, the filesystem, or the shell to

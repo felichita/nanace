@@ -95,6 +95,8 @@ pub struct ListContextsParams {
     pub limit: Option<u32>,
     /// Number of contexts to skip, for paging.
     pub offset: Option<u32>,
+    /// Only contexts carrying this tag, for example `verdict` or `trace-task-1`.
+    pub tag: Option<String>,
     /// Organization id. Optional when the user belongs to exactly one organization.
     pub org_id: Option<String>,
 }
@@ -511,7 +513,7 @@ impl NanaceMcp {
     }
 
     #[tool(
-        description = "List the most recently updated contexts of one team (titles and ids, no content).",
+        description = "List the most recently updated contexts of one team (titles and ids, no content), optionally only those carrying a tag.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_contexts(
@@ -532,7 +534,11 @@ impl NanaceMcp {
             Ok(org) => org,
             Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         };
-        let contexts = match self.api.list_contexts(org_id, team_id, limit, offset).await {
+        let contexts = match self
+            .api
+            .list_contexts(org_id, team_id, limit, offset, params.tag.as_deref())
+            .await
+        {
             Ok(contexts) => contexts,
             Err(err) => return Ok(tool_error(err)),
         };

@@ -2092,6 +2092,30 @@ async fn policy_and_wiki_pages_are_written_only_by_team_admins() {
     )
     .await;
 
+    // Pages can be listed by tag, whatever its case.
+    c.ok(
+        "POST",
+        &pages,
+        &bob,
+        Some(json!({ "title": "Verdict: TASK-1", "content": "ok", "tags": ["verdict", "Trace-TASK-1"] })),
+        StatusCode::CREATED,
+    )
+    .await;
+    for (tag, expected) in [("verdict", 1), ("TRACE-task-1", 1), ("nope", 0)] {
+        let listed = c
+            .ok("GET", &format!("{pages}?tag={tag}"), &carol, None, StatusCode::OK)
+            .await;
+        assert_eq!(listed.as_array().unwrap().len(), expected, "{tag}");
+    }
+    c.ok(
+        "GET",
+        &format!("{pages}?tag=bad%2Ftag"),
+        &carol,
+        None,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
     // A page that already has a look-alike title stays editable under it;
     // only giving a page such a title is refused.
     let legacy = id_of(

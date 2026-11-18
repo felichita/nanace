@@ -75,3 +75,7 @@ sqlx.workspace = true
 [[test]]
 name = "network"
 required-features = ["daemon"]
+
+[[test]]
+name = "e2e"
+required-features = ["daemon"]
