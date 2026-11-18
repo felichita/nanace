@@ -847,7 +847,9 @@ impl NanaceMcp {
 
     #[tool(
         description = "Ask a teammate's agent for its structured status: what it is doing, what it has found, whether it is busy. Answered from the status that agent last set; it does not interrupt the agent.",
-        annotations(read_only_hint = true, open_world_hint = true)
+        // Not read-only: it sends a request to another machine, which is
+        // recorded in the team's journal.
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true)
     )]
     async fn p2p_status(&self, Parameters(params): Parameters<P2pStatusParams>) -> Result<CallToolResult, ErrorData> {
         let (org_id, team_id, slug) = match self.p2p_team(params.org_id.as_deref(), params.team.as_deref()).await {
@@ -1081,8 +1083,7 @@ fn describe_reply(reply: &Value, team: &str) -> String {
 /// Keeps user-written text from closing (or faking) the `<context_content>`
 /// delimiters that mark it as data.
 fn neutralize_delimiters(text: &str) -> String {
-    text.replace("<context_content>", "&lt;context_content&gt;")
-        .replace("</context_content>", "&lt;/context_content&gt;")
+    crate::p2p::neutralize_frames(text)
 }
 
 /// Write failures with hints the model can act on.

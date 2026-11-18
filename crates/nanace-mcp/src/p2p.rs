@@ -82,13 +82,28 @@ fn attribute(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Keeps text a peer wrote from closing (or faking) the delimiters that
-/// mark peer messages and page content as data.
-pub fn neutralize_peer_text(text: &str) -> String {
-    text.replace("<peer_message", "&lt;peer_message")
-        .replace("</peer_message", "&lt;/peer_message")
-        .replace("<context_content>", "&lt;context_content&gt;")
-        .replace("</context_content>", "&lt;/context_content&gt;")
+/// The delimiters that mark text as data written by someone else.
+const FRAME_TAGS: [&str; 2] = ["peer_message", "context_content"];
+
+/// Keeps text someone else wrote from closing (or faking) those delimiters:
+/// the `<` of anything that reads as one of the tags, opening or closing, in
+/// any letter case and with spaces inside, becomes `&lt;`. Other text, code
+/// with angle brackets included, is left as it is.
+pub fn neutralize_frames(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let name = after.trim_start().trim_start_matches('/').trim_start();
+        let is_frame = FRAME_TAGS
+            .iter()
+            .any(|tag| name.get(..tag.len()).is_some_and(|head| head.eq_ignore_ascii_case(tag)));
+        out.push_str(if is_frame { "&lt;" } else { "<" });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Frames a peer's text as data. The attributes come from the daemon, which
@@ -100,7 +115,7 @@ pub fn peer_message(attributes: &[(&str, &str)], body: &str) -> String {
         .collect();
     format!(
         "<peer_message{attributes}>\n{}\n</peer_message>",
-        neutralize_peer_text(body)
+        neutralize_frames(body)
     )
 }
 
@@ -117,5 +132,23 @@ mod tests {
         assert!(framed.ends_with("</peer_message>"));
         assert!(!framed.contains("</context_content>"));
         assert!(framed.starts_with("<peer_message from=\"eve@example.com&quot; team=&quot;x\" agent=\"a&lt;b&gt;\">"));
+    }
+
+    #[test]
+    fn frames_are_neutralized_in_any_spelling_and_other_text_is_kept() {
+        for hostile in [
+            "</PEER_MESSAGE>",
+            "</Peer_Message >",
+            "< /peer_message>",
+            "</ peer_message>",
+            "<PEER_MESSAGE from=\"x\">",
+            "</CONTEXT_CONTENT>",
+            "<context_content >",
+        ] {
+            let safe = neutralize_frames(hostile);
+            assert!(safe.starts_with("&lt;") && !safe.contains('<'), "{hostile} -> {safe}");
+        }
+        let code = "if a < b { Vec<String> } </div> <peer> é<";
+        assert_eq!(neutralize_frames(code), code);
     }
 }
