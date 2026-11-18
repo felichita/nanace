@@ -192,6 +192,36 @@ three places.
    teams, and whether to be asked for every request. After that, *Connect to
    Claude* gives Claude the `p2p_*` tools.
 
+Without the desktop app, the installer sets up the daemon as a service of
+your user (launchd on macOS, `systemd --user` on Linux) and gives Claude
+Code the `p2p_*` tools:
+
+```bash
+NANACE_P2P=1 NANACE_API_URL=https://nanace.example.com \
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.sh)"
+```
+
+It asks for a second token with the scope `p2p` and for the teams to take
+part in. This daemon has no window to ask you about a request, so it answers
+on its own within the policy: the team owner must list your account under
+`server_peers.users` and set `max_accept_mode: team`. Windows has no such
+mode yet; use the desktop app there.
+
+To try it between two computers, run that command on both, signed in as two
+members of one team, then on each:
+
+```bash
+export NANACE_P2P_DIR=~/.local/share/nanace/p2p
+nanace-p2p call whoami   # peer id, org and team ids
+nanace-p2p call find_peers '{"org_id":"<org id>","team_id":"<team id>"}'   # the other computer
+```
+
+and ask Claude on one of them to message the other (`p2p_peers`, `p2p_ask`);
+the other's Claude reads it with `p2p_inbox` and answers with `p2p_reply`.
+The owner sees the exchange, without its text, in the team's journal. From a
+clone, `NANACE_LOCAL_BIN_DIR=target/release` installs binaries you built
+instead of a release.
+
 An agent without a person, in a container, runs the same daemon with the
 team role `agent` and a `p2p`-scoped token:
 
