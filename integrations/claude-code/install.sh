@@ -5,6 +5,7 @@
 #   - optionally connects Claude Code to a nanace server (token + `claude mcp add`),
 #   - with NANACE_P2P=1, the `nanace-p2p` daemon as a background service of
 #     this user, so Claude gets the `p2p_*` tools without the desktop app.
+#     NOT FOR A PERSON'S LAPTOP, see below.
 #
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/felichita/nanace/HEAD/integrations/claude-code/install.sh)"
 #
@@ -28,11 +29,16 @@
 #   NANACE_BASE_URL    override the skill download base (e.g. file:// of a clone)
 #   CLAUDE_CONFIG_DIR  Claude Code config dir (default: ~/.claude)
 #
-# NANACE_P2P=1 runs the daemon the way an agent in a container runs it: there
-# is no window to ask you about a request, so it answers on its own within the
-# team's `Policy: P2P`. The team owner has to list your account under
-# `server_peers` and set `max_accept_mode: team`. To be asked about every
-# request, use the nanace desktop app instead.
+# DO NOT USE NANACE_P2P=1 ON A PERSON'S LAPTOP. It installs a service that
+# restarts on its own (launchd KeepAlive, systemd Restart), accepts requests
+# without asking and lets the agent answer with nobody looking at the answer.
+# A laptop someone works on uses the nanace desktop app only: it asks before a
+# request reaches the agent and shows each answer before it leaves.
+#
+# NANACE_P2P=1 is for a machine nobody sits at. It runs the daemon the way an
+# agent in a container runs it, within the team's `Policy: P2P`: the team
+# owner has to list the account under `server_peers` and set
+# `max_accept_mode: team`.
 set -euo pipefail
 
 REPO="felichita/nanace"
@@ -488,6 +494,8 @@ start_p2p_service() {
 setup_p2p() {
   local bootstrap teams i=0
   say ""
+  warn "NANACE_P2P=1 is not for a laptop a person works on: this daemon accepts requests"
+  warn "and answers them with nobody asked. On such a laptop use the nanace desktop app."
   if [ ! -x "$P2P_BIN" ]; then
     say "nanace-p2p is not installed here, so P2P was not set up."
     return 0

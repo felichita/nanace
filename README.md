@@ -192,9 +192,15 @@ three places.
    teams, and whether to be asked for every request. After that, *Connect to
    Claude* gives Claude the `p2p_*` tools.
 
-Without the desktop app, the installer sets up the daemon as a service of
-your user (launchd on macOS, `systemd --user` on Linux) and gives Claude
-Code the `p2p_*` tools:
+> **Do not use `NANACE_P2P=1` on a person's laptop.** It installs a
+> service that restarts on its own, accepts requests without asking and
+> lets the agent answer with nobody looking at the answer. A laptop someone
+> works on uses the desktop app only: it asks before a request reaches the
+> agent and shows each answer before it leaves.
+
+On a machine nobody sits at (an agent host), the installer sets up the
+daemon as a service of its user (launchd on macOS, `systemd --user` on
+Linux) and gives Claude Code the `p2p_*` tools:
 
 ```bash
 NANACE_P2P=1 NANACE_API_URL=https://nanace.example.com \
@@ -202,18 +208,18 @@ NANACE_P2P=1 NANACE_API_URL=https://nanace.example.com \
 ```
 
 It asks for a second token with the scope `p2p` and for the teams to take
-part in. This daemon has no window to ask you about a request, so it answers
-on its own within the policy: the team owner must list your account under
-`server_peers.users` and set `max_accept_mode: team`. Windows has no such
-mode yet; use the desktop app there.
+part in. This daemon has no window to ask anyone about a request, so it
+answers on its own within the policy: the team owner must list its account
+under `server_peers.users` and set `max_accept_mode: team`. Windows has no
+such mode.
 
-To try it between two computers, run that command on both, signed in as two
-members of one team, then on each:
+To check it between two such machines, signed in as two members of one team,
+run on each:
 
 ```bash
 export NANACE_P2P_DIR=~/.local/share/nanace/p2p
 nanace-p2p call whoami   # peer id, org and team ids
-nanace-p2p call find_peers '{"org_id":"<org id>","team_id":"<team id>"}'   # the other computer
+nanace-p2p call find_peers '{"org_id":"<org id>","team_id":"<team id>"}'   # the other machine
 ```
 
 and ask Claude on one of them to message the other (`p2p_peers`, `p2p_ask`);
