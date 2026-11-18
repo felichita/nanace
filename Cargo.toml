@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/nanace-core", "crates/nanace-embed", "crates/nanace-mcp", "crates/nanace-server"]
+members = ["crates/nanace-core", "crates/nanace-embed", "crates/nanace-mcp", "crates/nanace-p2p", "crates/nanace-server"]
 # Built with its own lockfile and target dir by the Tauri CLI (apps/desktop).
 exclude = ["apps/desktop/src-tauri"]
 
@@ -25,6 +25,7 @@ futures-util = { version = "0.3", default-features = false }
 getrandom = "0.4"
 hmac = "0.13"
 fastembed = { version = "7.5", default-features = false, features = ["ort-download-binaries", "hf-hub-native-tls"] }
+libp2p = { version = "0.57", features = ["tokio", "tcp", "quic", "noise", "yamux", "identify", "ping", "relay", "dcutr", "autonat", "request-response", "json", "macros", "ed25519"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 qdrant-client = "1.20"
 prometheus = { version = "0.14", default-features = false }
