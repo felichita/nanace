@@ -7,15 +7,17 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use nanace_core::TeamRole;
 use nanace_core::p2p::{self, AcceptMode, ClientKind};
+use nanace_core::policy::{self, P2pPolicy};
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
-use crate::auth::{AnyScopeUser, AuthMethod, PeerUser};
+use crate::auth::{AnyScopeUser, AuthMethod, AuthUser, PeerUser};
 use crate::error::{ApiError, ApiResult};
-use crate::p2p::bind_signature_is_valid;
+use crate::p2p::{bind_signature_is_valid, parse_policy_page};
 use crate::ratelimit::RateClass;
-use crate::{AppState, access, db, metrics};
+use crate::{AppState, LOG_COMPONENT, access, db, metrics};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/me/peers/challenge", web::post().to(challenge))
@@ -29,7 +31,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             "/orgs/{org_id}/teams/{team_id}/presence/{peer_id}/{agent_label:.*}",
             web::delete().to(delete_presence),
         )
-        .route("/orgs/{org_id}/teams/{team_id}/peers", web::get().to(list_peers));
+        .route("/orgs/{org_id}/teams/{team_id}/peers", web::get().to(list_peers))
+        .route("/orgs/{org_id}/teams/{team_id}/p2p/policy", web::get().to(get_policy))
+        .route("/p2p/policy-template", web::get().to(policy_template));
 }
 
 /// Lowest presence TTL a client may ask for.
@@ -171,7 +175,7 @@ async fn bind_peer(
 
 async fn my_peers(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<HttpResponse> {
     let mut tx = db::user_tx(&state.pool, user.user_id).await?;
-    let rows: Vec<PeerRow> = sqlx::query_as(
+    let mine: Vec<PeerRow> = sqlx::query_as(
         "SELECT peer_id, client_kind, client_version, created_at, last_seen_at, revoked_at \
          FROM p2p_peers WHERE user_id = $1 ORDER BY created_at DESC, peer_id",
     )
@@ -179,7 +183,7 @@ async fn my_peers(state: web::Data<AppState>, user: AnyScopeUser) -> ApiResult<H
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(HttpResponse::Ok().json(rows))
+    Ok(HttpResponse::Ok().json(mine))
 }
 
 /// Revokes one of the caller's peers for good and ends its presence
@@ -257,10 +261,12 @@ async fn lookup_peer(
     .fetch_optional(&mut *tx)
     .await?;
     let (user_id, email, public_key) = owner.ok_or(ApiError::NotFound)?;
-    // Row security limits presence to the caller's teams.
+    // Row security limits presence to the caller's teams; the join keeps the
+    // teams whose policy enables P2P.
     let shared: Vec<SharedTeam> = sqlx::query_as(
         "SELECT DISTINCT pr.org_id, pr.team_id, m.role FROM p2p_presence pr \
          JOIN team_members m ON m.team_id = pr.team_id AND m.user_id = pr.user_id \
+         JOIN p2p_policies pp ON pp.team_id = pr.team_id AND pp.valid AND (pp.parsed->>'enabled')::boolean \
          WHERE pr.peer_id = $1 AND pr.expires_at > now() ORDER BY pr.org_id, pr.team_id",
     )
     .bind(&peer_id)
@@ -328,15 +334,51 @@ async fn put_presence(
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
     // The caller's own, unrevoked peer; anything else looks like no peer.
-    let owned: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM p2p_peers WHERE peer_id = $1 AND user_id = $2 AND revoked_at IS NULL FOR UPDATE",
+    let client_kind: Option<String> = sqlx::query_scalar(
+        "SELECT client_kind FROM p2p_peers WHERE peer_id = $1 AND user_id = $2 AND revoked_at IS NULL FOR UPDATE",
     )
     .bind(&body.peer_id)
     .bind(user.user_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if owned.is_none() {
-        return Err(ApiError::NotFound);
+    let client_kind = client_kind.ok_or(ApiError::NotFound)?;
+    // No valid, enabled policy means no P2P in this team.
+    let refuse = |reason: &'static str, error: ApiError| {
+        metrics::p2p_policy_denied(reason);
+        Err(error)
+    };
+    let Some(policy) = load_policy(&mut tx, team_id).await?.filter(|p| p.enabled) else {
+        return refuse(
+            "disabled",
+            ApiError::Conflict(
+                "P2P is not enabled for this team: its owner must add a valid `Policy: P2P` page".to_owned(),
+            ),
+        );
+    };
+    if body.accept_mode > policy.max_accept_mode {
+        return refuse(
+            "accept_mode",
+            ApiError::BadRequest(format!(
+                "accept_mode: the team policy allows at most `{}`",
+                policy.max_accept_mode.as_str()
+            )),
+        );
+    }
+    if client_kind == ClientKind::Server.as_str() && !policy.server_peers.users.contains(&user.email) {
+        return refuse(
+            "server_peer",
+            ApiError::Conflict(
+                "this account is not listed in `server_peers` of the team policy, so it cannot run a peer \
+                 without the desktop app"
+                    .to_owned(),
+            ),
+        );
+    }
+    if !policy.discovery.lan_addrs && multiaddrs.iter().any(|a| p2p::is_private_multiaddr(a)) {
+        return refuse(
+            "lan_addr",
+            ApiError::BadRequest("multiaddrs: the team policy does not share private addresses".to_owned()),
+        );
     }
     let live: Option<bool> = sqlx::query_scalar(
         "SELECT expires_at > now() FROM p2p_presence WHERE team_id = $1 AND peer_id = $2 AND agent_label = $3",
@@ -481,7 +523,7 @@ async fn list_peers(
     query: web::Query<PeersQuery>,
 ) -> ApiResult<HttpResponse> {
     let (org_id, team_id) = path.into_inner();
-    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
+    let role = access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
     let limit = query.limit.unwrap_or(DEFAULT_PEERS_LIMIT);
     if !(1..=MAX_PEERS_LIMIT).contains(&limit) {
         return Err(ApiError::BadRequest(format!("limit must be 1-{MAX_PEERS_LIMIT}")));
@@ -489,7 +531,23 @@ async fn list_peers(
     let capability = query.capability.as_ref().map(|c| c.trim().to_ascii_lowercase());
 
     let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
-    let rows: Vec<PresentPeer> = sqlx::query_as(
+    let stored = stored_policy(&mut tx, team_id).await?;
+    let policy = stored.as_ref().and_then(|s| s.policy.as_ref());
+    let summary = PolicySummary {
+        valid: policy.is_some(),
+        enabled: policy.is_some_and(|p| p.enabled),
+        version: stored.as_ref().map(|s| s.version.clone()),
+    };
+    // Default deny: without a policy that shows peers to this role, nobody
+    // is listed.
+    if !policy.is_some_and(|p| p.visible_to(role)) {
+        tx.commit().await?;
+        return Ok(HttpResponse::Ok().json(PeerList {
+            policy: summary,
+            peers: Vec::new(),
+        }));
+    }
+    let peers: Vec<PresentPeer> = sqlx::query_as(
         "SELECT pr.peer_id, pr.agent_label, pr.user_id, u.email, pr.capabilities, pr.multiaddrs, pr.accept_mode, \
                 p.client_kind, pr.expires_at \
          FROM p2p_presence pr JOIN p2p_peers p ON p.peer_id = pr.peer_id JOIN users u ON u.id = pr.user_id \
@@ -504,5 +562,276 @@ async fn list_peers(
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(HttpResponse::Ok().json(rows))
+    Ok(HttpResponse::Ok().json(PeerList { policy: summary, peers }))
+}
+
+#[derive(Serialize)]
+struct PolicySummary {
+    valid: bool,
+    enabled: bool,
+    version: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PeerList {
+    policy: PolicySummary,
+    peers: Vec<PresentPeer>,
+}
+
+/// A team's policy row.
+struct StoredPolicy {
+    context_id: Uuid,
+    version: String,
+    /// `None` when the page did not validate.
+    policy: Option<P2pPolicy>,
+    errors: Vec<String>,
+}
+
+/// The team's stored policy, if it has a `Policy: P2P` page the server
+/// parsed. A stored policy this version cannot read counts as invalid, so
+/// P2P stays off until the owner saves the page again.
+async fn stored_policy(tx: &mut Transaction<'static, Postgres>, team_id: Uuid) -> ApiResult<Option<StoredPolicy>> {
+    let row: Option<(Uuid, String, Option<serde_json::Value>, serde_json::Value)> =
+        sqlx::query_as("SELECT context_id, version, parsed, errors FROM p2p_policies WHERE team_id = $1")
+            .bind(team_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((context_id, version, parsed, errors)) = row else {
+        return Ok(None);
+    };
+    let mut errors: Vec<String> = serde_json::from_value(errors).map_err(anyhow::Error::from)?;
+    let policy = match parsed.map(serde_json::from_value::<P2pPolicy>) {
+        Some(Ok(policy)) => Some(policy),
+        Some(Err(err)) => {
+            tracing::warn!(
+                event = "p2p_policy_unreadable",
+                component = LOG_COMPONENT,
+                team_id = %team_id,
+                error = %err,
+                "stored P2P policy does not match this version; treating it as invalid"
+            );
+            errors.push("the policy was saved by another version of nanace; save the page again".to_owned());
+            None
+        }
+        None => None,
+    };
+    Ok(Some(StoredPolicy {
+        context_id,
+        version,
+        policy,
+        errors,
+    }))
+}
+
+/// The team's policy when it is valid.
+async fn load_policy(tx: &mut Transaction<'static, Postgres>, team_id: Uuid) -> ApiResult<Option<P2pPolicy>> {
+    Ok(stored_policy(tx, team_id).await?.and_then(|s| s.policy))
+}
+
+/// Refuses a `Policy: P2P` page that would not validate, before anything is
+/// written. Other titles pass.
+pub(crate) fn check_policy_page(title: &str, content: &str) -> ApiResult<()> {
+    if !policy::is_policy_page_title(title) {
+        return Ok(());
+    }
+    match parse_policy_page(content).policy {
+        Ok(_) => Ok(()),
+        Err(errors) => Err(ApiError::BadRequest(format!(
+            "Policy: P2P is not valid: {}",
+            errors.join("; ")
+        ))),
+    }
+}
+
+/// What a write did to a page that is, was or becomes the team's policy.
+pub(crate) enum PolicyChange<'a> {
+    /// The page now holds this content under the policy title.
+    Saved(&'a str),
+    /// The page was trashed or renamed away from the policy title.
+    Removed,
+}
+
+/// Keeps `p2p_policies` in step with the team's `Policy: P2P` page. Runs in
+/// the transaction of the page write and audits `p2p.policy_update`. A
+/// second policy page in a team is a conflict. Invalid content is stored as
+/// such (callers that must refuse it call [`check_policy_page`] first), which
+/// is what a restore from the trash relies on.
+pub(crate) async fn sync_policy(
+    tx: &mut Transaction<'static, Postgres>,
+    org_id: Uuid,
+    team_id: Uuid,
+    user_id: Uuid,
+    context_id: Uuid,
+    change: PolicyChange<'_>,
+) -> ApiResult<()> {
+    let existing: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT context_id, version FROM p2p_policies WHERE team_id = $1 FOR UPDATE")
+            .bind(team_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let old_version = existing.as_ref().map(|(_, version)| version.clone());
+    let owner = existing.map(|(owner, _)| owner);
+    let (new_version, valid) = match change {
+        PolicyChange::Removed => {
+            if owner != Some(context_id) {
+                return Ok(());
+            }
+            sqlx::query("DELETE FROM p2p_policies WHERE team_id = $1")
+                .bind(team_id)
+                .execute(&mut **tx)
+                .await?;
+            (None, false)
+        }
+        PolicyChange::Saved(content) => {
+            if owner.is_some_and(|owner| owner != context_id) {
+                return Err(ApiError::Conflict(
+                    "this team already has a `Policy: P2P` page; edit that one".to_owned(),
+                ));
+            }
+            let parsed = parse_policy_page(content);
+            let (policy, errors) = match parsed.policy {
+                Ok(policy) => (
+                    Some(serde_json::to_value(policy).map_err(anyhow::Error::from)?),
+                    Vec::new(),
+                ),
+                Err(errors) => (None, errors),
+            };
+            let valid = policy.is_some();
+            sqlx::query(
+                "INSERT INTO p2p_policies (team_id, org_id, context_id, version, parsed, valid, errors, updated_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (team_id) DO UPDATE SET version = EXCLUDED.version, parsed = EXCLUDED.parsed, \
+                     valid = EXCLUDED.valid, errors = EXCLUDED.errors, updated_by = EXCLUDED.updated_by, \
+                     updated_at = now()",
+            )
+            .bind(team_id)
+            .bind(org_id)
+            .bind(context_id)
+            .bind(&parsed.version)
+            .bind(policy)
+            .bind(valid)
+            .bind(serde_json::json!(errors))
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+            (Some(parsed.version), valid)
+        }
+    };
+    audit::record(
+        &mut **tx,
+        AuditEvent {
+            org_id: Some(org_id),
+            actor: user_id,
+            action: "p2p.policy_update",
+            resource_type: "team",
+            resource_id: Some(team_id),
+            details: serde_json::json!({
+                "context_id": context_id,
+                "old_version": old_version,
+                "new_version": new_version,
+                "valid": valid,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyQuery {
+    /// Also return the page's guidance for agents; a content read, audited.
+    text: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct PolicyResponse {
+    team_id: Uuid,
+    /// Hash of the policy page; null when the team has none.
+    version: Option<String>,
+    valid: bool,
+    enabled: bool,
+    policy: Option<P2pPolicy>,
+    errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+}
+
+/// The team's parsed P2P policy, for any member. A team without a valid
+/// policy gets `valid: false` and the reasons, which means P2P is off.
+async fn get_policy(
+    state: web::Data<AppState>,
+    user: AnyScopeUser,
+    path: web::Path<(Uuid, Uuid)>,
+    query: web::Query<PolicyQuery>,
+) -> ApiResult<HttpResponse> {
+    let (org_id, team_id) = path.into_inner();
+    access::require_team_role(&state.pool, org_id, team_id, user.user_id, TeamRole::Reader).await?;
+    let mut tx = db::scoped_tx(&state.pool, org_id, user.user_id).await?;
+    let stored = stored_policy(&mut tx, team_id).await?;
+    let mut response = PolicyResponse {
+        team_id,
+        version: None,
+        valid: false,
+        enabled: false,
+        policy: None,
+        errors: Vec::new(),
+        text: None,
+    };
+    match stored {
+        Some(stored) => {
+            if query.text == Some(true) {
+                let content: Option<String> = sqlx::query_scalar("SELECT content FROM contexts WHERE id = $1")
+                    .bind(stored.context_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                response.text = content.as_deref().map(policy::guidance_text);
+                audit::record(
+                    &mut *tx,
+                    AuditEvent {
+                        org_id: Some(org_id),
+                        actor: user.user_id,
+                        action: "context.read",
+                        resource_type: "context",
+                        resource_id: Some(stored.context_id),
+                        details: serde_json::json!({ "team_id": team_id, "via": "p2p_policy" }),
+                    },
+                )
+                .await?;
+            }
+            response.version = Some(stored.version);
+            response.valid = stored.policy.is_some();
+            response.enabled = stored.policy.as_ref().is_some_and(|p| p.enabled);
+            response.policy = stored.policy;
+            response.errors = stored.errors;
+        }
+        None => {
+            // A page from before policies were validated has no row.
+            let titles: Vec<String> = sqlx::query_scalar(
+                "SELECT title FROM contexts WHERE org_id = $1 AND team_id = $2 AND nanace_is_protected_title(title)",
+            )
+            .bind(org_id)
+            .bind(team_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            response
+                .errors
+                .push(if titles.iter().any(|t| policy::is_policy_page_title(t)) {
+                    "the `Policy: P2P` page was saved before policies were checked; its owner must save it again"
+                        .to_owned()
+                } else {
+                    "this team has no `Policy: P2P` page, so P2P is off".to_owned()
+                });
+        }
+    }
+    tx.commit().await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+/// A starting point for a team's `Policy: P2P` page, with strict defaults.
+async fn policy_template(_user: AuthUser) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "title": "Policy: P2P",
+        "content": policy::TEMPLATE,
+    }))
 }

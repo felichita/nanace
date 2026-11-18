@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use actix_web::{HttpResponse, web};
 use chrono::{DateTime, Utc};
+use nanace_core::policy::is_policy_page_title;
 use nanace_core::{TeamRole, embedding_input_hash, validate, wiki_links};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use super::p2p::{PolicyChange, check_policy_page, sync_policy};
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
@@ -229,6 +231,7 @@ async fn create_context(
         },
     )
     .await?;
+    check_policy_page(&input.title, &input.content)?;
     let context_id = Uuid::new_v4();
 
     let chunks = embed_context(&state, &input.title, &input.content).await?;
@@ -255,6 +258,10 @@ async fn create_context(
     .fetch_one(&mut *tx)
     .await?;
     replace_links(&mut tx, org_id, context_id, &input.content).await?;
+    if is_policy_page_title(&input.title) {
+        let saved = PolicyChange::Saved(&input.content);
+        sync_policy(&mut tx, org_id, team_id, user.user_id, context_id, saved).await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {
@@ -379,6 +386,7 @@ async fn update_context(
         },
     )
     .await?;
+    check_policy_page(&input.title, &input.content)?;
     // Serializes concurrent updates so PostgreSQL and Qdrant end up holding
     // the same version. Taken after the role check: under RLS, FOR UPDATE
     // also applies the UPDATE policy and would hide the row from readers.
@@ -423,6 +431,20 @@ async fn update_context(
     .fetch_one(&mut *tx)
     .await?;
     replace_links(&mut tx, org_id, context_id, &input.content).await?;
+    if is_policy_page_title(&input.title) {
+        let saved = PolicyChange::Saved(&input.content);
+        sync_policy(&mut tx, org_id, team_id, user.user_id, context_id, saved).await?;
+    } else if is_policy_page_title(&title) {
+        sync_policy(
+            &mut tx,
+            org_id,
+            team_id,
+            user.user_id,
+            context_id,
+            PolicyChange::Removed,
+        )
+        .await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {
@@ -493,6 +515,17 @@ async fn delete_context(
         .bind(context_id)
         .execute(&mut *tx)
         .await?;
+    if is_policy_page_title(&title) {
+        sync_policy(
+            &mut tx,
+            org_id,
+            team_id,
+            user.user_id,
+            context_id,
+            PolicyChange::Removed,
+        )
+        .await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {

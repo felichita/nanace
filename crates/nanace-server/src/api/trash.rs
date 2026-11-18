@@ -1,5 +1,6 @@
 use actix_web::{HttpResponse, web};
 use chrono::{DateTime, Utc};
+use nanace_core::policy::is_policy_page_title;
 use nanace_core::{TeamRole, embedding_input_hash};
 use serde::Serialize;
 use uuid::Uuid;
@@ -7,6 +8,7 @@ use uuid::Uuid;
 use super::contexts::{
     ContextRow, TitleWrite, embed_context, replace_links, require_title_access, vector_store_unavailable,
 };
+use super::p2p::{PolicyChange, sync_policy};
 use crate::audit::{self, AuditEvent};
 use crate::auth::{AuthUser, WriteUser};
 use crate::error::{ApiError, ApiResult};
@@ -118,6 +120,12 @@ async fn restore(
         .execute(&mut *tx)
         .await?;
     replace_links(&mut tx, org_id, context_id, &content).await?;
+    // A restored policy page is parsed again; one that no longer validates
+    // comes back as a page but leaves P2P off.
+    if is_policy_page_title(&title) {
+        let saved = PolicyChange::Saved(&content);
+        sync_policy(&mut tx, org_id, team_id, user.user_id, context_id, saved).await?;
+    }
     audit::record(
         &mut *tx,
         AuditEvent {

@@ -7,11 +7,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
 use nanace_core::p2p::bind_message;
+use nanace_core::policy::{MAX_POLICY_BLOCK_BYTES, P2pPolicy, policy_block};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::secret::sha256_hex;
 use crate::{db, metrics};
 
 /// How long a challenge can be answered.
@@ -112,6 +114,37 @@ pub fn bind_signature_is_valid(
         .is_ok()
 }
 
+/// A `Policy: P2P` page as the server understands it.
+pub struct ParsedPolicy {
+    /// Hash of the page content; changes with every edit.
+    pub version: String,
+    /// The policy, or what is wrong with the page in words for its owner.
+    pub policy: Result<P2pPolicy, Vec<String>>,
+}
+
+/// Parses and checks the policy block of a page.
+pub fn parse_policy_page(content: &str) -> ParsedPolicy {
+    let policy = match policy_block(content) {
+        None => Err(vec![
+            "the page needs a closed ```yaml p2p-policy block with the team's rules".to_owned(),
+        ]),
+        Some(block) if block.len() > MAX_POLICY_BLOCK_BYTES => Err(vec![format!(
+            "the policy block is larger than {MAX_POLICY_BLOCK_BYTES} bytes"
+        )]),
+        Some(block) => match serde_norway::from_str::<P2pPolicy>(block) {
+            Err(err) => Err(vec![format!("policy block: {err}")]),
+            Ok(policy) => {
+                let problems = policy.problems();
+                if problems.is_empty() { Ok(policy) } else { Err(problems) }
+            }
+        },
+    };
+    ParsedPolicy {
+        version: sha256_hex(content),
+        policy,
+    }
+}
+
 /// Deletes presence that has expired, auditing each ended presence as
 /// `p2p.presence_expire`, and refreshes the active-peers gauge. Reads never
 /// depend on this: they filter on `expires_at` themselves. Safe to run from
@@ -148,6 +181,38 @@ mod tests {
 
     fn state(secret: &str) -> P2pState {
         P2pState::new(&SecretString::from(secret.to_owned()), 120, 10)
+    }
+
+    #[test]
+    fn policy_pages_parse_or_explain() {
+        let template = parse_policy_page(nanace_core::policy::TEMPLATE);
+        let policy = template.policy.expect("the template is a valid policy");
+        assert!(policy.enabled && policy.problems().is_empty());
+        assert_eq!(template.version.len(), 64);
+        assert_ne!(template.version, parse_policy_page("other").version);
+
+        let page = |block: &str| format!("intro\n```yaml p2p-policy\n{block}\n```\n");
+        let errors = |content: &str| parse_policy_page(content).policy.unwrap_err();
+        assert!(errors("no block here")[0].contains("p2p-policy"));
+        assert!(errors(&page("version: [unclosed"))[0].starts_with("policy block:"));
+        // Unknown keys and wrong types are errors, not ignored.
+        assert!(errors(&page("version: 1\nenabled: true\nmax_accept_mode: ask\nextra: 1"))[0].contains("extra"));
+        assert!(errors(&page("version: 1\nenabled: yes please\nmax_accept_mode: ask"))[0].contains("enabled"));
+        assert!(errors(&page("version: 1\nenabled: true\nmax_accept_mode: always"))[0].contains("always"));
+        assert!(errors(&page("version: 1\nenabled: true"))[0].contains("max_accept_mode"));
+        assert!(
+            errors(&page(
+                "version: 1\nenabled: true\nmax_accept_mode: ask\nlimits:\n  max_hops: 40"
+            ))[0]
+                .contains("max_hops")
+        );
+        let big = page(&format!("version: 1\n# {}", "x".repeat(MAX_POLICY_BLOCK_BYTES)));
+        assert!(errors(&big)[0].contains("larger"));
+        // The smallest valid policy: everything else has a strict default.
+        let minimal = parse_policy_page(&page("version: 1\nenabled: false\nmax_accept_mode: off"))
+            .policy
+            .expect("valid");
+        assert!(minimal.calls.is_empty() && minimal.limits.max_hops == 2);
     }
 
     #[test]

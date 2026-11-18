@@ -6,7 +6,7 @@ pub(crate) mod contexts;
 mod google;
 mod graph;
 mod orgs;
-mod p2p;
+pub(crate) mod p2p;
 mod search;
 mod teams;
 mod tokens;

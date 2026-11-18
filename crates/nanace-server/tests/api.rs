@@ -2003,8 +2003,14 @@ async fn policy_and_wiki_pages_are_written_only_by_team_admins() {
         .await,
     );
     let policy = id_of(
-        &c.ok("POST", &pages, &alice, Some(create("Policy: P2P")), StatusCode::CREATED)
-            .await,
+        &c.ok(
+            "POST",
+            &pages,
+            &alice,
+            Some(create("Policy: Travel")),
+            StatusCode::CREATED,
+        )
+        .await,
     );
     let notes = id_of(
         &c.ok("POST", &pages, &bob, Some(create("Notes")), StatusCode::CREATED)
@@ -2245,7 +2251,7 @@ async fn policy_and_wiki_pages_are_written_only_by_team_admins() {
         "PUT",
         &format!("{base}/contexts/{policy}"),
         &oscar,
-        Some(json!({ "title": "Policy: P2P", "content": "by oscar" })),
+        Some(json!({ "title": "Policy: Travel", "content": "by oscar" })),
         StatusCode::OK,
     )
     .await;

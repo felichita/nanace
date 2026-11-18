@@ -122,7 +122,46 @@ where
         (org["id"].as_str().unwrap().parse().unwrap(), slug)
     }
 
+    /// A team whose owner enabled P2P with the template policy.
     async fn team(&self, admin: &str, org: Uuid, slug: &str) -> Uuid {
+        let team = self.bare_team(admin, org, slug).await;
+        self.save_policy(
+            admin,
+            org,
+            team,
+            None,
+            nanace_core::policy::TEMPLATE,
+            StatusCode::CREATED,
+        )
+        .await;
+        team
+    }
+
+    /// Creates the team's `Policy: P2P` page, or replaces the content of `page`.
+    async fn save_policy(
+        &self,
+        admin: &str,
+        org: Uuid,
+        team: Uuid,
+        page: Option<&str>,
+        content: &str,
+        expected: StatusCode,
+    ) -> Value {
+        let body = Some(json!({ "title": "Policy: P2P", "content": content }));
+        match page {
+            None => {
+                let uri = format!("/api/v1/orgs/{org}/teams/{team}/contexts");
+                self.ok("POST", &uri, admin, body, expected).await
+            }
+            Some(id) => {
+                let uri = format!("/api/v1/orgs/{org}/contexts/{id}");
+                self.ok("PUT", &uri, admin, body, expected).await
+            }
+        }
+    }
+
+    /// A team with no policy page: P2P is off.
+    async fn bare_team(&self, admin: &str, org: Uuid, slug: &str) -> Uuid {
         let team = self
             .ok(
                 "POST",
@@ -454,7 +493,8 @@ async fn presence_is_scoped_to_the_team() {
 
     // Team members see the team's peers; everyone else gets 404.
     let peers = c.ok("GET", &peers_uri, &bob, None, StatusCode::OK).await;
-    let listed: Vec<&str> = peers
+    assert_eq!(peers["policy"]["valid"], true);
+    let listed: Vec<&str> = peers["peers"]
         .as_array()
         .unwrap()
         .iter()
@@ -462,7 +502,7 @@ async fn presence_is_scoped_to_the_team() {
         .collect();
     assert_eq!(listed.len(), 2);
     assert!(listed.contains(&alice_peer.as_str()) && listed.contains(&bob_peer.as_str()));
-    let alice_row = peers
+    let alice_row = peers["peers"]
         .as_array()
         .unwrap()
         .iter()
@@ -480,7 +520,7 @@ async fn presence_is_scoped_to_the_team() {
             StatusCode::OK,
         )
         .await;
-    assert_eq!(infra.as_array().unwrap().len(), 2);
+    assert_eq!(infra["peers"].as_array().unwrap().len(), 2);
     let none = c
         .ok(
             "GET",
@@ -490,7 +530,7 @@ async fn presence_is_scoped_to_the_team() {
             StatusCode::OK,
         )
         .await;
-    assert_eq!(none, json!([]));
+    assert_eq!(none["peers"], json!([]));
     c.ok("GET", &peers_uri, &carol, None, StatusCode::NOT_FOUND).await;
     c.ok("GET", &peers_uri, &dave, None, StatusCode::NOT_FOUND).await;
     c.ok(
@@ -742,7 +782,7 @@ async fn expired_presence_is_hidden_then_swept() {
             StatusCode::OK,
         )
         .await;
-    let labels: Vec<&str> = peers
+    let labels: Vec<&str> = peers["peers"]
         .as_array()
         .unwrap()
         .iter()
@@ -827,7 +867,7 @@ async fn p2p_scoped_token_reaches_only_the_registry() {
             StatusCode::OK,
         )
         .await;
-    assert_eq!(peers[0]["peer_id"], peer);
+    assert_eq!(peers["peers"][0]["peer_id"], peer);
     c.ok(
         "GET",
         &format!("/api/v1/me/peers/lookup/{peer}"),
@@ -910,4 +950,318 @@ async fn p2p_scoped_token_reaches_only_the_registry() {
     )
     .await;
     c.ok("GET", "/api/v1/me", next, None, StatusCode::UNAUTHORIZED).await;
+}
+
+#[actix_web::test]
+#[ignore = "requires PostgreSQL and Qdrant (docker compose up -d --wait)"]
+async fn policy_page_turns_p2p_on_and_limits_it() {
+    let state = state().await;
+    let pool = state.pool.clone();
+    let c = Client {
+        app: test::init_service(App::new().app_data(state).configure(api::configure)).await,
+    };
+    let (alice, alice_id) = c.login("alice").await;
+    let (bob, bob_id) = c.login("bob").await;
+    let (carol, carol_id) = c.login("carol").await;
+    let (outsider, outsider_id) = c.login("eve").await;
+    let (org, _) = c.org(&alice).await;
+    let dev = c.bare_team(&alice, org, "dev").await;
+    c.add(&alice, org, dev, &bob, "writer").await;
+    c.add(&alice, org, dev, &carol, "reader").await;
+    let alice_peer = c.bind(&alice, alice_id, &new_key()).await;
+    let carol_peer = c.bind(&carol, carol_id, &new_key()).await;
+    let base = format!("/api/v1/orgs/{org}");
+    let policy_uri = format!("{base}/teams/{dev}/p2p/policy");
+    let peers_uri = format!("{base}/teams/{dev}/peers");
+    let template = nanace_core::policy::TEMPLATE;
+
+    // No policy page: nothing is announced and nobody is listed.
+    let policy = c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await;
+    assert_eq!(
+        (policy["valid"].clone(), policy["enabled"].clone()),
+        (json!(false), json!(false))
+    );
+    assert!(policy["errors"][0].as_str().unwrap().contains("no `Policy: P2P` page"));
+    let (status, body) = c.announce(&alice, org, dev, &alice_peer, "a").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let peers = c.ok("GET", &peers_uri, &alice, None, StatusCode::OK).await;
+    assert_eq!(
+        peers,
+        json!({ "policy": { "valid": false, "enabled": false, "version": null }, "peers": [] })
+    );
+    c.ok("GET", &policy_uri, &outsider, None, StatusCode::NOT_FOUND).await;
+
+    // The template endpoint hands out a page that validates.
+    let offered = c
+        .ok("GET", "/api/v1/p2p/policy-template", &alice, None, StatusCode::OK)
+        .await;
+    assert_eq!(offered["title"], "Policy: P2P");
+    assert_eq!(offered["content"], template);
+
+    // A page that does not validate is not saved, and says why.
+    for (content, needle) in [
+        ("no block at all", "p2p-policy"),
+        (
+            "```yaml p2p-policy\nversion: 1\nenabled: maybe\nmax_accept_mode: ask\n```",
+            "enabled",
+        ),
+        (
+            "```yaml p2p-policy\nversion: 1\nenabled: true\nmax_accept_mode: ask\nlimits:\n  max_hops: 99\n```",
+            "max_hops",
+        ),
+        (
+            "```yaml p2p-policy\nversion: 1\nenabled: true\nmax_accept_mode: ask\nsurprise: 1\n```",
+            "surprise",
+        ),
+    ] {
+        let refused = c
+            .save_policy(&alice, org, dev, None, content, StatusCode::BAD_REQUEST)
+            .await;
+        assert!(refused["message"].as_str().unwrap().contains(needle), "{refused}");
+    }
+    let pages = c
+        .ok(
+            "GET",
+            &format!("{base}/teams/{dev}/contexts"),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(pages, json!([]));
+    // Writers cannot create it at all.
+    c.save_policy(&bob, org, dev, None, template, StatusCode::FORBIDDEN)
+        .await;
+
+    let page = c
+        .save_policy(&alice, org, dev, None, template, StatusCode::CREATED)
+        .await;
+    let page_id = page["id"].as_str().unwrap().to_owned();
+    let policy = c.ok("GET", &policy_uri, &carol, None, StatusCode::OK).await;
+    assert_eq!(
+        (policy["valid"].clone(), policy["enabled"].clone()),
+        (json!(true), json!(true))
+    );
+    assert_eq!(policy["policy"]["limits"]["max_hops"], 2);
+    assert_eq!(policy["policy"]["max_accept_mode"], "ask");
+    assert!(policy.get("text").is_none());
+    let first_version = policy["version"].as_str().unwrap().to_owned();
+    assert_eq!(first_version.len(), 64);
+    // The guidance for agents is the page without the rules block.
+    let with_text = c
+        .ok("GET", &format!("{policy_uri}?text=true"), &carol, None, StatusCode::OK)
+        .await;
+    let text = with_text["text"].as_str().unwrap();
+    assert!(
+        text.contains("## For agents") && !text.contains("max_accept_mode"),
+        "{text}"
+    );
+    // A team has one policy page.
+    let second = json!({ "title": " policy : p2p", "content": template });
+    c.ok(
+        "POST",
+        &format!("{base}/teams/{dev}/contexts"),
+        &alice,
+        Some(second),
+        StatusCode::CONFLICT,
+    )
+    .await;
+
+    // With the policy on, presence works within its limits.
+    assert_eq!(c.announce(&alice, org, dev, &alice_peer, "a").await.0, StatusCode::OK);
+    let mut eager = presence(&alice_peer, "a");
+    eager["accept_mode"] = json!("team");
+    let (status, body) = c
+        .call("PUT", &format!("{base}/teams/{dev}/presence"), &alice, Some(eager))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("at most `ask`"));
+
+    // The owner narrows it: readers no longer see peers, LAN addresses are
+    // not shared.
+    let narrowed = template
+        .replace(
+            "visible_to: [reader, agent, writer, admin]",
+            "visible_to: [writer, admin]",
+        )
+        .replace("lan_addrs: true", "lan_addrs: false");
+    assert_ne!(narrowed, template);
+    c.save_policy(&alice, org, dev, Some(&page_id), &narrowed, StatusCode::OK)
+        .await;
+    let policy = c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await;
+    assert_ne!(policy["version"], first_version.as_str());
+    let hidden = c.ok("GET", &peers_uri, &carol, None, StatusCode::OK).await;
+    assert_eq!(hidden["peers"], json!([]));
+    assert_eq!(hidden["policy"]["valid"], true);
+    let shown = c.ok("GET", &peers_uri, &bob, None, StatusCode::OK).await;
+    assert_eq!(shown["peers"][0]["peer_id"], alice_peer.as_str());
+    let mut lan = presence(&alice_peer, "a");
+    lan["multiaddrs"] = json!(["/ip4/192.168.1.5/tcp/4001"]);
+    let (status, body) = c
+        .call("PUT", &format!("{base}/teams/{dev}/presence"), &alice, Some(lan))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // Carol can still be present and look Alice up; she just cannot list.
+    assert_eq!(c.announce(&carol, org, dev, &carol_peer, "c").await.0, StatusCode::OK);
+
+    // An edit that does not validate changes nothing.
+    let broken = narrowed.replace("max_hops: 2", "max_hops: 0");
+    c.save_policy(&alice, org, dev, Some(&page_id), &broken, StatusCode::BAD_REQUEST)
+        .await;
+    assert_eq!(
+        c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await["version"],
+        policy["version"]
+    );
+
+    // A peer without the desktop app needs its account in `server_peers`.
+    let server_key = new_key();
+    let mut bind = bind_request(&c.challenge(&bob).await, bob_id, &server_key);
+    bind["client_kind"] = json!("server");
+    c.ok("POST", "/api/v1/me/peers", &bob, Some(bind), StatusCode::CREATED)
+        .await;
+    let server_peer = peer_of(&server_key);
+    let (status, body) = c.announce(&bob, org, dev, &server_peer, "srv").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("server_peers"));
+    let bob_email = c.email_of(&bob).await;
+    let with_server = narrowed.replace("users: []", &format!("users: [{bob_email}]"));
+    c.save_policy(&alice, org, dev, Some(&page_id), &with_server, StatusCode::OK)
+        .await;
+    assert_eq!(c.announce(&bob, org, dev, &server_peer, "srv").await.0, StatusCode::OK);
+
+    // Turning it off hides everyone at once, without waiting for presence
+    // to expire.
+    let lookup = format!("/api/v1/me/peers/lookup/{alice_peer}");
+    c.ok("GET", &lookup, &bob, None, StatusCode::OK).await;
+    let off = with_server.replace("enabled: true", "enabled: false");
+    c.save_policy(&alice, org, dev, Some(&page_id), &off, StatusCode::OK)
+        .await;
+    let policy = c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await;
+    assert_eq!(
+        (policy["valid"].clone(), policy["enabled"].clone()),
+        (json!(true), json!(false))
+    );
+    assert_eq!(
+        c.ok("GET", &peers_uri, &bob, None, StatusCode::OK).await["peers"],
+        json!([])
+    );
+    c.ok("GET", &lookup, &bob, None, StatusCode::NOT_FOUND).await;
+    assert_eq!(
+        c.announce(&alice, org, dev, &alice_peer, "a").await.0,
+        StatusCode::CONFLICT
+    );
+    c.save_policy(&alice, org, dev, Some(&page_id), &with_server, StatusCode::OK)
+        .await;
+    c.ok("GET", &lookup, &bob, None, StatusCode::OK).await;
+
+    // Renaming the page away, or trashing it, turns P2P off; bringing it
+    // back turns it on again.
+    let page_uri = format!("{base}/contexts/{page_id}");
+    let renamed = json!({ "title": "Policy: P2P (old)", "content": with_server });
+    c.ok("PUT", &page_uri, &alice, Some(renamed), StatusCode::OK).await;
+    assert_eq!(
+        c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await["valid"],
+        false
+    );
+    c.save_policy(&alice, org, dev, Some(&page_id), &with_server, StatusCode::OK)
+        .await;
+    assert_eq!(
+        c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await["valid"],
+        true
+    );
+    c.ok("DELETE", &page_uri, &alice, None, StatusCode::NO_CONTENT).await;
+    assert_eq!(
+        c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await["valid"],
+        false
+    );
+    c.ok(
+        "POST",
+        &format!("{base}/trash/{page_id}/restore"),
+        &alice,
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        c.ok("GET", &policy_uri, &bob, None, StatusCode::OK).await["enabled"],
+        true
+    );
+
+    // Every change was audited with the versions before and after.
+    let changes: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT details->>'old_version', details->>'new_version' FROM audit_logs \
+         WHERE org_id = $1 AND action = 'p2p.policy_update' ORDER BY id",
+    )
+    .bind(org)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(changes.len(), 9, "{changes:?}");
+    assert_eq!(changes[0], (None, Some(first_version.clone())));
+    assert_eq!(changes[1].0.as_deref(), Some(first_version.as_str()));
+    assert!(
+        changes.iter().filter(|(_, new)| new.is_none()).count() == 2,
+        "{changes:?}"
+    );
+
+    // Below the API: only the team admin changes the stored policy, and
+    // other teams do not see it.
+    let mut tx = db::scoped_tx(&pool, org, bob_id).await.unwrap();
+    for sql in [
+        "UPDATE p2p_policies SET valid = false, parsed = NULL WHERE team_id = $1",
+        "DELETE FROM p2p_policies WHERE team_id = $1",
+    ] {
+        let changed = sqlx::query(sql)
+            .bind(dev)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "{sql}");
+    }
+    drop(tx);
+    let mut tx = db::user_tx(&pool, outsider_id).await.unwrap();
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM p2p_policies WHERE team_id = $1")
+        .bind(dev)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(visible, 0);
+    drop(tx);
+    let unscoped: i64 = sqlx::query_scalar("SELECT count(*) FROM p2p_policies")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(unscoped, 0);
+
+    // A policy page from before policies were checked has no stored policy:
+    // P2P stays off and the owner is told to save it again.
+    let legacy = c.bare_team(&alice, org, "legacy").await;
+    let mut tx = db::scoped_tx(&pool, org, alice_id).await.unwrap();
+    sqlx::query(
+        "INSERT INTO contexts (id, org_id, team_id, title, content, embedding_hash, embedding_model, chunk_count, created_by, updated_by) \
+         VALUES ($1, $2, $3, 'Policy: P2P', 'old text', 'h', 'm', 0, $4, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(org)
+    .bind(legacy)
+    .bind(alice_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let policy = c
+        .ok(
+            "GET",
+            &format!("{base}/teams/{legacy}/p2p/policy"),
+            &alice,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(policy["valid"], false);
+    assert!(
+        policy["errors"][0].as_str().unwrap().contains("save it again"),
+        "{policy}"
+    );
 }

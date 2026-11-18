@@ -45,6 +45,28 @@ impl AcceptMode {
     }
 }
 
+/// What one peer sends another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// A question that expects an answer.
+    Ask,
+    /// A request for the peer's structured status.
+    Status,
+    /// A one-way notification.
+    Notify,
+}
+
+impl MessageKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Status => "status",
+            Self::Notify => "notify",
+        }
+    }
+}
+
 /// Where a peer runs: started by the desktop app, or on a server without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +207,23 @@ fn multiaddr(value: &str) -> bool {
     host_ok && transport_ok && tail_ok
 }
 
+/// True when a checked multiaddr points into a private network (RFC 1918,
+/// carrier-grade NAT, IPv6 unique local), which a team may choose not to
+/// share.
+pub fn is_private_multiaddr(value: &str) -> bool {
+    let mut parts = value.split('/').skip(1);
+    match (parts.next(), parts.next()) {
+        (Some("ip4"), Some(host)) => host.parse::<Ipv4Addr>().is_ok_and(|ip| {
+            let [a, b, ..] = ip.octets();
+            ip.is_private() || (a == 100 && (64..128).contains(&b))
+        }),
+        (Some("ip6"), Some(host)) => host
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|ip| ip.segments()[0] & 0xfe00 == 0xfc00),
+        _ => false,
+    }
+}
+
 /// Returns the deduplicated addresses after checking each one.
 pub fn multiaddrs(values: &[String]) -> Result<Vec<String>, ValidationError> {
     if values.len() > MAX_MULTIADDRS {
@@ -309,6 +348,27 @@ mod tests {
             assert!(multiaddrs(&[bad.to_owned()]).is_err(), "{bad}");
         }
         assert!(multiaddrs(&vec![good[0].clone(); 9]).is_err());
+    }
+
+    #[test]
+    fn private_addresses_are_recognized() {
+        for private in [
+            "/ip4/192.168.1.20/tcp/4001",
+            "/ip4/10.0.0.5/udp/4001/quic-v1",
+            "/ip4/172.16.9.1/tcp/1",
+            "/ip4/100.64.0.1/tcp/1",
+            "/ip6/fd00::1/tcp/1",
+        ] {
+            assert!(is_private_multiaddr(private), "{private}");
+        }
+        for public in [
+            "/ip4/203.0.113.7/tcp/4001",
+            "/ip6/2001:db8::1/tcp/1",
+            "/dns4/a.example.com/tcp/1",
+            "",
+        ] {
+            assert!(!is_private_multiaddr(public), "{public}");
+        }
     }
 
     #[test]

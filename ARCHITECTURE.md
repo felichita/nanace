@@ -96,6 +96,7 @@ Talks to PostgreSQL and Qdrant.
 | `audit_logs` | Who changed or read what, and when |
 | `p2p_peers` | Which libp2p peer id belongs to which user; revoked ids stay as tombstones |
 | `p2p_presence` | Which peers and agents are present in a team right now; rows expire |
+| `p2p_policies` | The parsed `Policy: P2P` page of a team; one row per team |
 
 Roles are a closed set enforced by `CHECK` constraints and the
 `nanace_core::TeamRole` / `OrgRole` enums, not a separate table.
@@ -415,7 +416,8 @@ POST /api/v1/me/peers { peer_id, challenge, signature, client_kind, client_versi
 a team and is repeated as a heartbeat.
 
 - `ttl_secs` is at most `NANACE_P2P_PRESENCE_MAX_TTL_SECS` (default 120).
-- Any team member can be present, readers included.
+- Any team member can be present, readers included, once the team's policy
+  enables P2P.
 - Addresses are checked: dialable `ip4`/`ip6`/`dns` over `tcp` or `quic-v1`;
   loopback, link-local, unspecified and multicast are rejected.
 - Capabilities are labels a peer gives itself. They are used for search only
@@ -434,6 +436,38 @@ a team and is repeated as a heartbeat.
 | The token that announced it is revoked (its whole rotation chain) | Same transaction as the revocation |
 | The account is deleted | Peers are deleted explicitly, because the user row stays |
 | The organization is deleted | Foreign-key cascade |
+
+**Team policy.** P2P is off in a team until its owner creates a page titled
+`Policy: P2P`. The first ```` ```yaml p2p-policy ```` block of that page is
+the rules; the rest is guidance for agents. `GET /api/v1/p2p/policy-template`
+returns a starting page with strict defaults.
+
+- **Checked on save.** The server parses the block on every write of the
+  page (YAML, at most 16 KiB, unknown keys are errors, values range-checked,
+  patterns compiled with the linear-time `regex` crate). A page that does not
+  validate is refused with `400` and the reasons; nothing is saved.
+- **Stored with the page.** The parsed policy goes to `p2p_policies` in the
+  transaction of the page write, audited as `p2p.policy_update` with the
+  version (content hash) before and after. A second policy page in a team is
+  `409`.
+- **Off by default.** No row, an invalid row, or `enabled: false` means no
+  presence can be announced, no peers are listed and lookups answer `404`,
+  at once: presence rows are not deleted, they are just not served.
+- **What turns it off:** trashing the page or renaming it away from the
+  policy title. Restoring it parses it again; a restored page that no longer
+  validates comes back as a page and leaves P2P off.
+- **Rules are by team role**, read from PostgreSQL: `calls` lists which
+  roles may send which kinds of message to which roles, and anything not
+  listed is refused. Capabilities play no part in rules.
+- **What the server enforces now:** `enabled`; `max_accept_mode` on
+  presence; `discovery.visible_to` on the peer list; `discovery.lan_addrs`
+  on announced addresses; `server_peers` for peers that run without the
+  desktop app. The remaining fields (`calls`, `limits`, `data`, `summaries`)
+  are served to daemons through `GET …/p2p/policy` and enforced there
+  **[planned]**.
+- **Pages from before this version** titled `Policy: P2P` have no stored
+  policy. P2P stays off and `GET …/p2p/policy` tells the owner to save the
+  page again.
 
 **Lookup.** `GET /me/peers/lookup/{peer_id}` returns the owner and public key
 of a peer that is present in a team the caller shares with it, and `404`
@@ -456,7 +490,7 @@ with an in-memory token bucket (`429` with `Retry-After`). Each replica
 counts on its own, so this bounds abuse and is not a quota.
 
 **Metrics:** `nanace_p2p_active_peers`, `nanace_p2p_peer_binds_total`,
-`nanace_p2p_presence_starts_total`.
+`nanace_p2p_presence_starts_total`, `nanace_p2p_policy_denials_total{reason}`.
 
 ### Google Workspace group sync [planned]
 
@@ -661,7 +695,9 @@ Claude Desktop / Claude Code
 | `GET` | `/api/v1/me/peers/lookup/{peer_id}` | Authenticated; only peers present in a shared team |
 | `PUT` | `/api/v1/orgs/{org}/teams/{team}/presence` | Team member, write; announce or extend presence |
 | `DELETE` | `/api/v1/orgs/{org}/teams/{team}/presence/{peer_id}/{agent_label}` | The presence's owner, write |
-| `GET` | `/api/v1/orgs/{org}/teams/{team}/peers` | Team member; `?capability=`, `?limit=` |
+| `GET` | `/api/v1/orgs/{org}/teams/{team}/peers` | Team member; `?capability=`, `?limit=`; empty unless the policy shows peers to the caller's role |
+| `GET` | `/api/v1/orgs/{org}/teams/{team}/p2p/policy` | Team member; parsed policy, `?text=true` adds the guidance for agents |
+| `GET` | `/api/v1/p2p/policy-template` | Authenticated; a `Policy: P2P` page to start from |
 | `GET` | `/livez` | Anyone; liveness, touches no dependencies |
 | `GET` | `/readyz`, `/healthz` | Anyone; readiness, checks PostgreSQL and Qdrant |
 
