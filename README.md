@@ -83,8 +83,11 @@ PROJECT-2345` records what was done in the current session on the task's page
 (appending a dated section, or creating the page). It treats each team as a
 wiki: before writing it reads the team's `Wiki: Schema` page (page types, title
 prefixes, templates, tags), and afterwards it updates the related `Topic:` page
-and `Wiki: Index`. A team without a schema is initialized from
-`schema-template.md`, and the new schema is marked as the default for review.
+and `Wiki: Index`. `Wiki:` pages are edited only by the teamspace owner (team
+role `admin`): for the owner, a team without a schema is initialized from
+`schema-template.md` and marked as the default for review; for anyone else the
+skill creates no `Wiki:` page and ends with the lines for the owner to add to
+the index.
 It needs the write tools (**Allow Claude to create and edit pages**).
 
 Install or update the MCP server binary and the skill, and connect Claude Code

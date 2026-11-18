@@ -6,6 +6,7 @@ import { useLocation } from "wouter";
 import { blocksToMarkdown, PageLinkContext, type Editor, type PageLinkResolver } from "../editor/schema";
 import { PageEditor } from "../editor/PageEditor";
 import { api, ApiError, canWrite, type Context, type LinkedContext } from "../lib/api";
+import { canEditPage, isProtectedTitle, PROTECTED_NOTE } from "../lib/protected";
 import { useLayout } from "../lib/layout";
 import { useWorkspace } from "../lib/workspace";
 import { Crumb, Topbar } from "./Topbar";
@@ -168,7 +169,10 @@ export function PageView({ id }: { id: string }) {
 
   const page = pageQuery.data;
   const team = page ? ws.team(page.team_id) : undefined;
-  const editable = canWrite(team?.my_role);
+  const editable = canEditPage(team?.my_role, page?.title);
+  // A writer looking at a Policy: or Wiki: page: read-only, but not a reader.
+  const ownerOnly = !editable && canWrite(team?.my_role);
+  const mayProtect = team?.my_role === "admin";
 
   const [title, setTitle] = useState("");
   const [tags, setTags] = useState<string[]>([]);
@@ -214,6 +218,12 @@ export function PageView({ id }: { id: string }) {
       tags: tagsRef.current,
     };
     if (next.title === base.title && next.content === base.content && sameTags(next.tags, base.tags)) return;
+    // The server would refuse it; say why before sending anything. Not
+    // `blocked`: saving resumes once the title is changed.
+    if (!mayProtect && isProtectedTitle(next.title)) {
+      setSave({ kind: "error", message: 'only the teamspace owner can name a page "Policy: …" or "Wiki: …".' });
+      return;
+    }
 
     setSave({ kind: "saving" });
     const run = (async () => {
@@ -234,7 +244,7 @@ export function PageView({ id }: { id: string }) {
     inFlight.current = run;
     await run;
     inFlight.current = null;
-  }, [client, editable, id, orgId, ws]);
+  }, [client, editable, id, mayProtect, orgId, ws]);
 
   const schedule = useCallback(() => {
     window.clearTimeout(timer.current);
@@ -319,7 +329,7 @@ export function PageView({ id }: { id: string }) {
             <span className={cx("px-2 text-ink-3", save.kind === "error" && "text-danger")}>{status}</span>
             {!editable && (
               <span className="flex items-center gap-1 rounded bg-chip px-2 py-0.5 text-xs text-ink-2">
-                <Eye size={12} /> Can view
+                <Eye size={12} /> {ownerOnly ? PROTECTED_NOTE : "Can view"}
               </span>
             )}
             <IconButton title="Show in graph" onClick={() => navigate(`/graph?focus=${id}`)} className="h-7 w-7">

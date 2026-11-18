@@ -129,10 +129,13 @@ pub(crate) struct TitleWrite<'a> {
 /// looks protected (letters of another script) is refused here as well, so a
 /// writer cannot plant a page that reads like the team's policy.
 pub(crate) async fn require_title_access(state: &AppState, write: TitleWrite<'_>) -> ApiResult<()> {
+    // The look-alike check applies to a title being given, not to one a page
+    // already has: an existing page stays editable under its own title.
     let protected = write.current.is_some_and(validate::is_protected_title)
-        || write
-            .new
-            .is_some_and(|t| validate::is_protected_title(t) || validate::resembles_protected_title(t));
+        || write.new.is_some_and(|new| {
+            validate::is_protected_title(new)
+                || (write.current != Some(new) && validate::resembles_protected_title(new))
+        });
     if write.role == TeamRole::Admin || !protected {
         return Ok(());
     }

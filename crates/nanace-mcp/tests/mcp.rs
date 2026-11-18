@@ -466,6 +466,30 @@ async fn write_tools_need_opt_in_and_write_access() {
     assert!(is_error && text.contains("cannot write to team"), "{text}");
     let (is_error, text) = call(&bob, "update_context", json!({ "context_id": id, "append": "x" })).await;
     assert!(is_error && text.contains("not found"), "{text}");
+
+    // Policy: and Wiki: pages are the team owner's. Bob is a writer in qa.
+    let (is_error, text) = call(
+        &alice,
+        "create_context",
+        json!({ "team": "qa", "title": "Wiki: Index", "content": "catalog" }),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    let wiki = context_id_of(&text);
+    assert!(instructions.contains("edited only by its owner"), "{instructions}");
+    for (tool, args) in [
+        (
+            "create_context",
+            json!({ "team": "qa", "title": "wiki : Schema", "content": "x" }),
+        ),
+        ("update_context", json!({ "context_id": wiki, "append": "- a row" })),
+        ("update_context", json!({ "context_id": wiki, "title": "Index" })),
+    ] {
+        let (is_error, text) = call(&bob, tool, args).await;
+        assert!(is_error && text.contains("teamspace owner"), "{tool}: {text}");
+    }
+    let (_, page) = call(&bob, "get_context", json!({ "context_id": wiki })).await;
+    assert!(page.contains("catalog") && !page.contains("a row"), "{page}");
     let (is_error, text) = call(
         &bob,
         "create_context",

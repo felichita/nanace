@@ -139,6 +139,12 @@ only for changed code, new evidence, or an explicit re-review request.
 - Return `404` (not `403`) for org, team, context, or peer ids the caller
   cannot read, so ids cannot be probed.
 - Org admins manage membership but get no implicit access to team content.
+- Pages titled `Policy:` or `Wiki:` (`nanace_core::validate::is_protected_title`)
+  are written only by an admin of their team. Every handler that creates,
+  updates, trashes, restores or purges a context calls
+  `contexts::require_title_access`, and the RLS policies repeat the rule.
+  Change the Rust and SQL title checks together; both run
+  `PROTECTED_TITLE_CASES`.
 - Qdrant searches always filter on `org_id` and on team ids derived from
   PostgreSQL, and every hit is re-checked in PostgreSQL before it is returned.
   Never return Qdrant payload content without that check.

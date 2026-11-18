@@ -2086,6 +2086,27 @@ async fn policy_and_wiki_pages_are_written_only_by_team_admins() {
     )
     .await;
 
+    // A page that already has a look-alike title stays editable under it;
+    // only giving a page such a title is refused.
+    let legacy = id_of(
+        &c.ok(
+            "POST",
+            &pages,
+            &alice,
+            Some(create("Wіki: Legacy")),
+            StatusCode::CREATED,
+        )
+        .await,
+    );
+    c.ok(
+        "PUT",
+        &format!("{base}/contexts/{legacy}"),
+        &bob,
+        Some(json!({ "title": "Wіki: Legacy", "content": "edited by a writer" })),
+        StatusCode::OK,
+    )
+    .await;
+
     // Below the API, as Bob: the same writes change nothing or fail.
     let mut tx = db::scoped_tx(&pool, org_id, bob_id).await.unwrap();
     for sql in [

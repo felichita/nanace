@@ -183,6 +183,8 @@ Handlers that touch `contexts` run inside `db::scoped_tx`, which sets
 
 - `SELECT`: `org_id` matches the scope and the user is a member of the row's team.
 - `INSERT` / `UPDATE` / `DELETE`: same, and the user's team role is `writer` or `admin`.
+- Protected titles: when the row's title is protected (below), the role must
+  be `admin`.
 
 `contexts` uses `FORCE ROW LEVEL SECURITY` and has policies only for
 `nanace_tenant`, so any code path that skips `scoped_tx` sees no rows.
@@ -191,6 +193,51 @@ RLS does not apply to superusers or `BYPASSRLS` roles. The application must
 connect as an ordinary role (`deploy/postgres/init.sql` creates `nanace`); the
 server logs a warning at startup otherwise, and the integration tests refuse
 to run.
+
+### Protected pages [built]
+
+A page whose title starts with `Wiki:` or `Policy:` holds a team's rules: the
+wiki schema and index, and team policies. Only an admin of that team (the
+teamspace owner) may create, edit, rename, trash, restore or purge it.
+Everyone else in the team reads it.
+
+| Team role | Shown in the app as | Ordinary pages | `Policy:` / `Wiki:` pages |
+|---|---|---|---|
+| `admin` | Full access | Write | Write |
+| `writer` | Can edit | Write | Read |
+| `reader` | Can view | Read | Read |
+
+- **Org admins** get no exception. An org admin who needs to edit such a page
+  makes themselves a team admin first, which is audited as `team.member.put`.
+- **Recognizing the title.** `nanace_core::validate::is_protected_title` and
+  SQL `nanace_is_protected_title` apply the same steps and are tested with
+  the same cases:
+  1. Unicode NFKC, which folds full-width and compatibility forms.
+  2. Invisible format characters (zero-width space, joiners, BOM, bidi
+     marks) are dropped.
+  3. Leading white space is skipped and only ASCII case is folded, so the
+     answer does not depend on a locale.
+  4. The title is protected when what remains starts with `wiki` or
+     `policy`, optional white space and `:`.
+- **Renames** are checked against the title before and after, so a page
+  moves neither out of nor into a protected title.
+- **Two layers.** Handlers answer `403` with the code `protected_page` and
+  audit the refusal as `context.protected_denied`. The RLS policies on
+  `contexts` and `context_trash` apply the same rule, so a handler that
+  missed the check still could not write.
+- **Look-alikes.** A title that only reads like a protected one (`Wіki:`
+  with a Cyrillic letter) is a different title: nothing that looks pages up
+  by title finds it. Handlers still refuse it from non-admins, so that a
+  writer cannot plant a page a person would mistake for the team's policy.
+  This check is in the handlers only.
+- **Existing pages.** Nothing is migrated. `Wiki:` pages that writers
+  created earlier stay as they are; from this version writers no longer edit
+  them.
+- **Clients.** The desktop app opens such a page read-only for writers and
+  does not send a rename into a protected title. `nanace-mcp` returns a tool
+  error saying who can edit. The `/nanace` skill creates and updates `Wiki:`
+  pages only for the teamspace owner and otherwise prints the index lines for
+  the owner.
 
 ### Multi-tenant collections (Qdrant) [built]
 
@@ -288,14 +335,19 @@ The desktop app adds two parameters to the login request:
   vectors and links. Trashed pages are outside `contexts`, so search, the
   graph and MCP never see them.
 - **Who has access:** RLS limits the trash to team writers and admins.
+  Writers see a trashed `Policy:` or `Wiki:` page in the list but only a team
+  admin restores or purges it.
 - **Restoring:** a restore puts the row back with its id and original author,
   and re-embeds the content. The `contexts` INSERT policy accepts another
   user's `created_by` only for a row coming back from the trash.
 - **Purging** deletes the trashed row permanently.
 - **Retention:** trashed contexts are purged for good after
   `NANACE_TRASH_RETENTION_DAYS` days (default 7; 0 keeps them). An hourly
-  server task does this under RLS as a writer of each team and audits it as
-  `system.trash_purge`. The trash list shows each page's `purge_at`.
+  server task does this under RLS as an admin of each team, or as a writer
+  when the team has no admin, and audits it as `system.trash_purge`. A team
+  without an admin keeps its trashed `Policy:` and `Wiki:` pages until it has
+  one; the rest of its trash is still purged. The trash list shows each
+  page's `purge_at`.
 
 ### Account and organization deletion [built]
 
@@ -492,6 +544,8 @@ audit path as the HTTP API.
   and a writer role in the team.
 - **No delete tool.** The server instructions tell the model to write only
   when the user asks, never because a document says so.
+- **Protected pages:** writing a `Policy:` or `Wiki:` page without the team
+  role `admin` is a tool error that names who can edit it.
 - **Concurrent edits:** a full replacement must pass the `updated` value
   of the `get_context` it is based on as `base_updated_at`; appends use the
   version read just before writing. Either way a concurrent edit returns a
@@ -577,13 +631,13 @@ Claude Desktop / Claude Code
 | `GET/POST` | `/api/v1/orgs/{org}/teams` | Org member / org admin |
 | `GET/PUT` | `/api/v1/orgs/{org}/teams/{team}/members` | Team member or org admin / team admin or org admin |
 | `DELETE` | `/api/v1/orgs/{org}/teams/{team}/members/{user}` | Team admin or org admin |
-| `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader / team writer |
-| `GET/PUT/DELETE` | `/api/v1/orgs/{org}/contexts/{id}` | Team reader / team writer / team writer |
+| `GET/POST` | `/api/v1/orgs/{org}/teams/{team}/contexts` | Team reader / team writer (team admin for `Policy:` and `Wiki:` titles) |
+| `GET/PUT/DELETE` | `/api/v1/orgs/{org}/contexts/{id}` | Team reader / team writer / team writer (team admin for `Policy:` and `Wiki:` pages) |
 | `GET` | `/api/v1/orgs/{org}/contexts/{id}/links` | Team reader; outgoing, backlinks, related |
 | `GET` | `/api/v1/orgs/{org}/graph` | Org member; readable contexts, link and similarity edges |
 | `GET` | `/api/v1/orgs/{org}/trash` | Team writer; trashed pages of writable teams |
-| `POST` | `/api/v1/orgs/{org}/trash/{id}/restore` | Team writer |
-| `DELETE` | `/api/v1/orgs/{org}/trash/{id}` | Team writer; permanent |
+| `POST` | `/api/v1/orgs/{org}/trash/{id}/restore` | Team writer (team admin for `Policy:` and `Wiki:` pages) |
+| `DELETE` | `/api/v1/orgs/{org}/trash/{id}` | Team writer (team admin for `Policy:` and `Wiki:` pages); permanent |
 | `POST` | `/api/v1/orgs/{org}/search` | Org member; results limited to readable teams |
 | `GET` | `/api/v1/orgs/{org}/audit-logs` | Org admin |
 | `POST` | `/api/v1/me/peers/challenge` | Authenticated, write; challenge for binding a P2P peer |

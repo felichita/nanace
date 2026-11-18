@@ -25,6 +25,11 @@ pub enum ApiError {
     Unauthorized,
     #[error("permission denied")]
     Forbidden,
+    #[error(
+        "Policy: and Wiki: pages are edited only by the teamspace owner (team role `admin`). \
+         Tell the user instead of retrying or saving under a similar title."
+    )]
+    ProtectedPage,
     #[error("not found (or not visible to you)")]
     NotFound,
     #[error("invalid request: {0}")]
@@ -87,6 +92,8 @@ pub struct ContextSummary {
 
 #[derive(Deserialize)]
 struct ErrorBody {
+    #[serde(default)]
+    error: String,
     message: String,
 }
 
@@ -245,13 +252,14 @@ impl ApiClient {
                     .await
                     .map_err(|e| ApiError::Unexpected(e.without_url().to_string()));
             }
-            let message = resp
+            let (code, message) = resp
                 .json::<ErrorBody>()
                 .await
-                .map(|b| b.message)
-                .unwrap_or_else(|_| status.to_string());
+                .map(|b| (b.error, b.message))
+                .unwrap_or_else(|_| (String::new(), status.to_string()));
             return Err(match status {
                 StatusCode::UNAUTHORIZED => ApiError::Unauthorized,
+                StatusCode::FORBIDDEN if code == "protected_page" => ApiError::ProtectedPage,
                 StatusCode::FORBIDDEN => ApiError::Forbidden,
                 StatusCode::NOT_FOUND => ApiError::NotFound,
                 StatusCode::BAD_REQUEST => ApiError::BadRequest(message),
