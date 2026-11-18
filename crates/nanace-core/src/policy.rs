@@ -96,6 +96,9 @@ pub struct Data {
     /// the built-in secret rules, never replacing them.
     #[serde(default)]
     pub deny_outbound_patterns: Vec<String>,
+    /// Reserved: only `same` is accepted, and nothing enforces it. A daemon
+    /// cannot tell which team a referenced page belongs to; the API decides
+    /// who may read it.
     #[serde(default = "same_team")]
     pub allow_refs_to_teams: Vec<RefScope>,
 }

@@ -24,4 +24,6 @@ pub mod secrets;
 #[cfg(feature = "daemon")]
 pub mod spool;
 #[cfg(feature = "daemon")]
+pub mod throttle;
+#[cfg(feature = "daemon")]
 pub mod transport;

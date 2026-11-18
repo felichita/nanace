@@ -1058,6 +1058,9 @@ fn describe_reply(reply: &Value, team: &str) -> String {
                     "The peer answered, but the answer looked like it contained a secret (rule `{rule}`) and was dropped."
                 );
             }
+            (None, None) if reply["answer_dropped"] == true => out.push_str(
+                "The peer answered and the answer was read earlier; its text is no longer kept on this machine.\n",
+            ),
             (None, None) => out.push_str("The peer answered with no text.\n"),
         },
         "queued" => out.push_str("Not delivered yet: the peer is offline or still being reached. It is retried until the request expires. Check again with p2p_get_reply.\n"),

@@ -16,13 +16,14 @@ use libp2p::allow_block_list;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, dcutr, identify, noise, ping, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, connection_limits, dcutr, identify, noise, ping, tcp, yamux};
 use nanace_core::p2p::{MessageKind, RejectReason};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::daemon::Daemon;
 use crate::envelope::{Ack, Identity, Wire};
+use crate::throttle::{Throttle, source_of};
 use crate::transport::{Connection, Transport, TransportError};
 
 pub const ASK_PROTOCOL: &str = "/nanace/p2p/ask/1.0.0";
@@ -35,6 +36,16 @@ pub const IDENTIFY_PROTOCOL: &str = "/nanace/p2p/1.0.0";
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often the connection to the relay node is checked and restored.
 const BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5);
+/// Inbound connections still shaking hands, established ones, and
+/// connections to one peer (direct, relayed and one being upgraded).
+const MAX_PENDING_INCOMING: u32 = 32;
+const MAX_INCOMING: u32 = 128;
+const MAX_PER_PEER: u32 = 8;
+/// Registry lookups per minute for peers that were turned away: from one
+/// remote address and in all. Well under the server's per-user lookup limit,
+/// so strangers on the same network cannot use it up.
+const VOUCHES_PER_SOURCE: u32 = 5;
+const VOUCHES_TOTAL: u32 = 20;
 
 type Messages = request_response::json::Behaviour<Wire, Ack>;
 
@@ -46,12 +57,13 @@ type Messages = request_response::json::Behaviour<Wire, Ack>;
 mod behaviour {
     use libp2p::allow_block_list::{self, AllowedPeers};
     use libp2p::swarm::NetworkBehaviour;
-    use libp2p::{dcutr, identify, ping, relay};
+    use libp2p::{connection_limits, dcutr, identify, ping, relay};
 
     use super::Messages;
 
     #[derive(NetworkBehaviour)]
     pub(super) struct Behaviour {
+        pub(super) limits: connection_limits::Behaviour,
         pub(super) allowed: allow_block_list::Behaviour<AllowedPeers>,
         pub(super) relay: relay::client::Behaviour,
         pub(super) dcutr: dcutr::Behaviour,
@@ -152,6 +164,12 @@ impl Net {
             .with_quic()
             .with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(|key, relay| Behaviour {
+                limits: connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
+                        .with_max_established_incoming(Some(MAX_INCOMING))
+                        .with_max_established_per_peer(Some(MAX_PER_PEER)),
+                ),
                 allowed: allow_block_list::Behaviour::default(),
                 relay,
                 dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
@@ -235,6 +253,8 @@ struct Loop {
     connections: HashMap<PeerId, Vec<bool>>,
     /// Peers the registry is being asked about.
     vouching: HashSet<PeerId>,
+    /// How often strangers may make this daemon ask the registry.
+    vouches: Throttle,
     /// A relay reservation was requested on the current node connection.
     reserved: bool,
 }
@@ -253,6 +273,7 @@ async fn run(
         pending: HashMap::new(),
         connections: HashMap::new(),
         vouching: HashSet::new(),
+        vouches: Throttle::new(VOUCHES_PER_SOURCE, VOUCHES_TOTAL, Duration::from_secs(60)),
         reserved: false,
     };
     let mut bootstrap_tick = tokio::time::interval(BOOTSTRAP_INTERVAL);
@@ -401,8 +422,10 @@ impl Loop {
             // so that its next attempt is let in if it belongs to a team of
             // ours.
             SwarmEvent::IncomingConnectionError {
-                peer_id: Some(peer), ..
-            } => self.vouch(peer),
+                peer_id: Some(peer),
+                send_back_addr,
+                ..
+            } => self.vouch(peer, &send_back_addr),
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
                 tracing::debug!(event = "hole_punch", component = "nanace_p2p", peer = %event.remote_peer_id, direct = event.result.is_ok(), "direct connection attempt");
             }
@@ -410,13 +433,18 @@ impl Loop {
         }
     }
 
-    fn vouch(&mut self, peer: PeerId) {
+    /// Asks the registry about a peer that was turned away. Each lookup
+    /// spends the user's own request budget on the server and a new peer id
+    /// costs a stranger nothing, so lookups are bounded per remote address
+    /// and in total; beyond that the peer is simply not let in this time.
+    fn vouch(&mut self, peer: PeerId, from: &Multiaddr) {
         let Some(daemon) = self.daemon.clone() else {
             return;
         };
-        if !self.vouching.insert(peer) {
+        if self.vouching.contains(&peer) || !self.vouches.allow(source_of(from), std::time::Instant::now()) {
             return;
         }
+        self.vouching.insert(peer);
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let allowed = daemon.vouches_for(&peer.to_string()).await;

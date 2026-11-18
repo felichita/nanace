@@ -22,6 +22,9 @@ pub enum RateClass {
     P2pPresence,
     P2pLookup,
     P2pExchange,
+    /// The network node asking about one peer; counted for the node as a
+    /// whole (`Uuid::nil()`), which has no user.
+    P2pNodeAllow,
 }
 
 impl RateClass {
@@ -32,6 +35,7 @@ impl RateClass {
             Self::P2pBind => 30.0,
             Self::P2pPresence | Self::P2pLookup => 120.0,
             Self::P2pExchange => 240.0,
+            Self::P2pNodeAllow => 600.0,
         }
     }
 }

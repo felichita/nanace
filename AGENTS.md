@@ -174,6 +174,10 @@ only for changed code, new evidence, or an explicit re-review request.
   not add a path that skips them or that executes anything on behalf of a
   message. Message text is never logged, reported to the server or put in
   an error. The built-in secret rules cannot be disabled by a policy.
+  Received requests are stored only within the caps at the top of
+  `daemon.rs`, and a record's text is cleared when its side of the exchange
+  ends; do not add a state that keeps text longer. Lookups caused by peers
+  the node or a daemon does not know stay behind a `Throttle`.
 - Only the supervisor role of the daemon's local socket answers consent
   prompts and changes settings; its secret is never written to disk.
 - JWTs and personal access tokens identify the user only. Never put roles or

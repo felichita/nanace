@@ -637,8 +637,18 @@ answer also waits for the user.
 its deadline (`request_ttl_secs`), then expires. There is no mailbox on the
 server, so both daemons must be online at the same moment at some point
 before the deadline. Queued messages are files only the user can read
-(`<state dir>/spool`), removed a day after the exchange ends. Chains of
-requests under one trace stop at the policy's `max_hops`.
+(`<state dir>/spool`). Their text does not outlive the exchange: a request's
+text is dropped by the sender on delivery and by the receiver when it
+answers, an answer's text by the receiver on delivery and by the sender ten
+minutes after its agent read it. Headers stay for a day. Chains of requests
+under one trace stop at the policy's `max_hops`.
+
+**Bounds.** A daemon keeps at most 200 unfinished received requests (20 from
+one user, 8 MiB of text) and shows the user at most 30 consent prompts (3
+from one user); more are refused with `rate`. Daemon and node cap their
+connections, and both bound how often peers they do not know make them ask
+the server. A node that cannot fetch its allow list for 30 seconds turns
+every peer away.
 
 **Local socket.** Programs of the same user reach the daemon over a Unix
 socket (a named pipe on Windows) with JSON-RPC, one message per line. A
