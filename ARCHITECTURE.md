@@ -631,7 +631,9 @@ policy's `max_accept_mode`:
 
 A request nobody decides on expires after the policy's
 `consent_timeout_secs`. With "show answers before sending", the agent's
-answer also waits for the user.
+answer also waits for the user. The desktop app starts with it on; the user
+may turn it off unless the team policy sets `require_answer_review: true`.
+A peer without the desktop app has nobody to ask and answers on its own.
 
 **Delivery.** A request waits in the sender's queue and is retried until
 its deadline (`request_ttl_secs`), then expires. There is no mailbox on the

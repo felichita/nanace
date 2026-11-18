@@ -297,6 +297,8 @@ impl Net {
         }
         node.daemon.register_agent(name, &[]).await.unwrap();
         node.daemon.set_supervisor(kind == ClientKind::Desktop).await;
+        // Answer review has its own test; elsewhere answers go straight out.
+        node.daemon.set_review_answers(false).await.unwrap();
         node.daemon.tick().await;
         node
     }
@@ -1433,6 +1435,70 @@ async fn answers_and_addresses_are_checked_against_the_registry() {
         Ack::Rejected(RejectReason::Invalid)
     );
     assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Delivered);
+}
+
+#[tokio::test]
+async fn answers_wait_for_the_user_by_default_and_when_the_policy_requires_it() {
+    let net = Net::new();
+    let alice = net
+        .join("alice", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    // A daemon nobody configured holds answers for its user.
+    let stranger = Uuid::new_v4();
+    net.world
+        .lock()
+        .unwrap()
+        .emails
+        .insert(stranger, "fresh@example.com".to_owned());
+    let fresh = net
+        .start("fresh", Identity::from_secret([7u8; 32]), stranger, ClientKind::Desktop)
+        .await;
+    assert!(fresh.daemon.settings().await.review_answers);
+
+    // Bob turned it off: his answers go straight out.
+    let bob = net
+        .join("bob", Some(TeamRole::Writer), ClientKind::Desktop, AcceptMode::Team)
+        .await;
+    let sent = alice.daemon.send("alice", net.ask(&bob, "one")).await.unwrap();
+    settle().await;
+    bob.daemon
+        .reply("bob", sent.request_id, "first".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Answered);
+    assert!(!bob.daemon.whoami().await.teams[0].answer_review_required);
+
+    // The team owner requires review: Bob's setting no longer decides.
+    net.policy(|p| p.require_answer_review = true);
+    net.advance(31);
+    assert!(bob.daemon.whoami().await.teams[0].answer_review_required);
+    let sent = alice.daemon.send("alice", net.ask(&bob, "two")).await.unwrap();
+    settle().await;
+    bob.daemon
+        .reply("bob", sent.request_id, "second".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Delivered, "held");
+    assert_eq!(bob.daemon.pending().await[0].1.as_deref(), Some("second"));
+    bob.daemon.decide_review(sent.request_id, true).await.unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Answered);
+
+    // A peer without the desktop app has nobody to ask and answers itself.
+    let robo = net
+        .join("robo", Some(TeamRole::Agent), ClientKind::Server, AcceptMode::Team)
+        .await;
+    robo.daemon.set_review_answers(true).await.unwrap();
+    let sent = alice.daemon.send("alice", net.ask(&robo, "three")).await.unwrap();
+    settle().await;
+    robo.daemon
+        .reply("robo", sent.request_id, "third".to_owned(), vec![])
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(alice.state_of(sent.request_id).await.0, OutState::Answered);
 }
 
 #[cfg(unix)]

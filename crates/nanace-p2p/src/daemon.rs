@@ -95,13 +95,27 @@ pub struct TeamSettings {
 }
 
 /// What survives a restart besides the spool.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub teams: Vec<TeamSettings>,
-    /// Hold an agent's answer until the user confirms it (desktop only).
-    #[serde(default)]
+    /// Hold an agent's answer until the user confirms it (desktop only). On
+    /// unless the user turns it off; a team policy can require it.
+    #[serde(default = "review_by_default")]
     pub review_answers: bool,
+}
+
+fn review_by_default() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            teams: Vec::new(),
+            review_answers: review_by_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +340,8 @@ pub struct TeamView {
     pub effective_accept_mode: AcceptMode,
     pub p2p_enabled: bool,
     pub policy_version: Option<String>,
+    /// The team policy makes the user confirm every answer.
+    pub answer_review_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1174,7 +1190,8 @@ impl Daemon {
         }
         let review = {
             let mut state = self.state.lock().await;
-            let review = self.kind == ClientKind::Desktop && state.settings.review_answers;
+            let review = self.kind == ClientKind::Desktop
+                && (state.settings.review_answers || team.policy.require_answer_review);
             let record = state
                 .inc
                 .get_mut(&request_id)
@@ -1885,6 +1902,7 @@ impl Daemon {
                 accept_mode: team.accept_mode,
                 effective_accept_mode: effective,
                 p2p_enabled: policy.is_some(),
+                answer_review_required: policy.as_ref().is_some_and(|p| p.policy.require_answer_review),
                 policy_version: policy.map(|p| p.version.clone()),
             });
         }
